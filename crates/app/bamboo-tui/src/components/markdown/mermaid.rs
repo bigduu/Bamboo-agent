@@ -22,14 +22,26 @@ impl Unavailable {
     }
 }
 
-/// Preview one vertical path. The original fence remains available to the
-/// source picker regardless of which view is shown.
+/// Preview one path in its declared direction. The source picker can still
+/// access the original fence.
 pub(super) fn render(source: &str, width: usize) -> Result<Vec<Line<'static>>, Unavailable> {
-    let labels = parse_path(source).ok_or(Unavailable::Unsupported)?;
+    let (direction, labels) = parse_path(source).ok_or(Unavailable::Unsupported)?;
     let labels: Vec<_> = labels
         .into_iter()
         .map(|label| (label, grapheme_cell_width(label)))
         .collect();
+    let border = Style::default().fg(colors::code_border());
+    match direction {
+        Direction::TopDown => render_vertical(labels, width, border),
+        Direction::LeftToRight => render_horizontal(labels, width, border),
+    }
+}
+
+fn render_vertical(
+    labels: Vec<(&str, usize)>,
+    width: usize,
+    border: Style,
+) -> Result<Vec<Line<'static>>, Unavailable> {
     let label_width = labels.iter().map(|(_, cells)| *cells).max().unwrap_or(0);
     if label_width + 4 > width {
         return Err(Unavailable::TooWide);
@@ -39,7 +51,6 @@ pub(super) fn render(source: &str, width: usize) -> Result<Vec<Line<'static>>, U
     let rule_left = "─".repeat(center - 1);
     let rule_right = "─".repeat(label_width + 2 - center);
     let arrow = format!("{}↓", " ".repeat(center));
-    let border = Style::default().fg(colors::code_border());
     let mut rows = Vec::with_capacity(labels.len() * 4 - 1);
     let last_index = labels.len() - 1;
     for (index, (label, cells)) in labels.into_iter().enumerate() {
@@ -65,6 +76,56 @@ pub(super) fn render(source: &str, width: usize) -> Result<Vec<Line<'static>>, U
     Ok(rows)
 }
 
+fn render_horizontal(
+    labels: Vec<(&str, usize)>,
+    width: usize,
+    border: Style,
+) -> Result<Vec<Line<'static>>, Unavailable> {
+    let arrow = "──→";
+    let gap_width = grapheme_cell_width(arrow);
+    let box_widths: usize = labels.iter().map(|(_, cells)| cells + 4).sum();
+    if box_widths + gap_width * (labels.len() - 1) > width {
+        return Err(Unavailable::TooWide);
+    }
+
+    let gap = " ".repeat(gap_width);
+    let mut top = String::new();
+    let mut middle = Vec::new();
+    let mut bottom = String::new();
+    let last_index = labels.len() - 1;
+    for (index, (label, cells)) in labels.into_iter().enumerate() {
+        let rule = "─".repeat(cells + 2);
+        top.push('┌');
+        top.push_str(&rule);
+        top.push('┐');
+        bottom.push('└');
+        bottom.push_str(&rule);
+        bottom.push('┘');
+
+        let left_side = if index == 0 { "│ " } else { "┤ " };
+        let right_side = if index == last_index { " │" } else { " ├" };
+        middle.push(Span::styled(left_side, border));
+        middle.push(Span::raw(label.to_owned()));
+        middle.push(Span::styled(right_side, border));
+        if index != last_index {
+            top.push_str(&gap);
+            middle.push(Span::styled(arrow, border));
+            bottom.push_str(&gap);
+        }
+    }
+    Ok(vec![
+        Line::styled(top, border),
+        Line::from(middle),
+        Line::styled(bottom, border),
+    ])
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Direction {
+    TopDown,
+    LeftToRight,
+}
+
 #[derive(Clone, Copy)]
 struct NodeRef<'a> {
     id: &'a str,
@@ -77,7 +138,7 @@ struct Node<'a> {
     next: Option<usize>,
 }
 
-fn parse_path(source: &str) -> Option<Vec<&str>> {
+fn parse_path(source: &str) -> Option<(Direction, Vec<&str>)> {
     if source.len() > MAX_SOURCE_BYTES {
         return None;
     }
@@ -87,10 +148,15 @@ fn parse_path(source: &str) -> Option<Vec<&str>> {
         .filter(|line| !line.is_empty())
         .map(|line| line.strip_suffix(';').unwrap_or(line).trim_ascii_end());
     let mut header = statements.next()?.split_ascii_whitespace();
-    if !matches!(header.next(), Some("flowchart" | "graph"))
-        || header.next() != Some("TD")
-        || header.next().is_some()
-    {
+    if !matches!(header.next(), Some("flowchart" | "graph")) {
+        return None;
+    }
+    let direction = match header.next()? {
+        "TD" => Direction::TopDown,
+        "LR" => Direction::LeftToRight,
+        _ => return None,
+    };
+    if header.next().is_some() {
         return None;
     }
 
@@ -124,7 +190,7 @@ fn parse_path(source: &str) -> Option<Vec<&str>> {
         labels.push(node.reference.label.unwrap_or(node.reference.id));
         match node.next {
             Some(next) => index = next,
-            None => return (labels.len() == nodes.len()).then_some(labels),
+            None => return (labels.len() == nodes.len()).then_some((direction, labels)),
         }
     }
     None
@@ -228,7 +294,10 @@ mod tests {
         );
         assert_eq!(
             parse_path(source).unwrap(),
-            ["计划 🧭", "Verify", "Deploy (done) & verify"]
+            (
+                Direction::TopDown,
+                vec!["计划 🧭", "Verify", "Deploy (done) & verify"]
+            )
         );
     }
 
@@ -260,11 +329,13 @@ mod tests {
             "A --> _blank",
             "A",
         ] {
-            assert_eq!(
-                render(&format!("flowchart TD\n{body}"), 120),
-                Err(Unavailable::Unsupported),
-                "{body}",
-            );
+            for direction in ["TD", "LR"] {
+                assert_eq!(
+                    render(&format!("flowchart {direction}\n{body}"), 120),
+                    Err(Unavailable::Unsupported),
+                    "{body}",
+                );
+            }
         }
     }
 
@@ -312,5 +383,30 @@ mod tests {
         );
         assert!(rows.iter().all(|row| row.width() <= 11));
         assert_eq!(render(source, 10), Err(Unavailable::TooWide));
+    }
+
+    #[test]
+    fn horizontal_boxes_fit_by_cells_and_preserve_graph_order() {
+        let source = concat!(
+            "graph LR;\r\n",
+            "  B[Done];\r\n",
+            "  A --> B\r\n",
+            "  A[检查 👩‍💻]\r\n",
+        );
+        assert_eq!(
+            parse_path(source),
+            Some((Direction::LeftToRight, vec!["检查 👩‍💻", "Done"]))
+        );
+        let rows = render(source, 22).unwrap();
+        assert_eq!(
+            rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            [
+                "┌─────────┐   ┌──────┐",
+                "│ 检查 👩‍💻 ├──→┤ Done │",
+                "└─────────┘   └──────┘"
+            ]
+        );
+        assert!(rows.iter().all(|row| row.width() == 22));
+        assert_eq!(render(source, 21), Err(Unavailable::TooWide));
     }
 }
