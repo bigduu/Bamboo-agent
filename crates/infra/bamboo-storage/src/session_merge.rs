@@ -446,7 +446,7 @@ fn adopt_durable_supervised_outcomes(
 /// Capture the same owner-checked snapshot that the storage writer publishes
 /// while it still owns the physical guard. The slot is owned by the callback
 /// as well as the awaiting task, including when that task is cancelled.
-fn capture_root_publication(
+pub(crate) fn capture_root_publication(
     publish: bamboo_domain::RootActorRuntimePublisher,
 ) -> (
     bamboo_domain::RootActorRuntimePublisher,
@@ -468,7 +468,7 @@ fn capture_root_publication(
     (callback, slot)
 }
 
-fn adopt_root_publication(
+pub(crate) fn adopt_root_publication(
     session: &mut Session,
     slot: &std::sync::Mutex<(bool, Option<Session>)>,
 ) -> std::io::Result<()> {

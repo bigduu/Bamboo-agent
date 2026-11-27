@@ -315,6 +315,27 @@ impl AppState {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn new_with_provider_for_managed_update_test(
+        bamboo_home_dir: PathBuf,
+        config: Config,
+        provider: Arc<dyn LLMProvider>,
+    ) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_provider_and_facade(
+            bamboo_home_dir,
+            config,
+            provider,
+            false,
+            None,
+            None,
+            Arc::new(NoopToolEventPublisher),
+            memory_store,
+            HostStartup::ManagedUpdate,
+        )
+        .await
+    }
+
     /// Inject both provider and memory explicitly for isolated Host embeddings.
     pub async fn new_with_provider_and_memory_store(
         bamboo_home_dir: PathBuf,
@@ -901,7 +922,14 @@ impl AppState {
             bamboo_engine::auto_dream::MemoryMaintenanceAdmission::default();
         let managed_update_runtime = managed_lifecycle_hooks.map(|lifecycle_hooks| {
             super::planned_update::ManagedUpdateRuntime {
-                boot_refusal: super::planned_update::unsupported_host_routes(&config_snapshot),
+                boot_refusal: super::planned_update::unsupported_host_routes(
+                    &config_snapshot,
+                    false,
+                ),
+                immediate_boot_refusal: super::planned_update::unsupported_host_routes(
+                    &config_snapshot,
+                    true,
+                ),
                 memory: memory_maintenance_admission.clone(),
                 lifecycle_hooks,
             }

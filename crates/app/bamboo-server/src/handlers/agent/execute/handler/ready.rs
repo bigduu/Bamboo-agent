@@ -48,8 +48,9 @@ pub(super) struct ReadyExecution<'a> {
     pub model_source: &'static str,
     pub reasoning_source: &'static str,
     pub is_child_session: bool,
-    /// Durable Schedule profile captured before preparing this execution.
-    pub scheduled_startup_expected: Option<Box<bamboo_agent_core::Session>>,
+    /// Canonical Schedule or interrupted-conversation snapshot before preparation.
+    pub bound_startup_expected: Option<Box<bamboo_agent_core::Session>>,
+    pub resume_interrupted: bool,
     /// The `no_human_approver` posture from THIS execute request. #74: re-derived
     /// per user-initiated execute and written over the session's persisted flag.
     pub no_human_approver: bool,
@@ -281,7 +282,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     apply_no_human_approver(&mut session, ready.no_human_approver);
 
     #[cfg(test)]
-    if ready.scheduled_startup_expected.is_some() {
+    if ready.bound_startup_expected.is_some() && !ready.resume_interrupted {
         crate::handlers::agent::execute::scheduled_startup_test_hooks::pause(session_id).await;
     }
 
@@ -341,7 +342,14 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         Ok(None)
     };
     let native_binding = match binding {
-        Ok(binding) => binding,
+        Ok(binding) => binding.map(|(agent, tools)| {
+            let agent = if ready.resume_interrupted {
+                std::sync::Arc::new(agent.with_interrupted_resume_context())
+            } else {
+                agent
+            };
+            (agent, tools)
+        }),
         Err(error) => {
             execution_reservation.abandon().await;
             super::fail_reserved_pending_startup(
@@ -404,8 +412,35 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             .flatten();
         match host_binding {
             Err(error) => Err(error),
+            Ok(()) if ready.resume_interrupted => {
+                match (
+                    ready.bound_startup_expected.as_deref(),
+                    execution_reservation.root_actor_writer(),
+                ) {
+                    (Some(expected), Some(owner)) => {
+                        let cache = state.sessions.clone();
+                        Box::pin(state.session_store.save_interrupted_root_startup(
+                            &owner,
+                            &mut session,
+                            expected,
+                            std::sync::Arc::new(move |saved| {
+                                cache.insert(
+                                    saved.id.clone(),
+                                    std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(
+                                        saved.clone(),
+                                    )),
+                                );
+                            }),
+                        ))
+                        .await
+                    }
+                    _ => Err(std::io::Error::other(
+                        "interrupted resume has no Root execution writer",
+                    )),
+                }
+            }
             Ok(()) => match (
-                ready.scheduled_startup_expected.as_deref(),
+                ready.bound_startup_expected.as_deref(),
                 execution_persistence.as_ref(),
             ) {
                 (Some(expected), Some(persistence)) => {

@@ -8897,8 +8897,15 @@ impl Storage for SessionStoreV2 {
         inherited: Option<&bamboo_domain::InheritedChildWait>,
         publish: bamboo_domain::storage::RootActorRuntimePublisher,
     ) -> io::Result<()> {
-        self.save_root_actor_bound_startup_impl(owner, session, expected, inherited, None, publish)
-            .await
+        self.save_root_actor_bound_startup_impl(
+            owner,
+            session,
+            expected,
+            inherited,
+            root_actor_runtime::RootBoundStartup::Execution,
+            publish,
+        )
+        .await
     }
 
     async fn save_supervisor_approval_response(
@@ -8915,7 +8922,7 @@ impl Storage for SessionStoreV2 {
             session,
             expected,
             inherited,
-            Some(approval),
+            root_actor_runtime::RootBoundStartup::Approval(approval),
             publish,
         )
         .await

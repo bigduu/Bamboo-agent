@@ -267,7 +267,7 @@ pub(crate) async fn persist_checkpoint(
 
 /// Read-only refusal, also used before outer runtime/adapter finalizers.
 /// A raw caller never gains a lease or write authority by presenting metadata.
-pub(crate) fn reject_recovery(session: &Session) -> Result<(), AgentError> {
+pub fn reject_recovery(session: &Session) -> Result<(), AgentError> {
     if read_loop_state(session)?.is_some_and(|state| {
         state.live()
             || state.status == LoopStatus::RecoveryUnsupported

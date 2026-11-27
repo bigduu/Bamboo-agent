@@ -46,11 +46,29 @@ pub async fn prepare_execute(
     input: ExecuteInput,
 ) -> Result<ExecutePreparationOutcome, ExecutePreparationError> {
     // ---- Load session ----
-    let mut session = repo
+    let session = repo
         .load_session(&input.session_id)
         .await?
         .ok_or_else(|| ExecutePreparationError::NotFound(input.session_id.clone()))?;
 
+    prepare_loaded_execute(session, config, input, false)
+}
+
+/// Prepare from a canonical snapshot checked by the interactive resume owner.
+pub fn prepare_interrupted_execute(
+    session: Session,
+    config: ExecutionConfigSnapshot,
+    input: ExecuteInput,
+) -> Result<ExecutePreparationOutcome, ExecutePreparationError> {
+    prepare_loaded_execute(session, config, input, true)
+}
+
+fn prepare_loaded_execute(
+    mut session: Session,
+    config: ExecutionConfigSnapshot,
+    input: ExecuteInput,
+    resume_interrupted: bool,
+) -> Result<ExecutePreparationOutcome, ExecutePreparationError> {
     let is_child_session = session.kind == bamboo_agent_core::SessionKind::Child;
     let server_snapshot = ServerExecuteSnapshot::from_session(&session);
 
@@ -134,7 +152,7 @@ pub async fn prepare_execute(
     // the actual provider handle, before reserving or spawning execution.
 
     // ---- Check for pending user message ----
-    if !server_snapshot.has_pending_user_message {
+    if !resume_interrupted && !server_snapshot.has_pending_user_message {
         return Ok(ExecutePreparationOutcome::NoPendingMessage { server_snapshot });
     }
 

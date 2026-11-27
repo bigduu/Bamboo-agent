@@ -202,6 +202,14 @@ pub async fn get_session(
                 .is_some()
                 .then_some(true);
             summary.adopt_activity_waits(&durable_session);
+            summary.resume_interrupted = Some(
+                running_child_count == 0
+                    && crate::handlers::agent::execute::interrupted::can_offer(
+                        &state,
+                        &durable_session,
+                    )
+                    .await,
+            );
             if durable_session.kind == SessionKind::Root
                 && durable_session.parent_session_id.is_none()
             {

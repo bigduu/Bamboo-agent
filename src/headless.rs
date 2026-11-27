@@ -702,6 +702,7 @@ async fn run_session(
             upstream_retry: None,
             // Headless runs cannot offer an interactive same-run continuation.
             live_bootstrap_resume: false,
+            resume_interrupted: false,
         }),
     )
     .await;
