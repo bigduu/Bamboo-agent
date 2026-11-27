@@ -1914,6 +1914,7 @@ mod tests {
         for source in [
             "```mermaid\nflowchart RL\nA --> B\n```",
             "~~~mermaid theme=neutral\nflowchart TD\nA --> B\n~~~",
+            "~~~mermaid\r\nflowchart LR\r\nA-->B-->\r\n~~~",
         ] {
             let settled = render_markdown(source, 80);
             assert_eq!(text_of(&settled[0]), "Mermaid source · unsupported diagram");
@@ -1935,6 +1936,52 @@ mod tests {
                 source: body,
             }]
         );
+    }
+
+    #[test]
+    fn settled_mermaid_chains_match_separate_edges_and_keep_raw_copy_source() {
+        let chain = "\tA(Plan)-->|复核 🧭|B[Run]-->C(Done);\r\n";
+        let separate = "\tA(Plan)-->|复核 🧭|B[Run];\r\n\tB-->C(Done);\r\n";
+        let fenced = |body: &str| {
+            format!("Before the diagram.\r\n\r\n~~~ mermaid\r\n{body}~~~\r\n\r\nAfter the diagram.")
+        };
+
+        for (direction, arrow) in [("TD", '↓'), ("LR", '→')] {
+            let body = format!("flowchart {direction}\r\n{chain}");
+            let source = fenced(&body);
+            let equivalent = fenced(&format!("flowchart {direction}\r\n{separate}"));
+            let settled = render_markdown(&source, 60);
+            assert_eq!(settled, render_markdown(&equivalent, 60));
+
+            let rows: Vec<_> = settled.iter().map(text_of).collect();
+            assert_eq!(
+                rows.first().map(String::as_str),
+                Some("Before the diagram.")
+            );
+            assert_eq!(rows.last().map(String::as_str), Some("After the diagram."));
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.matches(arrow).count())
+                    .sum::<usize>(),
+                2
+            );
+            assert!(rows.iter().any(|row| row.contains("复核 🧭")));
+            assert!(rows.iter().any(|row| row.contains('╭')));
+            assert!(rows.iter().any(|row| row.contains('┌')));
+
+            let streaming = render_streaming_markdown(&source, 60);
+            assert!(streaming
+                .iter()
+                .any(|row| text_of(row).contains(chain.trim())));
+            assert!(streaming.iter().all(|row| !text_of(row).contains(arrow)));
+            assert_eq!(
+                copyable_fences(&source).1,
+                [CopyableFence {
+                    language: Some("mermaid"),
+                    source: &body,
+                }]
+            );
+        }
     }
 
     #[test]
