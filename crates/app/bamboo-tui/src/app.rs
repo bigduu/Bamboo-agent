@@ -1954,6 +1954,18 @@ pub(crate) struct ScheduleIntervalEdit {
     pub(crate) error: Option<String>,
 }
 
+struct PendingSchedulePrompt {
+    generation: u64,
+    schedule_id: String,
+    task_message: String,
+}
+
+pub(crate) struct SchedulePromptEdit {
+    schedule_id: String,
+    pub(crate) textarea: TextArea<'static>,
+    pub(crate) error: Option<String>,
+}
+
 pub(crate) enum ScheduleRunsContent {
     Loading,
     Loaded(Vec<ScheduleRunView>),
@@ -5201,6 +5213,9 @@ pub struct App {
     pub(crate) schedule_interval: Option<ScheduleIntervalEdit>,
     pending_schedule_interval: Option<PendingScheduleInterval>,
     schedule_interval_generation: u64,
+    pub(crate) schedule_prompt: Option<SchedulePromptEdit>,
+    pending_schedule_prompt: Option<PendingSchedulePrompt>,
+    schedule_prompt_generation: u64,
     pub(crate) schedule_runs: Option<ScheduleRunsPane>,
     schedule_runs_request_id: u64,
     pub(crate) schedule_sessions: Option<ScheduleSessionsPane>,
@@ -5463,6 +5478,9 @@ impl App {
             schedule_interval: None,
             pending_schedule_interval: None,
             schedule_interval_generation: 0,
+            schedule_prompt: None,
+            pending_schedule_prompt: None,
+            schedule_prompt_generation: 0,
             schedule_runs: None,
             schedule_runs_request_id: 0,
             schedule_sessions: None,
@@ -5692,6 +5710,7 @@ impl App {
         self.close_schedule_sessions();
         self.schedule_rename = None;
         self.schedule_interval = None;
+        self.schedule_prompt = None;
         self.chat.pressed_block = None;
         self.chat.pressed_attachment_remove = None;
         self.invalidate_permission_mode_context();
@@ -5717,6 +5736,7 @@ impl App {
             self.chat.background_unread = 0;
             self.schedule_rename = None;
             self.schedule_interval = None;
+            self.schedule_prompt = None;
             self.tab = Tab::Chat;
             self.status_message = "Session already active".to_string();
             self.discover_active_loop();
@@ -6052,6 +6072,9 @@ impl App {
     pub fn set_theme(&mut self, palette: crate::theme::ThemePalette) {
         self.theme = palette;
         apply_textarea_palette(&mut self.chat.textarea, palette);
+        if let Some(editor) = self.schedule_prompt.as_mut() {
+            apply_textarea_palette(&mut editor.textarea, palette);
+        }
         if let Some(editor) = self.config_editor.as_mut() {
             apply_textarea_palette(&mut editor.textarea, palette);
         }
@@ -6788,7 +6811,15 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key).await?,
             AppEvent::Paste(text) => {
-                if self.chat_composer_focused() {
+                if self.active_action_contexts().first() == Some(&ActionContext::SchedulePrompt) {
+                    self.pending_key_sequence = None;
+                    if !self.schedule_prompt_is_saving() {
+                        if let Some(editor) = self.schedule_prompt.as_mut() {
+                            editor.textarea.insert_str(&text);
+                            editor.error = None;
+                        }
+                    }
+                } else if self.chat_composer_focused() {
                     self.pending_key_sequence = None;
                     self.insert_composer_text(&text);
                 }
@@ -6872,6 +6903,13 @@ impl App {
                 result,
             } => {
                 self.finish_schedule_interval(generation, schedule_id, result);
+            }
+            AppEvent::SchedulePromptFinished {
+                generation,
+                schedule_id,
+                result,
+            } => {
+                self.finish_schedule_prompt(generation, schedule_id, result);
             }
             AppEvent::SkillsLoaded(r) => {
                 self.skills.loading = false;
@@ -9088,6 +9126,7 @@ impl App {
             || self.schedule_form.is_some()
             || self.schedule_rename.is_some()
             || self.schedule_interval.is_some()
+            || self.schedule_prompt.is_some()
             || self.schedule_runs.is_some()
             || self.schedule_sessions.is_some()
             || self.config_editor.is_some()
@@ -9827,6 +9866,7 @@ impl App {
             || self.schedule_form.is_some()
             || self.schedule_rename.is_some()
             || self.schedule_interval.is_some()
+            || self.schedule_prompt.is_some()
             || self.schedule_runs.is_some()
             || self.schedule_sessions.is_some()
             || self.fence_copy_picker.is_some()
@@ -9902,6 +9942,8 @@ impl App {
             ActionContext::ScheduleRename
         } else if self.schedule_interval.is_some() {
             ActionContext::ScheduleInterval
+        } else if self.schedule_prompt.is_some() {
+            ActionContext::SchedulePrompt
         } else if self.schedule_form.is_some() {
             ActionContext::ScheduleForm
         } else if self.schedule_sessions.is_some() {
@@ -10003,6 +10045,8 @@ impl App {
             rename.error = Some(message.clone());
         } else if let Some(interval) = self.schedule_interval.as_mut() {
             interval.error = Some(message.clone());
+        } else if let Some(editor) = self.schedule_prompt.as_mut() {
+            editor.error = Some(message.clone());
         } else if let Some(form) = self.schedule_form.as_mut() {
             form.error = Some(message.clone());
         } else if let Some(editor) = self.config_editor.as_mut() {
@@ -10277,6 +10321,7 @@ impl App {
             ActionContext::CommandPalette => self.handle_command_palette_key(key),
             ActionContext::ScheduleRename => self.handle_schedule_rename_key(key),
             ActionContext::ScheduleInterval => self.handle_schedule_interval_key(key),
+            ActionContext::SchedulePrompt => self.handle_schedule_prompt_key(key),
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
             ActionContext::ScheduleRuns => self.handle_schedule_runs_key(key),
             ActionContext::ScheduleSessions => self.handle_schedule_sessions_key(key),
@@ -15134,6 +15179,7 @@ impl App {
             Some(ActionId::ToggleScheduleEnabled) => self.toggle_selected_schedule(),
             Some(ActionId::RenameSchedule) => self.open_schedule_rename(),
             Some(ActionId::EditScheduleInterval) => self.open_schedule_interval(),
+            Some(ActionId::EditSchedulePrompt) => self.open_schedule_prompt(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
                     (self.schedules.selected + 1).min(self.schedules.schedules.len() - 1);
@@ -15152,6 +15198,7 @@ impl App {
                 if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
                     if self.schedule_rename_pending_for(&schedule.id)
                         || self.schedule_interval_pending_for(&schedule.id)
+                        || self.schedule_prompt_pending_for(&schedule.id)
                     {
                         self.notify(NoticeLevel::Warn, "Wait for the schedule update to finish");
                         return Ok(());
@@ -15196,6 +15243,7 @@ impl App {
         };
         if self.schedule_rename_is_saving()
             || self.schedule_interval_pending_for(&schedule.id)
+            || self.schedule_prompt_pending_for(&schedule.id)
             || self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
             || self
                 .schedules
@@ -15327,6 +15375,7 @@ impl App {
         };
         if self.schedule_interval_is_saving()
             || self.schedule_rename_pending_for(&schedule.id)
+            || self.schedule_prompt_pending_for(&schedule.id)
             || self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
             || self.schedules.toggle_pending_for(&schedule.id)
         {
@@ -15478,6 +15527,147 @@ impl App {
         }
     }
 
+    fn open_schedule_prompt(&mut self) {
+        let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) else {
+            return;
+        };
+        let Some(prompt) = schedule
+            .prompt
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+        else {
+            return;
+        };
+        if self.schedule_prompt_is_saving()
+            || self.schedule_rename_pending_for(&schedule.id)
+            || self.schedule_interval_pending_for(&schedule.id)
+            || self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
+            || self.schedules.toggle_pending_for(&schedule.id)
+        {
+            self.notify(NoticeLevel::Warn, "Wait for the schedule update to finish");
+            return;
+        }
+        let mut textarea = TextArea::new(prompt.split('\n').map(str::to_string).collect());
+        apply_textarea_palette(&mut textarea, self.theme);
+        textarea.move_cursor(CursorMove::Bottom);
+        textarea.move_cursor(CursorMove::End);
+        self.schedule_prompt = Some(SchedulePromptEdit {
+            schedule_id: schedule.id.clone(),
+            textarea,
+            error: None,
+        });
+    }
+
+    pub(crate) fn schedule_prompt_is_saving(&self) -> bool {
+        self.pending_schedule_prompt.is_some()
+    }
+
+    fn schedule_prompt_pending_for(&self, schedule_id: &str) -> bool {
+        self.pending_schedule_prompt
+            .as_ref()
+            .is_some_and(|edit| edit.schedule_id == schedule_id)
+    }
+
+    fn handle_schedule_prompt_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::SchedulePrompt, key);
+        if self.schedule_prompt_is_saving() {
+            return;
+        }
+        let Some(edit) = self.schedule_prompt.as_mut() else {
+            return;
+        };
+        match action {
+            Some(ActionId::Cancel) => self.schedule_prompt = None,
+            Some(ActionId::SaveSchedulePrompt) => {
+                let task_message = edit.textarea.lines().join("\n");
+                if task_message.trim().is_empty() {
+                    edit.error = Some("Enter a task prompt".into());
+                    return;
+                }
+                let Some(tx) = self.event_tx.clone() else {
+                    edit.error = Some("Host connection is unavailable".into());
+                    return;
+                };
+                let schedule_id = edit.schedule_id.clone();
+                self.schedule_prompt_generation = self.schedule_prompt_generation.wrapping_add(1);
+                let generation = self.schedule_prompt_generation;
+                self.pending_schedule_prompt = Some(PendingSchedulePrompt {
+                    generation,
+                    schedule_id: schedule_id.clone(),
+                    task_message: task_message.clone(),
+                });
+                edit.error = None;
+
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .set_schedule_prompt(&schedule_id, &task_message)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::SchedulePromptFinished {
+                        generation,
+                        schedule_id,
+                        result,
+                    });
+                });
+            }
+            None if text_widget_input_allowed(key) => {
+                edit.textarea.input(key);
+                edit.error = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_schedule_prompt(
+        &mut self,
+        generation: u64,
+        schedule_id: String,
+        result: Result<String, String>,
+    ) {
+        let Some(pending) = self.pending_schedule_prompt.take_if(|pending| {
+            pending.generation == generation && pending.schedule_id == schedule_id
+        }) else {
+            return;
+        };
+        let result = result.and_then(|task_message| {
+            if task_message == pending.task_message {
+                Ok(task_message)
+            } else {
+                Err("Invalid schedule prompt response".into())
+            }
+        });
+        match result {
+            Ok(task_message) => {
+                if let Some(row) = self
+                    .schedules
+                    .schedules
+                    .iter_mut()
+                    .find(|row| row.id == schedule_id && row.prompt.is_some())
+                {
+                    row.prompt = Some(task_message);
+                }
+                if self
+                    .schedule_prompt
+                    .take_if(|edit| edit.schedule_id == schedule_id)
+                    .is_some()
+                {
+                    self.status_message = "Task prompt saved".into();
+                }
+                self.refresh_schedule_catalog_after_change();
+            }
+            Err(error) => {
+                if let Some(edit) = self
+                    .schedule_prompt
+                    .as_mut()
+                    .filter(|edit| edit.schedule_id == schedule_id)
+                {
+                    edit.error = Some(error);
+                }
+            }
+        }
+    }
+
     fn refresh_schedule_catalog_after_change(&mut self) {
         // A catalog already in flight may have read the old saved fields.
         if std::mem::take(&mut self.schedules.loading) {
@@ -15503,6 +15693,7 @@ impl App {
         if self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
             || self.schedule_rename_pending_for(&schedule.id)
             || self.schedule_interval_pending_for(&schedule.id)
+            || self.schedule_prompt_pending_for(&schedule.id)
         {
             return;
         }
@@ -23414,9 +23605,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    1_323_560_173_839_743_737
+                    2_178_642_964_832_313_249
                 } else {
-                    16_562_366_538_585_194_124
+                    3_386_411_761_011_315_760
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -25123,6 +25314,184 @@ mod question_tests {
             assert!(app.schedule_rename.is_none());
             assert!(!app.schedule_rename_is_saving());
         }
+    }
+
+    #[tokio::test]
+    async fn schedule_prompt_editor_saves_exact_multiline_text_and_fences_catalogs() {
+        use tokio::sync::oneshot;
+
+        const ID: &str = "release-review";
+        const SAVED: &str = "  Draft 🧭  \ncheck release\n";
+        const EDITED: &str = "  Draft 🧭  \ncheck release\n下一步 🧪\n";
+        let catalog = |task_message: &str| {
+            serde_json::json!({"schedules": [
+                {"id": ID, "name": "Release review", "enabled": false,
+                    "trigger": {"type": "interval", "every_seconds": 90},
+                    "state": {"next_fire_at": "2028-01-26T09:10:00Z"},
+                    "run_config": {"task_message": task_message}},
+                {"id": "workflow", "name": "Workflow schedule",
+                    "trigger": {"type": "once"}, "run_config": {
+                        "workflow_target": {"workflow_id": "review", "revision": 1, "args": {}},
+                        "task_message": "Old compatibility prompt"
+                    }},
+            ]})
+            .to_string()
+        };
+        let original = catalog(SAVED);
+        let confirmed = catalog(EDITED);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (stale_seen, stale_started) = oneshot::channel();
+        let (patch_seen, patch_started) = oneshot::channel();
+        let (allow_patch, wait_patch) = oneshot::channel();
+        let (allow_fresh, wait_fresh) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut initial, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut initial).await, "/api/v1/schedules");
+            respond_test_http(&mut initial, "application/json", &original).await;
+
+            let (mut stale, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut stale).await, "/api/v1/schedules");
+            stale_seen.send(()).unwrap();
+
+            let (mut patch, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut patch).await;
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.lines().next(),
+                Some("PATCH /api/v1/schedules/release-review/prompt HTTP/1.1")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({"task_message": EDITED})
+            );
+            patch_seen.send(()).unwrap();
+            wait_patch.await.unwrap();
+            let response = serde_json::json!({"id": ID, "name": "Other name", "enabled": true,
+                "trigger": {"type": "interval", "every_seconds": 120},
+                "run_config": {"task_message": EDITED}});
+            respond_test_http(&mut patch, "application/json", &response.to_string()).await;
+
+            let (mut fresh, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut fresh).await, "/api/v1/schedules");
+            respond_test_http(&mut stale, "application/json", &original).await;
+            wait_fresh.await.unwrap();
+            respond_test_http(&mut fresh, "application/json", &confirmed).await;
+        });
+
+        async fn event(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        let mut app = App::new(client.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx.clone());
+        app.tab = Tab::Schedules;
+        app.load_schedule_catalog(client.clone(), tx.clone());
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert!(schedule_editor_preview(&app, "PROMPT", "READY").contains("p edit prompt"));
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('p'))).await.unwrap();
+        assert!(app.schedule_prompt.is_none());
+        assert!(!schedule_editor_preview(&app, "PROMPT", "WORKFLOW").contains("edit prompt"));
+        app.handle_key(key(KeyCode::Up)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('p'))).await.unwrap();
+        let preview = schedule_editor_preview(&app, "PROMPT", "EDITING");
+        assert!(preview.contains("Edit task prompt") && preview.contains("F2 save"));
+        assert_eq!(
+            app.schedule_prompt
+                .as_ref()
+                .unwrap()
+                .textarea
+                .lines()
+                .join("\n"),
+            SAVED
+        );
+        app.handle_event(AppEvent::Paste("下一步 🧪".into()))
+            .await
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_prompt_is_saving());
+        assert_eq!(
+            app.schedule_prompt
+                .as_ref()
+                .unwrap()
+                .textarea
+                .lines()
+                .join("\n"),
+            EDITED
+        );
+
+        app.load_schedule_catalog(client, tx);
+        let budget = Duration::from_secs(5);
+        tokio::time::timeout(budget, stale_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::F(2))).await.unwrap();
+        tokio::time::timeout(budget, patch_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(AppEvent::SchedulePromptFinished {
+            generation: app.schedule_prompt_generation,
+            schedule_id: "workflow".into(),
+            result: Ok(EDITED.into()),
+        })
+        .await
+        .unwrap();
+        assert!(app.schedule_prompt_is_saving());
+        assert!(schedule_editor_preview(&app, "PROMPT", "PENDING").contains("Saving…"));
+        assert_eq!(app.schedules.schedules[0].prompt.as_deref(), Some(SAVED));
+
+        allow_patch.send(()).unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert!(app.schedule_prompt.is_none());
+        let assert_saved = |app: &App| {
+            let selected = &app.schedules.schedules[app.schedules.selected];
+            assert_eq!(selected.id, ID);
+            assert_eq!(selected.prompt.as_deref(), Some(EDITED));
+            assert_eq!(selected.name.as_deref(), Some("Release review"));
+            assert_eq!(selected.enabled, Some(false));
+            assert_eq!(selected.interval_seconds, Some(90));
+            assert_eq!(app.schedules.schedules[1].prompt, None);
+        };
+        assert_saved(&app);
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert_saved(&app);
+        allow_fresh.send(()).unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert_saved(&app);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_prompt_editor_keeps_blank_input_local_and_escape_preserves_the_saved_task() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:1"));
+        app.tab = Tab::Schedules;
+        let view = serde_json::from_value(serde_json::json!({
+            "id": "task", "name": "Task",
+            "trigger": {"type": "once"}, "run_config": {"task_message": "  Keep 🧭\n "}
+        }))
+        .unwrap();
+        app.schedules.schedules.push(Schedule::from_view(view));
+        app.handle_key(key(KeyCode::Char('p'))).await.unwrap();
+        let edit = app.schedule_prompt.as_mut().unwrap();
+        edit.textarea = TextArea::new(vec!["  ".into(), " ".into()]);
+        app.handle_key(key(KeyCode::F(2))).await.unwrap();
+        assert!(!app.schedule_prompt_is_saving());
+        assert_eq!(
+            app.schedule_prompt.as_ref().unwrap().error.as_deref(),
+            Some("Enter a task prompt")
+        );
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_prompt.is_none());
+        assert_eq!(
+            app.schedules.schedules[0].prompt.as_deref(),
+            Some("  Keep 🧭\n ")
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ use crate::schedule_app::{ScheduleRunJob, ScheduleRunStatus};
 
 use super::super::types::{
     CreateScheduleRequest, PatchScheduleRequest, RenameScheduleRequest, ScheduleRunRecordView,
-    ScheduleView, SetScheduleIntervalRequest,
+    ScheduleView, SetScheduleIntervalRequest, SetSchedulePromptRequest,
 };
 use super::super::validation::{
     resolve_create_schedule_definition, resolve_patch_schedule_definition,
@@ -198,7 +198,54 @@ pub async fn set_schedule_interval(
             Some(
                 SchedulePatchRejection::NoFutureOccurrence | SchedulePatchRejection::InvalidWindow,
             ) => Ok(schedule_no_future_occurrence()),
-            None => Err(internal_server_error("change schedule interval", error)),
+            _ => Err(internal_server_error("change schedule interval", error)),
+        },
+    }
+}
+
+fn invalid_schedule_prompt() -> HttpResponse {
+    crate::error::json_error_with_code(
+        StatusCode::BAD_REQUEST,
+        "task_message is required".into(),
+        Some("invalid_schedule_prompt"),
+    )
+}
+
+/// `PATCH /api/v1/schedules/{schedule_id}/prompt`
+pub async fn set_schedule_prompt(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    req: Result<web::Json<SetSchedulePromptRequest>>,
+) -> Result<HttpResponse> {
+    let SetSchedulePromptRequest::Prompt { task_message } = match req {
+        Ok(req) => req.into_inner(),
+        Err(error) if error.as_response_error().status_code() == StatusCode::BAD_REQUEST => {
+            return Ok(invalid_schedule_prompt());
+        }
+        Err(error) => return Err(error),
+    };
+    match state
+        .schedule_store
+        .patch_task_prompt(&path, task_message)
+        .await
+    {
+        Ok(Some(schedule)) => Ok(HttpResponse::Ok().json(ScheduleView::from(schedule))),
+        Ok(None) => Ok(crate::error::json_error_with_code(
+            StatusCode::NOT_FOUND,
+            "Schedule not found".into(),
+            Some("schedule_not_found"),
+        )),
+        Err(error) => match error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<SchedulePatchRejection>())
+        {
+            Some(SchedulePatchRejection::InvalidPrompt) => Ok(invalid_schedule_prompt()),
+            Some(SchedulePatchRejection::PromptChanged) => Ok(crate::error::json_error_with_code(
+                StatusCode::CONFLICT,
+                "Schedule no longer has an editable task prompt".into(),
+                Some("schedule_prompt_changed"),
+            )),
+            _ => Err(internal_server_error("change schedule prompt", error)),
         },
     }
 }
@@ -752,6 +799,256 @@ mod tests {
             assert_eq!(store.get_schedule(&schedule.id).await, Some(exhausted));
             assert_eq!(store.get_schedule(&once.id).await, Some(once));
             assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), saved);
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_prompt_preserves_disabled_and_exhausted_tasks_and_prior_claims() {
+            const OLD_PROMPT: &str = "Previous report instructions";
+            const NEW_PROMPT: &str = " \tRéviser les notes 🧪\r\n写结论\n  ";
+
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let store = &state.schedule_store;
+            let config = ScheduleRunConfig {
+                task_message: Some(OLD_PROMPT.into()),
+                system_prompt: Some("Keep the saved report format".into()),
+                enhance_prompt: Some("Keep the saved refinement".into()),
+                model: Some("fixture-model".into()),
+                auto_execute: true,
+                ..Default::default()
+            };
+            let occurrence = chrono::Utc::now() + chrono::Duration::hours(2);
+            let once = store
+                .create_schedule(
+                    "Consumed one-shot".into(),
+                    ScheduleTrigger::Once { at: occurrence },
+                    true,
+                    config.clone(),
+                )
+                .await
+                .unwrap();
+            let ended = store
+                .create_schedule_with_definition(
+                    "Ended interval".into(),
+                    true,
+                    config.clone(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(ScheduleTrigger::legacy_interval(900, Some(occurrence))),
+                        timezone: Some("Asia/Shanghai".into()),
+                        end_at: Some(occurrence + chrono::Duration::seconds(30)),
+                        overlap_policy: Some(OverlapPolicy::Allow),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let disabled = store
+                .create_schedule(
+                    "Disabled recurring task".into(),
+                    ScheduleTrigger::legacy_interval(900, Some(occurrence)),
+                    false,
+                    config.clone(),
+                )
+                .await
+                .unwrap();
+            assert!(disabled.state.next_fire_at.is_some());
+            // Claim the due occurrences directly in the disposable store.
+            let claims = store.claim_due_runs(occurrence).await.unwrap();
+            assert_eq!(claims.len(), 2);
+            assert!(claims.iter().all(|claim| claim.run_config == config));
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            for (id, previous_next) in [
+                (&once.id, None),
+                (&ended.id, None),
+                (&disabled.id, disabled.state.next_fire_at),
+            ] {
+                let mut expected = store.get_schedule(id).await.unwrap();
+                assert!(!expected.enabled);
+                assert_eq!(expected.state.next_fire_at, previous_next);
+                assert_eq!(expected.run_config, config);
+                let records = store.list_run_records_for_schedule(id).await;
+                if let Some(claim) = claims.iter().find(|claim| claim.schedule_id == *id) {
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0].run_id, claim.run_id);
+                    assert_eq!(records[0].status, ScheduleRunStatus::Queued);
+                } else {
+                    assert!(records.is_empty());
+                }
+
+                let uri = format!("/api/v1/schedules/{id}/prompt");
+                let request = || {
+                    test::TestRequest::patch()
+                        .uri(&uri)
+                        .set_json(serde_json::json!({ "task_message": NEW_PROMPT }))
+                        .to_request()
+                };
+                let response = test::call_service(&app, request()).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let view: Value = test::read_body_json(response).await;
+                assert_eq!(view["id"].as_str(), Some(id.as_str()));
+                assert_eq!(view["run_config"]["task_message"], NEW_PROMPT);
+
+                let saved = store.get_schedule(id).await.unwrap();
+                expected.run_config.task_message = Some(NEW_PROMPT.into());
+                assert_ne!(saved.updated_at, expected.updated_at);
+                expected.updated_at = saved.updated_at;
+                assert_eq!(saved, expected);
+                assert_eq!(
+                    view,
+                    serde_json::to_value(ScheduleView::from(saved.clone())).unwrap()
+                );
+                assert_eq!(store.list_run_records_for_schedule(id).await, records);
+
+                let persisted = tokio::fs::read(store.index_path()).await.unwrap();
+                let repeated = test::call_service(&app, request()).await;
+                assert_eq!(repeated.status(), StatusCode::OK);
+                assert_eq!(test::read_body_json::<Value, _>(repeated).await, view);
+                assert_eq!(
+                    tokio::fs::read(store.index_path()).await.unwrap(),
+                    persisted
+                );
+                let reopened =
+                    ScheduleStore::new(store.index_path().parent().unwrap().to_path_buf())
+                        .await
+                        .unwrap();
+                assert_eq!(reopened.get_schedule(id).await, Some(saved));
+                assert_eq!(reopened.list_run_records_for_schedule(id).await, records);
+            }
+
+            let previous = claims
+                .iter()
+                .find(|claim| claim.schedule_id == once.id)
+                .unwrap();
+            let later = store.create_run_now(&once.id).await.unwrap().unwrap();
+            assert_ne!(previous.run_id, later.run_id);
+            assert_eq!(previous.run_config, config);
+            let mut expected = config;
+            expected.task_message = Some(NEW_PROMPT.into());
+            assert_eq!(later.run_config, expected);
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_prompt_rejects_bad_payloads_and_uneditable_rows_without_writes() {
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let store = &state.schedule_store;
+            let trigger = ScheduleTrigger::Once {
+                at: chrono::Utc::now() + chrono::Duration::hours(2),
+            };
+            let task = store
+                .create_schedule(
+                    "Task".into(),
+                    trigger.clone(),
+                    false,
+                    ScheduleRunConfig {
+                        task_message: Some("Saved prompt".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let workflow = store
+                .create_schedule(
+                    "Workflow".into(),
+                    trigger.clone(),
+                    false,
+                    ScheduleRunConfig {
+                        workflow_target: Some(bamboo_domain::ScheduledWorkflowTarget {
+                            workflow_id: "fixture-workflow".into(),
+                            revision: 1,
+                            args: serde_json::json!({}),
+                        }),
+                        auto_execute: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let empty = store
+                .create_schedule(
+                    "Empty".into(),
+                    trigger,
+                    false,
+                    ScheduleRunConfig {
+                        task_message: Some(" \t\n\u{2003}".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let saved = tokio::fs::read(store.index_path()).await.unwrap();
+            let uri = format!("/api/v1/schedules/{}/prompt", task.id);
+            for payload in [
+                r#"{"task_message":"unfinished"#,
+                "{}",
+                r#"["prompt"]"#,
+                r#"{"task_message":null}"#,
+                r#"{"task_message":7}"#,
+                r#"{"task_message":" \n\t\u2003"}"#,
+                r#"{"task_message":"Edited prompt","enabled":true}"#,
+            ] {
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::patch()
+                        .uri(&uri)
+                        .insert_header(("Content-Type", "application/json"))
+                        .set_payload(payload)
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "payload {payload}"
+                );
+                let body: Value = test::read_body_json(response).await;
+                assert_eq!(body["error"]["type"], "api_error");
+                assert_eq!(body["error"]["code"], "invalid_schedule_prompt");
+            }
+            for (id, status, code) in [
+                (
+                    workflow.id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_prompt_changed",
+                ),
+                (
+                    empty.id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_prompt_changed",
+                ),
+                ("missing", StatusCode::NOT_FOUND, "schedule_not_found"),
+            ] {
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::patch()
+                        .uri(&format!("/api/v1/schedules/{id}/prompt"))
+                        .set_json(serde_json::json!({ "task_message": "Edited prompt" }))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), status);
+                let body: Value = test::read_body_json(response).await;
+                assert_eq!(body["error"]["type"], "api_error");
+                assert_eq!(body["error"]["code"], code);
+            }
+            assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), saved);
+            assert_eq!(store.get_schedule(&task.id).await, Some(task));
+            assert_eq!(store.get_schedule(&workflow.id).await, Some(workflow));
+            assert_eq!(store.get_schedule(&empty.id).await, Some(empty));
         }
 
         #[actix_web::test]

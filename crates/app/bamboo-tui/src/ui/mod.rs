@@ -125,6 +125,9 @@ fn render_overlays(f: &mut Frame, app: &App, anchor: Option<Rect>, inline_approv
     if app.schedule_interval.is_some() {
         layout::render_schedule_interval(f, app);
     }
+    if app.schedule_prompt.is_some() {
+        layout::render_schedule_prompt(f, app);
+    }
     if app.schedule_rename.is_some() {
         layout::render_schedule_rename(f, app);
     }

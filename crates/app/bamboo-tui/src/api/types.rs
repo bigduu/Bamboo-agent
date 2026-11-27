@@ -848,13 +848,18 @@ impl Schedule {
             } else {
                 None
             };
+        let prompt = if v.run_config.workflow_target.is_none() {
+            v.run_config.task_message
+        } else {
+            None
+        };
         Self {
             cron: Some(trigger_display(&v.trigger)),
             cadence_detail: Some(trigger_cadence(v.trigger, v.timezone.as_deref())),
             interval_seconds,
             name: Some(v.name),
             enabled: Some(v.enabled),
-            prompt: v.run_config.task_message,
+            prompt,
             last_run: v.state.last_finished_at,
             next_run: v.state.next_fire_at,
             id: v.id,
@@ -1096,6 +1101,8 @@ pub struct ScheduleRunConfigView {
     pub project_id: Option<String>,
     #[serde(default)]
     pub task_message: Option<String>,
+    #[serde(default)]
+    pub workflow_target: Option<serde_json::Value>,
 }
 
 /// Body of `POST /api/v1/schedules`. Must match the server's

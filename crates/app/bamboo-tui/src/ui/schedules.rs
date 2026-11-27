@@ -100,14 +100,29 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             ),
         );
     }
-    f.render_widget(Paragraph::new(header), chunks[0]);
-
-    let body = chunks[1];
     let selected = app
         .schedules
         .selected
         .min(app.schedules.schedules.len().saturating_sub(1));
     let selected_schedule = app.schedules.schedules.get(selected);
+    if selected_schedule
+        .and_then(|schedule| schedule.prompt.as_deref())
+        .is_some_and(|prompt| !prompt.trim().is_empty())
+    {
+        let key = app
+            .keymap
+            .primary_hint(ActionContext::Schedules, ActionId::EditSchedulePrompt);
+        header.spans.insert(
+            1,
+            Span::styled(
+                format!(" · {key} edit prompt"),
+                Style::default().fg(colors::inactive()),
+            ),
+        );
+    }
+    f.render_widget(Paragraph::new(header), chunks[0]);
+
+    let body = chunks[1];
     let detail_width = body.width.saturating_sub(2);
     let toggle = selected_schedule
         .filter(|_| body.height > 2 && detail_width > 0)
