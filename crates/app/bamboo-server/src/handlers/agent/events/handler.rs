@@ -3,7 +3,7 @@ use serde::Deserialize;
 
 use super::stream::{live_stream_response, terminal_response};
 use super::subscription::subscribe_with_runner_snapshot;
-use super::terminal::terminal_event_if_ready;
+use super::terminal::{terminal_event_for_status, terminal_event_if_ready};
 use crate::app_state::{AgentStatus, AppState};
 
 /// Upper bound for the client-supplied token-coalescing window (milliseconds).
@@ -102,19 +102,43 @@ pub async fn handler(
         if let Some(terminal_event) =
             terminal_event_if_ready(&state, &session_id, runner_status).await
         {
-            tracing::debug!(
-                "[{}] Events -> ONE-SHOT terminal stream (closing immediately); the client will treat this as a finished run",
-                session_id,
-            );
             let diagnostic =
                 super::super::llm_diagnostics::persisted(state.get_ref(), &session_id).await;
-            return terminal_response(
-                budget_event_to_replay,
-                critical_events_to_replay,
-                terminal_event,
-                session_id,
-                diagnostic,
-            );
+            // A runner can start or finish during the cold storage reads.
+            // Keep events published after subscription in their original order.
+            let current_runners = if runner_snapshot.is_none()
+                && matches!(&terminal_event, bamboo_agent_core::AgentEvent::Error { .. })
+            {
+                Some(state.agent_runners.read().await)
+            } else {
+                None
+            };
+            let current_runner = current_runners
+                .as_ref()
+                .and_then(|runners| runners.get(&session_id));
+            let terminal_event = match current_runner {
+                Some(runner)
+                    if matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
+                        || !receiver.is_empty() =>
+                {
+                    None
+                }
+                Some(runner) => Some(terminal_event_for_status(Some(runner.status.clone()))),
+                None => Some(terminal_event),
+            };
+            if let Some(terminal_event) = terminal_event {
+                tracing::debug!(
+                    "[{}] Events -> ONE-SHOT terminal stream (closing immediately); the client will treat this as a finished run",
+                    session_id,
+                );
+                return terminal_response(
+                    budget_event_to_replay,
+                    critical_events_to_replay,
+                    terminal_event,
+                    session_id,
+                    diagnostic,
+                );
+            }
         }
     }
 
@@ -141,12 +165,236 @@ pub async fn handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::Responder;
+    use actix_web::{test, App, Responder};
     use bamboo_agent_core::{AgentEvent, Message, Session};
-    use bamboo_domain::Storage;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use bamboo_domain::{AgentRuntimeState, AgentStatusState, LlmRequestDiagnostic, Storage};
+    use serde_json::Value;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct UnexpectedProvider(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl bamboo_llm::LLMProvider for UnexpectedProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("observing an SSE stream must not start a provider call");
+        }
+    }
+
+    async fn sse_app_state(home: &Path, provider: Arc<UnexpectedProvider>) -> AppState {
+        let mut config = bamboo_llm::Config::default();
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
+        AppState::new_with_provider(home.to_path_buf(), config, provider)
+            .await
+            .unwrap()
+    }
+
+    fn saved_failure(id: &str, runtime_status: AgentStatusState) -> Session {
+        let mut session = Session::new(id, "test-model");
+        session.add_message(Message::user("saved user turn"));
+        session.add_message(Message::assistant("partial assistant reply", None));
+        let mut runtime = AgentRuntimeState::new(uuid::Uuid::new_v4().to_string());
+        runtime.execution_id = Some(uuid::Uuid::new_v4().to_string());
+        runtime.status = runtime_status;
+        session.agent_runtime_state = Some(runtime);
+        session.set_last_run_status("error");
+        session.set_last_run_error("provider disconnected after partial output");
+        session
+    }
+
+    async fn read_sse_body(body: impl actix_web::body::MessageBody) -> String {
+        let bytes = tokio::time::timeout(Duration::from_secs(2), actix_web::body::to_bytes(body))
+            .await
+            .expect("SSE ends after the terminal event")
+            .unwrap_or_else(|_| panic!("read SSE body"));
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn sse_data(body: &str) -> Vec<&str> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect()
+    }
+
+    async fn assert_cold_sse_failure(session: Session, diagnostic: Option<LlmRequestDiagnostic>) {
+        let home = tempfile::tempdir().unwrap();
+        let provider = Arc::new(UnexpectedProvider::default());
+        let writer = sse_app_state(home.path(), provider.clone()).await;
+        writer.storage.save_session(&session).await.unwrap();
+        writer.shutdown().await;
+        drop(writer);
+
+        let state = web::Data::new(sse_app_state(home.path(), provider.clone()).await);
+        assert!(state.agent_runners.read().await.get(&session.id).is_none());
+        let saved = state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.last_run_status().as_deref(), Some("error"));
+        assert_eq!(saved.last_run_error(), session.last_run_error());
+        assert_eq!(saved.last_run_diagnostic(), diagnostic);
+        assert_eq!(
+            saved.agent_runtime_state.as_ref().unwrap().status,
+            session.agent_runtime_state.as_ref().unwrap().status,
+        );
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/events/{}", session.id))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let body = read_sse_body(response.into_body()).await;
+        let after = state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        state.shutdown().await;
+
+        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            serde_json::to_value(&after.messages).unwrap(),
+            serde_json::to_value(&session.messages).unwrap(),
+        );
+        assert_eq!(after.last_run_error(), session.last_run_error());
+        assert_eq!(after.last_run_diagnostic(), diagnostic);
+        let frames = sse_data(&body);
+        assert_eq!(frames.len(), 2, "{body}");
+        assert_eq!(frames[1], "[DONE]");
+        let event: Value = serde_json::from_str(frames[0]).unwrap();
+        assert_eq!(event["type"], "error", "{body}");
+        assert_eq!(
+            event["message"],
+            session.last_run_error().unwrap(),
+            "{body}"
+        );
+        assert_eq!(
+            event.get("diagnostic").cloned(),
+            diagnostic.map(|receipt| serde_json::to_value(receipt).unwrap()),
+            "{body}",
+        );
+    }
+
+    #[actix_web::test]
+    async fn cold_sse_replays_saved_legacy_error_with_stale_running_runtime() {
+        let session = saved_failure("cold-sse-legacy-error", AgentStatusState::Running);
+        assert_cold_sse_failure(session, None).await;
+    }
+
+    #[actix_web::test]
+    async fn cold_sse_replays_exact_failed_error_and_persisted_timeout_receipt() {
+        use bamboo_agent_core::{AgentError, StreamTimeoutError, StreamTimeoutPhase};
+
+        let mut session = saved_failure("cold-sse-timeout-error", AgentStatusState::Failed);
+        let timeout = StreamTimeoutError::new(
+            StreamTimeoutPhase::TransportIdle,
+            Duration::from_secs(120),
+            Some("fixture-provider".into()),
+            Some("test-model".into()),
+            Duration::from_millis(120_002),
+            Some(Duration::from_millis(120_002)),
+            true,
+        );
+        assert!(session.record_llm_request_diagnostic(timeout.diagnostic(&session).unwrap()));
+        session.set_last_run_error(AgentError::StreamTimeout(timeout).to_string());
+        let diagnostic = session
+            .last_run_diagnostic()
+            .expect("validated timeout receipt");
+        assert_cold_sse_failure(session, Some(diagnostic)).await;
+    }
+
+    #[actix_web::test]
+    async fn cold_sse_keeps_newer_native_inbox_work_live_after_saved_error() {
+        use bamboo_domain::{SessionActivationPolicy, SessionMessageEnvelope};
+
+        let home = tempfile::tempdir().unwrap();
+        let provider = Arc::new(UnexpectedProvider::default());
+        let state = web::Data::new(sse_app_state(home.path(), provider.clone()).await);
+        let id = "cold-sse-newer-inbox-work";
+        let session = saved_failure(id, AgentStatusState::Running);
+        state.storage.save_session(&session).await.unwrap();
+        state
+            .session_inbox
+            .deliver_with_activation_intent(
+                &SessionMessageEnvelope::user_input(id, "newer input"),
+                SessionActivationPolicy::RespectSpecificWait,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(state
+            .session_inbox
+            .inspect(id)
+            .await
+            .unwrap()
+            .activation_pending());
+
+        let sender = state.get_session_event_sender(id).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/events/{id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let token = AgentEvent::Token {
+            content: "live subscriber observed newer turn".into(),
+        };
+        let terminal = AgentEvent::Complete {
+            usage: Default::default(),
+        };
+        sender
+            .send(token.clone())
+            .expect("subscriber keeps the live receiver");
+        sender.send(terminal.clone()).unwrap();
+        let body = read_sse_body(response.into_body()).await;
+        state.shutdown().await;
+
+        let frames = sse_data(&body);
+        assert_eq!(frames.len(), 3, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(frames[0]).unwrap(),
+            serde_json::to_value(token).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(frames[1]).unwrap(),
+            serde_json::to_value(terminal).unwrap()
+        );
+        assert_eq!(frames[2], "[DONE]");
+        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+    }
 
     struct MainReadBarrier {
         inner: Arc<dyn Storage>,
@@ -174,6 +422,97 @@ mod tests {
         async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
             self.inner.delete_session(id).await
         }
+    }
+
+    #[actix_web::test]
+    async fn cold_sse_keeps_same_root_runner_reserved_during_main_read_live() {
+        assert_cold_sse_keeps_newer_runner("cold-sse-runner-reserved", AgentStatus::Pending).await;
+    }
+
+    #[actix_web::test]
+    async fn cold_sse_delivers_same_root_run_completed_during_main_read() {
+        assert_cold_sse_keeps_newer_runner("cold-sse-runner-completed", AgentStatus::Completed)
+            .await;
+    }
+
+    async fn assert_cold_sse_keeps_newer_runner(id: &str, status: AgentStatus) {
+        let home = tempfile::tempdir().unwrap();
+        let provider = Arc::new(UnexpectedProvider::default());
+        let writer = sse_app_state(home.path(), provider.clone()).await;
+        let session = saved_failure(id, AgentStatusState::Running);
+        writer.storage.save_session(&session).await.unwrap();
+        writer.shutdown().await;
+        drop(writer);
+
+        let mut app_state = sse_app_state(home.path(), provider.clone()).await;
+        let barrier = Arc::new(MainReadBarrier {
+            inner: app_state.storage.clone(),
+            session_id: id.into(),
+            armed: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        app_state.storage = barrier.clone();
+        let state = web::Data::new(app_state);
+        let sender = state.get_session_event_sender(id).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let request = test::TestRequest::get().uri(&format!("/api/v1/events/{id}"));
+        let token = AgentEvent::Token {
+            content: "exact same-Root progress".into(),
+        };
+        let terminal = AgentEvent::Complete {
+            usage: bamboo_agent_core::agent::events::TokenUsage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                total_tokens: 5,
+            },
+        };
+        let completed_during_read = matches!(status, AgentStatus::Completed);
+        let install_runner = async {
+            barrier.entered.notified().await;
+            let mut runner = crate::app_state::AgentRunner::new();
+            runner.status = status;
+            runner.completed_at = completed_during_read.then(chrono::Utc::now);
+            runner.event_sender = sender.clone();
+            let mut runners = state.agent_runners.write().await;
+            assert!(runners.insert(id.into(), runner).is_none());
+            if completed_during_read {
+                sender.send(token.clone()).expect("subscriber is attached");
+                sender.send(terminal.clone()).unwrap();
+            }
+            drop(runners);
+            barrier.release.notify_one();
+        };
+        let (response, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                test::call_service(&app, request.to_request()),
+                install_runner
+            )
+        })
+        .await
+        .expect("Main-read barrier completes without timing the reservation");
+
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        if !completed_during_read {
+            // A pending reservation keeps the receiver even before it publishes.
+            let _ = sender.send(token.clone());
+            let _ = sender.send(terminal.clone());
+        }
+        let body = read_sse_body(response.into_body()).await;
+        state.agent_runners.write().await.remove(id);
+        state.shutdown().await;
+
+        let frames = sse_data(&body);
+        assert_eq!(frames.len(), 3, "{body}");
+        assert_eq!(frames[0], serde_json::to_string(&token).unwrap());
+        assert_eq!(frames[1], serde_json::to_string(&terminal).unwrap());
+        assert_eq!(frames[2], "[DONE]");
+        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
     }
 
     #[actix_web::test]
