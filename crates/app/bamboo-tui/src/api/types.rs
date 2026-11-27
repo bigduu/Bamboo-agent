@@ -7,7 +7,7 @@
 //! crate still warns, since the blanket crate-level allow was removed.
 #![allow(dead_code)]
 
-use chrono::{DateTime, NaiveTime, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveTime, SecondsFormat, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 fn default_allow_custom() -> bool {
@@ -834,6 +834,7 @@ pub struct Schedule {
     pub daily_time: Option<ScheduleClockTime>,
     pub weekly_time: Option<ScheduleWeeklyTime>,
     pub monthly_time: Option<ScheduleMonthlyTime>,
+    pub once_at: Option<DateTime<Utc>>,
     pub timezone: Option<String>,
     pub enabled: Option<bool>,
     pub prompt: Option<String>,
@@ -853,6 +854,14 @@ impl Schedule {
                 None
             };
         let ordinary = v.run_config.workflow_target.is_none();
+        let once_at = v
+            .state
+            .next_fire_at
+            .filter(|_| {
+                ordinary && v.trigger.get("type").and_then(|tag| tag.as_str()) == Some("once")
+            })
+            .and_then(|_| v.trigger.get("at"))
+            .and_then(|at| DateTime::<Utc>::deserialize(at).ok());
         let (daily_time, weekly_time, monthly_time) = if ordinary
             && matches!(
                 v.trigger.get("type").and_then(|tag| tag.as_str()),
@@ -903,6 +912,7 @@ impl Schedule {
             daily_time,
             weekly_time,
             monthly_time,
+            once_at,
             timezone: v.timezone,
             name: Some(v.name),
             enabled: Some(v.enabled),
@@ -920,6 +930,30 @@ impl Schedule {
             ScheduleClockKind::Monthly => self.monthly_time.as_ref().map(|monthly| monthly.time),
         }
     }
+
+    pub(crate) fn upcoming_once_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.once_at.filter(|&at| {
+            self.next_run.is_some_and(|next| next > now) && schedule_once_rfc3339_time(at).is_some()
+        })
+    }
+}
+
+fn schedule_once_rfc3339_time(at: DateTime<Utc>) -> Option<DateTime<FixedOffset>> {
+    const MAX_RFC3339_OFFSET_SECONDS: i32 = 23 * 3600 + 59 * 60;
+    // UTC normalization can move a valid four-digit local timestamp across
+    // the RFC3339 year boundary. Use a legal offset that maps it back.
+    let offset = match at.year() {
+        0..=9999 => return Some(at.fixed_offset()),
+        -1 => FixedOffset::east_opt(MAX_RFC3339_OFFSET_SECONDS)?,
+        10000 => FixedOffset::west_opt(MAX_RFC3339_OFFSET_SECONDS)?,
+        _ => return None,
+    };
+    let local = at.with_timezone(&offset);
+    (0..=9999).contains(&local.year()).then_some(local)
+}
+
+pub(crate) fn format_schedule_once_at(at: DateTime<Utc>) -> Option<String> {
+    schedule_once_rfc3339_time(at).map(|value| value.to_rfc3339_opts(SecondsFormat::AutoSi, true))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1449,6 +1483,79 @@ pub struct SkillDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedule_projection_requires_an_ordinary_once_trigger_and_pending_state() {
+        let project = |trigger, next_fire_at, run_config| {
+            let view = serde_json::from_value(serde_json::json!({
+                "id": "once-17",
+                "enabled": false,
+                "trigger": trigger,
+                "state": {"next_fire_at": next_fire_at},
+                "run_config": run_config,
+            }))
+            .unwrap();
+            Schedule::from_view(view)
+        };
+        let raw_at = "2030-03-31T08:15:00.125+08:00";
+        let saved_at = DateTime::parse_from_rfc3339(raw_at).unwrap().to_utc();
+        let trigger = serde_json::json!({"type": "once", "at": raw_at});
+        let next = "2030-03-31T00:30:00Z";
+        let next_run = DateTime::parse_from_rfc3339(next).unwrap().to_utc();
+        let ordinary = serde_json::json!({"task_message": "Review results"});
+        let saved = project(trigger.clone(), Some(next), ordinary.clone());
+        assert_eq!(saved.once_at, Some(saved_at));
+        assert_eq!(saved.enabled, Some(false));
+        assert_eq!(saved.upcoming_once_at(saved_at), Some(saved_at));
+        assert_eq!(saved.upcoming_once_at(next_run), None);
+        assert_eq!(
+            saved.cadence_detail.as_deref(),
+            Some("Once 2030-03-31T00:15:00.125Z")
+        );
+        let unrepresentable = "+10000-01-02T00:00:00Z";
+        let legacy = project(
+            serde_json::json!({"type": "once", "at": unrepresentable}),
+            Some(unrepresentable),
+            ordinary.clone(),
+        );
+        assert!(legacy.once_at.is_some());
+        assert_eq!(legacy.upcoming_once_at(saved_at), None);
+        for (trigger, pending, config) in [
+            (trigger.clone(), None, ordinary.clone()),
+            (
+                trigger,
+                Some(next),
+                serde_json::json!({"workflow_target": {"workflow_id": "review"}}),
+            ),
+            (
+                serde_json::json!({"type": "daily", "at": raw_at}),
+                Some(next),
+                ordinary.clone(),
+            ),
+            (
+                serde_json::json!({"type": "once", "at": "not a timestamp"}),
+                Some(next),
+                ordinary,
+            ),
+        ] {
+            let saved = project(trigger, pending, config);
+            assert_eq!(saved.once_at, None);
+            assert_eq!(saved.upcoming_once_at(saved_at), None);
+        }
+    }
+
+    #[test]
+    fn once_timestamp_format_keeps_instants_that_cross_the_rfc3339_years() {
+        for timestamp in [
+            "9999-12-31T23:59:59.125-23:59",
+            "0000-01-01T00:00:00.125+23:59",
+        ] {
+            let at = DateTime::parse_from_rfc3339(timestamp).unwrap().to_utc();
+            assert_eq!(format_schedule_once_at(at).as_deref(), Some(timestamp));
+        }
+        let at = "+10000-01-02T00:00:00Z".parse().unwrap();
+        assert_eq!(format_schedule_once_at(at), None);
+    }
 
     #[test]
     fn schedule_projection_exposes_only_valid_typed_interval_periods() {

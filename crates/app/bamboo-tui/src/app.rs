@@ -33,7 +33,9 @@ use crate::keymap::{
     text_character, text_widget_input_allowed, ActionAvailability, ActionContext, ActionId,
     HelpEntry, KeyResolution, Keymap, PendingSequence,
 };
-use crate::schedule_form::{parse_schedule_clock, ScheduleForm};
+use crate::schedule_form::{
+    parse_schedule_clock, parse_schedule_once_at, ScheduleForm, SCHEDULE_ONCE_AT_INPUT_ERROR,
+};
 use crate::search::ranked_indices;
 use crate::subagents::{SubagentTreeState, SubagentTreeStatus, MAX_SUBAGENT_TREE_SESSIONS};
 use crate::task_plan::{TaskPlanOverlayState, TaskPlanPane, TaskProgressState};
@@ -1952,12 +1954,14 @@ struct PendingScheduleCadence {
 pub(crate) enum ScheduleCadenceKind {
     Interval,
     Clock(ScheduleClockKind),
+    OnceAt,
 }
 
 #[derive(Clone, Copy)]
 enum ScheduleCadenceValue {
     Interval(u64),
     Clock(ScheduleClockKind, ScheduleClockTime),
+    OnceAt(DateTime<Utc>),
 }
 
 const INTERVAL_INPUT_ERROR: &str = "Enter a positive whole number of seconds";
@@ -1989,6 +1993,9 @@ impl ScheduleCadenceEdit {
             ScheduleCadenceKind::Clock(kind) => parse_schedule_clock(&self.draft)
                 .map(|time| ScheduleCadenceValue::Clock(kind, time))
                 .ok_or(SCHEDULE_CLOCK_INPUT_ERROR),
+            ScheduleCadenceKind::OnceAt => {
+                parse_schedule_once_at(&self.draft, Utc::now()).map(ScheduleCadenceValue::OnceAt)
+            }
         }
     }
 
@@ -2005,6 +2012,12 @@ impl ScheduleCadenceEdit {
                 8,
                 SCHEDULE_CLOCK_INPUT_ERROR,
                 SCHEDULE_CLOCK_INPUT_ERROR,
+            ),
+            ScheduleCadenceKind::OnceAt => (
+                character.is_ascii_digit() || "-+:TtZz. ".contains(character),
+                64,
+                SCHEDULE_ONCE_AT_INPUT_ERROR,
+                "Once timestamp is too long",
             ),
         };
         if !allowed {
@@ -15254,6 +15267,9 @@ impl App {
             Some(ActionId::EditScheduleMonthlyTime) => {
                 self.open_schedule_cadence(ScheduleCadenceKind::Clock(ScheduleClockKind::Monthly))
             }
+            Some(ActionId::EditScheduleOnceTime) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::OnceAt)
+            }
             Some(ActionId::EditSchedulePrompt) => self.open_schedule_prompt(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
@@ -15452,6 +15468,15 @@ impl App {
                 };
                 (every_seconds.to_string(), None, None)
             }
+            ScheduleCadenceKind::OnceAt => {
+                let Some(draft) = schedule
+                    .upcoming_once_at(Utc::now())
+                    .and_then(format_schedule_once_at)
+                else {
+                    return;
+                };
+                (draft, None, None)
+            }
             ScheduleCadenceKind::Clock(kind) => {
                 let Some(ScheduleClockTime {
                     hour,
@@ -15558,6 +15583,9 @@ impl App {
                                 .update_schedule_clock_time(&schedule_id, kind, time)
                                 .await
                         }
+                        ScheduleCadenceValue::OnceAt(at) => {
+                            client.update_schedule_once_at(&schedule_id, at).await
+                        }
                     };
                     let _ = tx.send(AppEvent::ScheduleCadenceFinished {
                         generation,
@@ -15601,10 +15629,16 @@ impl App {
                 "Invalid Monthly time response",
                 "Monthly schedule time saved",
             ),
+            ScheduleCadenceValue::OnceAt(_) => {
+                ("Invalid Once time response", "Once schedule time saved")
+            }
         };
         let correct_value = |schedule: &Schedule| match pending.value {
             ScheduleCadenceValue::Interval(seconds) => schedule.interval_seconds == Some(seconds),
             ScheduleCadenceValue::Clock(kind, time) => schedule.clock_time(kind) == Some(time),
+            ScheduleCadenceValue::OnceAt(at) => {
+                schedule.once_at == Some(at) && schedule.next_run == Some(at)
+            }
         };
         let result = result.and_then(|schedule| {
             if schedule.id == schedule_id && correct_value(&schedule) {
@@ -15620,6 +15654,7 @@ impl App {
                         && match pending.value {
                             ScheduleCadenceValue::Interval(_) => row.interval_seconds.is_some(),
                             ScheduleCadenceValue::Clock(kind, _) => row.clock_time(kind).is_some(),
+                            ScheduleCadenceValue::OnceAt(_) => row.once_at.is_some(),
                         }
                 }) {
                     match pending.value {
@@ -15630,6 +15665,10 @@ impl App {
                             row.daily_time = schedule.daily_time;
                             row.weekly_time = schedule.weekly_time;
                             row.monthly_time = schedule.monthly_time;
+                            row.timezone = schedule.timezone;
+                        }
+                        ScheduleCadenceValue::OnceAt(at) => {
+                            row.once_at = Some(at);
                             row.timezone = schedule.timezone;
                         }
                     }
@@ -23735,9 +23774,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    2_127_276_734_221_655_232
+                    13_760_179_138_186_495_100
                 } else {
-                    15_972_041_773_537_586_509
+                    6_778_824_493_373_319_245
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -26153,6 +26192,151 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn schedule_once_time_edits_only_pending_tasks_and_keeps_the_refused_draft() {
+        use chrono::Datelike;
+        use tokio::io::AsyncWriteExt;
+
+        const ID: &str = "once/review";
+        let year = Utc::now().year() + 1;
+        let old_at = format!("{year}-03-30T09:15:00Z");
+        let entered = format!("{year}-04-30T18:42:17.250+08:00");
+        let canonical = format!("{year}-04-30T10:42:17.250Z");
+        let original = serde_json::json!({
+            "id": ID, "name": "Once review", "enabled": false, "timezone": "Asia/Shanghai",
+            "trigger": {"type": "once", "at": old_at},
+            "run_config": {"task_message": "Review the report"},
+            "state": {"next_fire_at": old_at},
+        });
+        let mut consumed = original.clone();
+        consumed["id"] = serde_json::json!("consumed");
+        consumed["name"] = serde_json::json!("Consumed review");
+        consumed["state"] = serde_json::json!({"next_fire_at": null});
+        let mut confirmed = original.clone();
+        confirmed["trigger"]["at"] = serde_json::json!(canonical);
+        confirmed["state"]["next_fire_at"] = serde_json::json!(canonical);
+        let expected_body = serde_json::json!({"at": canonical});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for refuse in [true, false] {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut connection).await;
+                let (head, body) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    head.lines().next(),
+                    Some("PATCH /api/v1/schedules/once%2Freview/once-at HTTP/1.1")
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    expected_body
+                );
+                if refuse {
+                    connection
+                        .write_all(
+                            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    connection.shutdown().await.unwrap();
+                } else {
+                    respond_test_http(&mut connection, "application/json", &confirmed.to_string())
+                        .await;
+                }
+            }
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = [consumed, original]
+            .into_iter()
+            .map(|view| Schedule::from_view(serde_json::from_value(view).unwrap()))
+            .collect();
+
+        assert!(!schedule_editor_preview(&app, "ONCE", "CONSUMED").contains("o edit once time"));
+        app.handle_key(key(KeyCode::Char('o'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        assert!(schedule_editor_preview(&app, "ONCE", "READY").contains("o edit once time"));
+        app.handle_key(key(KeyCode::Char('o'))).await.unwrap();
+        assert_eq!(app.schedule_cadence.as_ref().unwrap().draft, old_at);
+        for width in [60, 120] {
+            let opened = schedule_editor_preview_at_width(&app, "ONCE", "EDITING", width);
+            assert!(opened.contains("Edit once time") && opened.contains(&format!("At: {old_at}")));
+            assert!(opened.contains("Include Z or an offset such as +08:00."));
+            assert!(opened.contains("Enter save") && opened.contains("Esc cancel"));
+        }
+
+        for _ in 0..old_at.len() {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        let without_offset = format!("{year}-04-30T18:42:17");
+        for character in without_offset.chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_cadence_is_saving());
+        assert_eq!(
+            app.schedule_cadence.as_ref().unwrap().error.as_deref(),
+            Some(SCHEDULE_ONCE_AT_INPUT_ERROR)
+        );
+        for _ in 0..without_offset.len() {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in entered.chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+
+        let budget = Duration::from_secs(5);
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let refused = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(refused).await.unwrap();
+        let editor = app.schedule_cadence.as_ref().unwrap();
+        assert_eq!(editor.draft, entered);
+        assert_eq!(
+            editor.error.as_deref(),
+            Some("Editing Once time requires a newer Host")
+        );
+        for width in [60, 120] {
+            let refused = schedule_editor_preview_at_width(&app, "ONCE", "REFUSED", width);
+            assert!(refused.contains(&entered));
+            assert!(refused.contains("Editing Once time requires a newer Host"));
+        }
+        assert_eq!(
+            app.schedules.schedules[1].next_run,
+            Some(old_at.parse().unwrap())
+        );
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let saved = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(saved).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert_eq!(app.status_message, "Once schedule time saved");
+        assert!(app.schedules.schedules[0].once_at.is_none());
+        assert!(app.schedules.schedules[0].next_run.is_none());
+        let row = &app.schedules.schedules[1];
+        assert_eq!(row.once_at, Some(canonical.parse().unwrap()));
+        assert_eq!(row.next_run, row.once_at);
+        assert_eq!(row.name.as_deref(), Some("Once review"));
+        assert_eq!(row.enabled, Some(false));
+        assert_eq!(row.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(row.prompt.as_deref(), Some("Review the report"));
+        for width in [60, 120] {
+            let saved = schedule_editor_preview_at_width(&app, "ONCE", "SAVED", width);
+            assert!(saved.contains(&canonical));
+            assert!(!saved.contains("Edit once time"));
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn schedule_interval_updates_one_row_through_the_host_and_fences_catalogs() {
         use tokio::sync::oneshot;
 
@@ -27167,6 +27351,7 @@ mod question_tests {
                 daily_time: None,
                 weekly_time: None,
                 monthly_time: None,
+                once_at: None,
                 timezone: None,
                 enabled: Some(true),
                 prompt: None,
@@ -27263,6 +27448,7 @@ mod question_tests {
             daily_time: None,
             weekly_time: None,
             monthly_time: None,
+            once_at: None,
             timezone: None,
             enabled: Some(true),
             prompt: None,
@@ -27807,6 +27993,7 @@ mod question_tests {
             daily_time: None,
             weekly_time: None,
             monthly_time: None,
+            once_at: None,
             timezone: None,
             enabled: Some(true),
             prompt: None,

@@ -171,12 +171,7 @@ impl ScheduleForm {
                 }
             }
             ScheduleTriggerKind::Once => {
-                let at = DateTime::parse_from_rfc3339(timing)
-                    .map_err(|_| "Enter an RFC3339 timestamp with an offset (Z or +08:00)")?
-                    .with_timezone(&Utc);
-                if at <= now {
-                    return Err("Once must be scheduled for a future time");
-                }
+                let at = parse_schedule_once_at(timing, now)?;
                 ScheduleTriggerReq::Once { at }
             }
             ScheduleTriggerKind::Interval => {
@@ -243,6 +238,22 @@ impl ScheduleForm {
 
 fn shifted_index(index: usize, direction: isize, len: usize) -> usize {
     (index % len + direction.rem_euclid(len as isize) as usize) % len
+}
+
+pub(crate) const SCHEDULE_ONCE_AT_INPUT_ERROR: &str =
+    "Enter an RFC3339 timestamp with an offset (Z or +08:00)";
+
+pub(crate) fn parse_schedule_once_at(
+    input: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, &'static str> {
+    let at = DateTime::parse_from_rfc3339(input.trim())
+        .map_err(|_| SCHEDULE_ONCE_AT_INPUT_ERROR)?
+        .with_timezone(&Utc);
+    if at <= now {
+        return Err("Once must be scheduled for a future time");
+    }
+    Ok(at)
 }
 
 fn parse_clock(timing: &str) -> Result<(u8, u8, u8), &'static str> {

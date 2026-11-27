@@ -354,6 +354,8 @@ impl ScheduleDefinitionChanges {
 pub(crate) enum SchedulePatchRejection {
     #[error("schedule has no next run within configured window")]
     NoFutureOccurrence,
+    #[error("one-time occurrence is no longer pending")]
+    OnceNotPending,
     #[error("start_at must be earlier than end_at")]
     InvalidWindow,
     #[error("interval must be a positive, representable number of seconds")]
@@ -1316,6 +1318,68 @@ impl ScheduleStore {
         )?);
         candidate.updated_at = now;
 
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
+    }
+
+    pub(crate) async fn patch_once_at(
+        &self,
+        id: &str,
+        at: DateTime<Utc>,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        if !matches!(existing.trigger, ScheduleTrigger::Once { .. })
+            || existing.run_config.workflow_target.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::TriggerChanged,
+            ));
+        }
+
+        let now = Utc::now();
+        if existing.state.next_fire_at.is_none_or(|due| due <= now)
+            || current_due_at(existing).is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::OnceNotPending,
+            ));
+        }
+        let after = existing
+            .state
+            .last_scheduled_at
+            .map_or(now, |last| now.max(last));
+        if at <= after
+            || existing.start_at.is_some_and(|start| at < start)
+            || existing.end_at.is_some_and(|end| at > end)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::NoFutureOccurrence,
+            ));
+        }
+
+        let trigger = ScheduleTrigger::Once { at };
+        if existing.trigger == trigger && existing.state.next_fire_at == Some(at) {
+            return Ok(Some(existing.clone()));
+        }
+
+        let mut candidate = existing.clone();
+        candidate.trigger = trigger;
+        candidate.state.next_fire_at = Some(at);
+        candidate.updated_at = now;
         let mut next = index.clone();
         next.schedules.insert(id.to_owned(), candidate.clone());
         self.persist_updated_index(&mut next).await?;

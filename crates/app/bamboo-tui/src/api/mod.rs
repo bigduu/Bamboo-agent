@@ -1443,6 +1443,107 @@ impl BambooClient {
         Ok(schedule)
     }
 
+    pub(crate) async fn update_schedule_once_at(
+        &self,
+        schedule_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Schedule> {
+        use reqwest::StatusCode;
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        let timestamp = format_schedule_once_at(at)
+            .context("Enter a future RFC3339 timestamp for Once time")?;
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "once-at"]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not contact the Host to update Once time"))?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "at": timestamp }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update Once time")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update Once time")
+                }
+            })?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let code = match status {
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                    schedule_response_code(response).await
+                }
+                _ => None,
+            };
+            match (status, code.as_deref()) {
+                (StatusCode::BAD_REQUEST, Some("invalid_schedule_once_at")) => {
+                    anyhow::bail!("Enter a future RFC3339 timestamp for Once time")
+                }
+                (StatusCode::CONFLICT, Some("schedule_trigger_changed")) => {
+                    anyhow::bail!("Schedule is no longer a Once schedule")
+                }
+                (StatusCode::CONFLICT, Some("schedule_once_not_pending")) => {
+                    anyhow::bail!("Once schedule no longer has a pending occurrence")
+                }
+                (StatusCode::CONFLICT, Some("schedule_no_future_occurrence")) => {
+                    anyhow::bail!("Schedule has no future occurrence")
+                }
+                (StatusCode::NOT_FOUND, Some("schedule_not_found")) => {
+                    anyhow::bail!("Schedule no longer exists")
+                }
+                (StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED, _) => {
+                    anyhow::bail!("Editing Once time requires a newer Host")
+                }
+                _ => anyhow::bail!("Could not update Once time (HTTP {})", status.as_u16()),
+            }
+        }
+
+        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                ScheduleBodyError::TooLarge => {
+                    anyhow::anyhow!("Once time response is too large (2 MiB limit)")
+                }
+                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for the Once time response")
+                }
+                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid Once time response"),
+            })?;
+        let receipt: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Once time response"))?;
+        anyhow::ensure!(
+            receipt
+                .get("state")
+                .is_some_and(serde_json::Value::is_object)
+                && receipt
+                    .get("run_config")
+                    .is_some_and(serde_json::Value::is_object),
+            "Invalid Once time response"
+        );
+        let view: ScheduleView = serde_json::from_value(receipt)
+            .map_err(|_| anyhow::anyhow!("Invalid Once time response"))?;
+        let schedule = Schedule::from_view(view);
+        anyhow::ensure!(
+            schedule.id == schedule_id
+                && schedule.once_at == Some(at)
+                && schedule.next_run == Some(at),
+            "Once time response does not match the request"
+        );
+        Ok(schedule)
+    }
+
     pub(crate) async fn set_schedule_prompt(
         &self,
         schedule_id: &str,
@@ -2939,6 +3040,209 @@ mod tests {
         let (result, ()) = timeout(Duration::from_secs(5), async {
             tokio::join!(
                 client.update_schedule_clock_time(TOGGLE_SCHEDULE_ID, kind, time),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn update_schedule_once_at_sends_only_rfc3339_and_retains_confirmed_instant() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Review results",
+            "enabled": false,
+            "trigger": {"type":"once","at":"2030-03-31T08:15:00.125+08:00"},
+            "timezone": "Asia/Shanghai",
+            "state": {"next_fire_at": ONCE_SCHEDULE_AT},
+            "run_config": {"task_message": "Review results"},
+        });
+        let schedule = schedule_once_at_reply(ONCE_SCHEDULE_AT, "200 OK", "", &body.to_string())
+            .await
+            .unwrap();
+        let at = ONCE_SCHEDULE_AT.parse().unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(schedule.once_at, Some(at));
+        assert_eq!(schedule.next_run, Some(at));
+        assert_eq!(schedule.enabled, Some(false));
+        assert_eq!(schedule.timezone.as_deref(), Some("Asia/Shanghai"));
+    }
+
+    #[tokio::test]
+    async fn update_schedule_once_at_preserves_a_valid_offset_across_the_utc_year_boundary() {
+        let wire_at = "9999-12-31T23:59:59.125-23:59";
+        let utc_at = "+10000-01-01T23:58:59.125Z";
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "trigger": {"type":"once","at":utc_at},
+            "state": {"next_fire_at":utc_at},
+            "run_config": {},
+        });
+        let schedule = schedule_once_at_reply(wire_at, "200 OK", "", &body.to_string())
+            .await
+            .unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339(wire_at)
+            .unwrap()
+            .to_utc();
+        assert_eq!(schedule.once_at, Some(at));
+        assert_eq!(schedule.next_run, Some(at));
+    }
+
+    #[tokio::test]
+    async fn update_schedule_once_at_rejects_mismatched_or_incomplete_receipts() {
+        let receipt = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "trigger": {"type":"once","at":ONCE_SCHEDULE_AT},
+            "state": {"next_fire_at":ONCE_SCHEDULE_AT},
+            "run_config": {},
+        });
+        for (path, value) in [
+            ("/id", serde_json::json!("different-id")),
+            ("/trigger/type", serde_json::json!("daily")),
+            ("/trigger/at", serde_json::json!("2030-03-31T00:15:00Z")),
+            (
+                "/state/next_fire_at",
+                serde_json::json!("2030-03-31T00:15:00Z"),
+            ),
+            ("/state/next_fire_at", serde_json::json!(null)),
+            (
+                "/run_config",
+                serde_json::json!({"workflow_target":{"workflow_id":"review"}}),
+            ),
+        ] {
+            let mut body = receipt.clone();
+            *body.pointer_mut(path).unwrap() = value;
+            assert_eq!(
+                schedule_once_at_reply(ONCE_SCHEDULE_AT, "200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Once time response does not match the request"
+            );
+        }
+        for field in ["state", "run_config"] {
+            let mut body = receipt.clone();
+            body.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                schedule_once_at_reply(ONCE_SCHEDULE_AT, "200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid Once time response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_once_at_preserves_typed_refusals_and_never_falls_back() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                "invalid_schedule_once_at",
+                "Enter a future RFC3339 timestamp for Once time",
+            ),
+            (
+                "409 Conflict",
+                "schedule_once_not_pending",
+                "Once schedule no longer has a pending occurrence",
+            ),
+            (
+                "409 Conflict",
+                "schedule_trigger_changed",
+                "Schedule is no longer a Once schedule",
+            ),
+            (
+                "409 Conflict",
+                "schedule_no_future_occurrence",
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                "schedule_not_found",
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                "unknown_route",
+                "Editing Once time requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                "method_not_allowed",
+                "Editing Once time requires a newer Host",
+            ),
+            (
+                "503 Service Unavailable",
+                "internal_error",
+                "Could not update Once time (HTTP 503)",
+            ),
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}});
+            assert_eq!(
+                schedule_once_at_reply(ONCE_SCHEDULE_AT, status, "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert_eq!(
+            schedule_once_at_reply(
+                ONCE_SCHEDULE_AT,
+                "307 Temporary Redirect",
+                "Location: /api/v1/schedules/other\r\n",
+                ""
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "Could not update Once time (HTTP 307)"
+        );
+    }
+
+    const ONCE_SCHEDULE_AT: &str = "2030-03-31T00:15:00.125Z";
+
+    async fn schedule_once_at_reply(
+        wire_at: &str,
+        status: &str,
+        extra: &str,
+        body: &str,
+    ) -> Result<Schedule> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/once-at HTTP/1.1")
+            );
+            assert_eq!(request_json(&request), serde_json::json!({"at":wire_at}));
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            if status.starts_with("404") || status.starts_with("405") || status.starts_with("307") {
+                assert!(timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err());
+            }
+        };
+        let at = chrono::DateTime::parse_from_rfc3339(wire_at)
+            .unwrap()
+            .to_utc();
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.update_schedule_once_at(TOGGLE_SCHEDULE_ID, at),
                 serve
             )
         })

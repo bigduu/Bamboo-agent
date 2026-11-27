@@ -1,3 +1,4 @@
+use chrono::Utc;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -149,6 +150,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Some((ActionId::EditScheduleWeeklyTime, "edit weekly time"))
             } else if schedule.monthly_time.is_some() {
                 Some((ActionId::EditScheduleMonthlyTime, "edit monthly time"))
+            } else if schedule.upcoming_once_at(Utc::now()).is_some() {
+                Some((ActionId::EditScheduleOnceTime, "edit once time"))
             } else {
                 None
             };
@@ -545,6 +548,7 @@ mod tests {
             daily_time: None,
             weekly_time: None,
             monthly_time: None,
+            once_at: None,
             timezone: None,
         }
     }
