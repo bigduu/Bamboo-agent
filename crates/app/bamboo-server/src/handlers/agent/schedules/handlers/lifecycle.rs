@@ -5,7 +5,8 @@ use crate::schedule_app::store::SchedulePatchRejection;
 use crate::schedule_app::{ScheduleRunJob, ScheduleRunStatus};
 
 use super::super::types::{
-    CreateScheduleRequest, PatchScheduleRequest, ScheduleRunRecordView, ScheduleView,
+    CreateScheduleRequest, PatchScheduleRequest, RenameScheduleRequest, ScheduleRunRecordView,
+    ScheduleView,
 };
 use super::super::validation::{
     resolve_create_schedule_definition, resolve_patch_schedule_definition,
@@ -109,6 +110,44 @@ pub async fn patch_schedule(
             )),
             None => Err(internal_server_error("patch schedule", error)),
         },
+    }
+}
+
+/// `PATCH /api/v1/schedules/{schedule_id}/name`
+pub async fn rename_schedule(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    req: Result<web::Json<RenameScheduleRequest>>,
+) -> Result<HttpResponse> {
+    let name = match req {
+        Ok(req) => {
+            let RenameScheduleRequest::Title { name } = req.into_inner();
+            normalize_optional_name(Some(&name))
+        }
+        Err(error) if error.as_response_error().status_code() == StatusCode::BAD_REQUEST => None,
+        Err(error) => return Err(error),
+    };
+    let Some(name) = name else {
+        return Ok(crate::error::json_error_with_code(
+            StatusCode::BAD_REQUEST,
+            "name is required".into(),
+            Some("invalid_schedule_name"),
+        ));
+    };
+
+    let id = path.into_inner();
+    let updated = state
+        .schedule_store
+        .patch_schedule(&id, Some(name), None, None, None)
+        .await
+        .map_err(|error| internal_server_error("rename schedule", error))?;
+    match updated {
+        Some(schedule) => Ok(HttpResponse::Ok().json(ScheduleView::from(schedule))),
+        None => Ok(crate::error::json_error_with_code(
+            StatusCode::NOT_FOUND,
+            "Schedule not found".into(),
+            Some("schedule_not_found"),
+        )),
     }
 }
 
@@ -339,6 +378,115 @@ mod tests {
                 tokio::fs::read(store.index_path()).await.unwrap(),
                 persisted
             );
+        }
+
+        #[actix_web::test]
+        async fn rename_schedule_route_changes_only_the_exact_saved_title() {
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let store = &state.schedule_store;
+            let at = chrono::Utc::now() + chrono::Duration::hours(2);
+            let trigger = ScheduleTrigger::Once { at };
+            let config = ScheduleRunConfig {
+                task_message: Some("Prepare the saved schedule report".into()),
+                ..Default::default()
+            };
+            let schedule = store
+                .create_schedule_with_definition(
+                    "Saved title".into(),
+                    false,
+                    config.clone(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(trigger.clone()),
+                        start_at: Some(at - chrono::Duration::minutes(5)),
+                        end_at: Some(at + chrono::Duration::minutes(5)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let sibling = store
+                .create_schedule(schedule.name.clone(), trigger, false, config)
+                .await
+                .unwrap();
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let uri = format!("/api/v1/schedules/{}/name", schedule.id);
+            let saved = tokio::fs::read(store.index_path()).await.unwrap();
+
+            for payload in [
+                serde_json::json!({}),
+                serde_json::json!({ "name": null }),
+                serde_json::json!({ "name": 1 }),
+                serde_json::json!({ "name": " \t " }),
+                serde_json::json!({ "name": "Mixed update", "enabled": true }),
+                serde_json::json!(["Positional title"]),
+            ] {
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::patch()
+                        .uri(&uri)
+                        .set_json(payload)
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body: Value = test::read_body_json(response).await;
+                assert_eq!(body["error"]["type"], "api_error");
+                assert_eq!(body["error"]["code"], "invalid_schedule_name");
+            }
+
+            let missing = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri("/api/v1/schedules/unknown-schedule/name")
+                    .set_json(serde_json::json!({ "name": "Valid title" }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+            let body: Value = test::read_body_json(missing).await;
+            assert_eq!(body["error"]["type"], "api_error");
+            assert_eq!(body["error"]["code"], "schedule_not_found");
+            assert_eq!(body["error"]["message"], "Schedule not found");
+            assert_eq!(
+                store.get_schedule(&schedule.id).await,
+                Some(schedule.clone())
+            );
+            assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), saved);
+
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&uri)
+                    .set_json(serde_json::json!({ "name": "  新しい名前  \t" }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let renamed: Value = test::read_body_json(response).await;
+            assert!(renamed["updated_at"].is_string());
+            let mut expected = serde_json::to_value(ScheduleView::from(schedule)).unwrap();
+            expected["name"] = serde_json::json!("新しい名前");
+            expected["updated_at"] = renamed["updated_at"].clone();
+            assert_eq!(renamed, expected);
+
+            let home = store.index_path().parent().unwrap().to_path_buf();
+            let reopened = ScheduleStore::new(home).await.unwrap();
+            let renamed_entry = reopened
+                .get_schedule(renamed["id"].as_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(ScheduleView::from(renamed_entry)).unwrap(),
+                renamed
+            );
+            assert_eq!(reopened.get_schedule(&sibling.id).await, Some(sibling));
         }
 
         #[actix_web::test]

@@ -31,6 +31,7 @@ pub(crate) enum ActionContext {
     Mcp,
     Schedules,
     ScheduleForm,
+    ScheduleRename,
     ScheduleRuns,
     ScheduleSessions,
     FenceCopyPicker,
@@ -53,7 +54,7 @@ pub(crate) enum ActionContext {
 }
 
 impl ActionContext {
-    pub(crate) const ALL: [Self; 36] = [
+    pub(crate) const ALL: [Self; 37] = [
         Self::Chat,
         Self::ConversationBlock,
         Self::Global,
@@ -71,6 +72,7 @@ impl ActionContext {
         Self::Mcp,
         Self::Schedules,
         Self::ScheduleForm,
+        Self::ScheduleRename,
         Self::ScheduleRuns,
         Self::ScheduleSessions,
         Self::FenceCopyPicker,
@@ -111,6 +113,7 @@ impl ActionContext {
             Self::Mcp => "MCP",
             Self::Schedules => "Schedules",
             Self::ScheduleForm => "Schedule form",
+            Self::ScheduleRename => "Schedule rename",
             Self::ScheduleRuns => "Schedule runs",
             Self::ScheduleSessions => "Schedule Sessions",
             Self::FenceCopyPicker => "Code fence picker",
@@ -235,6 +238,7 @@ pub(crate) enum ActionId {
     PreviousPage,
     ShowTools,
     NewSchedule,
+    RenameSchedule,
     OpenScheduleSessions,
     RunSchedule,
     ToggleScheduleEnabled,
@@ -815,6 +819,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Mcp,
             Schedules,
             ScheduleForm,
+            ScheduleRename,
             ScheduleRuns,
             ScheduleSessions,
             FenceCopyPicker,
@@ -837,6 +842,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Mcp, "Enter"),
             (Schedules, "Enter"),
             (ScheduleForm, "Enter"),
+            (ScheduleRename, "Enter"),
             (ScheduleRuns, "Enter"),
             (ScheduleSessions, "Enter"),
             (FenceCopyPicker, "Enter"),
@@ -863,6 +869,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionNumber,
             QuestionInspect,
             ScheduleForm,
+            ScheduleRename,
             ScheduleRuns,
             ScheduleSessions,
             FenceCopyPicker,
@@ -886,6 +893,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionNumber, "Esc"),
             (QuestionInspect, "Esc; v"),
             (ScheduleForm, "Esc"),
+            (ScheduleRename, "Esc"),
             (ScheduleRuns, "Esc"),
             (ScheduleSessions, "Esc"),
             (FenceCopyPicker, "Esc"),
@@ -911,6 +919,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionCustom,
             QuestionNumber,
             ScheduleForm,
+            ScheduleRename,
             SessionPickerBrowse,
             SessionPickerRename,
             ModelPicker,
@@ -920,6 +929,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionCustom, "Backspace"),
             (QuestionNumber, "Backspace"),
             (ScheduleForm, "Backspace"),
+            (ScheduleRename, "Backspace"),
             (SessionPickerBrowse, "Backspace"),
             (SessionPickerRename, "Backspace"),
             (ModelPicker, "Backspace"),
@@ -1358,6 +1368,14 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [Schedules],
         [(Schedules, "n")]
+    ),
+    spec!(
+        RenameSchedule,
+        "Rename schedule",
+        "Change the selected schedule's name",
+        false,
+        [Schedules],
+        [(Schedules, "e")]
     ),
     spec!(
         OpenScheduleSessions,

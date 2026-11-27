@@ -55,6 +55,11 @@ pub enum AppEvent {
         schedule_id: String,
         result: Loaded<Schedule>,
     },
+    ScheduleRenameFinished {
+        generation: u64,
+        schedule_id: String,
+        result: Loaded<String>,
+    },
     ScheduleRunsLoaded {
         request_id: u64,
         schedule_id: String,

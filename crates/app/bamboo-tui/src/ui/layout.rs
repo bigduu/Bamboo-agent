@@ -2367,6 +2367,65 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
     f.render_widget(paragraph.block(block), area);
 }
 
+pub(super) fn render_schedule_rename(f: &mut Frame, app: &App) {
+    let Some(rename) = &app.schedule_rename else {
+        return;
+    };
+    let screen = f.area();
+    let width = usize::from(centered_rect(90, 0, screen).width.saturating_sub(2));
+    let saving = app.schedule_rename_is_saving();
+    let cursor = if saving { "" } else { "▏" };
+    let draft = clip_tail_cells(
+        &rename.draft,
+        width.saturating_sub(8 + usize::from(!saving)),
+    );
+    let muted = Style::default().fg(colors::subtle());
+    let mut lines = vec![Line::from(vec![
+        Span::styled("  Name: ", muted),
+        Span::styled(
+            format!("{draft}{cursor}"),
+            Style::default().fg(colors::brand()),
+        ),
+    ])];
+    if saving {
+        lines.push(Line::styled("  Saving…", muted));
+    } else {
+        if let Some(error) = &rename.error {
+            lines.push(Line::styled(
+                format!("  {}", clip_cells(error, width.saturating_sub(2))),
+                Style::default().fg(colors::error()),
+            ));
+        }
+        let key = |action| {
+            app.keymap
+                .primary_hint(ActionContext::ScheduleRename, action)
+        };
+        lines.push(Line::styled(
+            clip_cells(
+                &format!(
+                    "  {} save · {} cancel",
+                    key(ActionId::Activate),
+                    key(ActionId::Cancel)
+                ),
+                width,
+            ),
+            muted,
+        ));
+    }
+
+    let area = centered_rect(90, lines.len() as u16 + 2, screen);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::brand()))
+                .title(" Rename schedule "),
+        ),
+        area,
+    );
+}
+
 /// Contextual session picker (`Ctrl+P` on Chat). It renders over the
 /// transcript rather than switching to the management tab, so dismissing it
 /// restores the exact composer draft/cursor and transcript scroll beneath it.
@@ -4086,9 +4145,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             if cfg!(target_os = "macos") {
-                [17_440_646_320_989_384_370, 16_351_077_110_429_304_208]
+                [5_741_994_946_620_296_138, 6_974_571_662_424_884_876]
             } else {
-                [14_693_427_191_799_456_976, 5_120_460_176_196_724_946]
+                [13_063_416_522_773_230_992, 2_008_128_776_819_391_150]
             },
             "complete help-overlay buffer golden changed"
         );

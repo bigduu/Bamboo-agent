@@ -122,6 +122,9 @@ fn render_overlays(f: &mut Frame, app: &App, anchor: Option<Rect>, inline_approv
     if app.schedule_form.is_some() {
         layout::render_schedule_form(f, app);
     }
+    if app.schedule_rename.is_some() {
+        layout::render_schedule_rename(f, app);
+    }
 
     if app.command_palette.is_some() {
         layout::render_command_palette_at(f, app, anchor);
