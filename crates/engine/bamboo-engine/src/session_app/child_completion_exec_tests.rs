@@ -173,6 +173,277 @@ async fn background_exec_delivery_does_not_overwrite_an_active_human_conversatio
     assert!(registration.notifications_mut().has_changed().unwrap());
 }
 
+struct BackgroundExecRecoveryLoadGate {
+    inner: Arc<bamboo_storage::SessionStoreV2>,
+    target: String,
+    reads: AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    fail_locked_read: bool,
+}
+
+const EXEC_RECOVERY_TEST_WAIT: Duration = Duration::from_secs(5);
+
+impl BackgroundExecRecoveryLoadGate {
+    fn install(
+        coordinator: Arc<ChildCompletionCoordinator>,
+        store: &Arc<bamboo_storage::SessionStoreV2>,
+        target: &str,
+        fail_locked_read: bool,
+    ) -> (ChildCompletionCoordinator, Arc<Self>) {
+        let mut coordinator = Arc::try_unwrap(coordinator).ok().unwrap();
+        let gate = Arc::new(Self {
+            inner: store.clone(),
+            target: target.to_owned(),
+            reads: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            fail_locked_read,
+        });
+        coordinator.storage = gate.clone();
+        (coordinator, gate)
+    }
+
+    async fn wait_for_locked_load(
+        &self,
+        mut recovery: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    ) {
+        tokio::time::timeout(EXEC_RECOVERY_TEST_WAIT, async {
+            tokio::select! {
+                _ = recovery.as_mut() => panic!("backstop exited before its locked reload"),
+                () = self.entered.notified() => {}
+            }
+        })
+        .await
+        .expect("backstop reaches its second load");
+        assert_eq!(self.reads.load(Ordering::SeqCst), 2);
+        assert!(session_resume_lock(&self.target).try_lock().is_err());
+    }
+}
+
+#[async_trait]
+impl Storage for BackgroundExecRecoveryLoadGate {
+    async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+        self.inner.save_session(session).await
+    }
+
+    async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        if id == self.target && self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
+            self.entered.notify_one();
+            self.release.notified().await;
+            if self.fail_locked_read {
+                return Err(std::io::Error::other(
+                    "transient recovery fixture read failure",
+                ));
+            }
+        }
+        self.inner.load_session(id).await
+    }
+
+    async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+        self.inner.delete_session(id).await
+    }
+}
+
+fn saved_exec_wait(session_id: &str, handle: &str) -> (Session, AgentRuntimeState) {
+    let mut session = Session::new(session_id, "model");
+    let now = Utc::now();
+    let mut waiting = AgentRuntimeState::new("original-background-run");
+    waiting.status = AgentStatusState::Suspended;
+    waiting.suspension = Some(SuspensionState {
+        reason: "waiting_for_bash".into(),
+        suspended_at: now,
+        resumable: true,
+        hook_point: None,
+    });
+    waiting.waiting_for_bash = Some(bamboo_domain::WaitingForBashState::for_bash(
+        vec![handle.to_owned()],
+        now,
+    ));
+    write_runtime_state(&mut session, &waiting);
+    session.set_last_run_status("suspended");
+    session
+        .metadata
+        .insert("runtime.suspend_reason".into(), "waiting_for_bash".into());
+    session
+        .metadata
+        .insert("runtime.background_exec_id".into(), handle.into());
+    (session, waiting)
+}
+
+#[tokio::test]
+async fn background_exec_recovery_retains_wake_when_foreground_enters_between_checks() {
+    assert_recovery_survives_foreground(false).await;
+}
+
+#[tokio::test]
+async fn background_exec_recovery_retains_wake_after_transient_locked_read_failure() {
+    assert_recovery_survives_foreground(true).await;
+}
+
+async fn assert_recovery_survives_foreground(fail_locked_read: bool) {
+    let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+    let handle = "restart-has-no-command-handle";
+    let (mut session, waiting) = saved_exec_wait("recovered-background-exec", handle);
+    store.save_session(&session).await.unwrap();
+    let (coordinator, gate) =
+        BackgroundExecRecoveryLoadGate::install(coordinator, &store, &session.id, fail_locked_read);
+
+    // Poll the real backstop inline so a failed assertion also cancels it.
+    let recovery = coordinator.bash_self_resume(
+        session.id.clone(),
+        vec![handle.to_owned()],
+        Some(session.created_at),
+        waiting.waiting_for_bash.clone(),
+    );
+    tokio::pin!(recovery);
+    gate.wait_for_locked_load(recovery.as_mut()).await;
+
+    let run_id = "human-foreground-run";
+    let mut foreground = waiting.clone();
+    foreground.run_id = run_id.into();
+    foreground.status = AgentStatusState::Running;
+    foreground.suspension = None;
+    write_runtime_state(&mut session, &foreground);
+    session.set_last_run_status("running");
+    session.add_message(Message::user("Continue the foreground discussion."));
+    store.save_session(&session).await.unwrap();
+    let mut registration = coordinator
+        .agent
+        .activation_router()
+        .unwrap()
+        .register_session_run(&session, run_id)
+        .await
+        .unwrap();
+    let mut runner = AgentRunner::new();
+    runner.status = AgentStatus::Running;
+    runner.run_id = run_id.into();
+    coordinator
+        .agent_runners
+        .write()
+        .await
+        .insert(session.id.clone(), runner);
+
+    let lock = session_resume_lock(&session.id);
+    gate.release.notify_one();
+    let held = tokio::time::timeout(EXEC_RECOVERY_TEST_WAIT, async {
+        // The foreground turn remains active even if the old retry budget
+        // expires. Exiting the backstop and deferring both release the lock.
+        tokio::select! {
+            biased;
+            _ = &mut recovery => panic!("backstop dropped the recovery wake while foreground owned the session"),
+            held = lock.lock() => held,
+        }
+    })
+    .await
+    .expect("backstop releases the resume lock while the foreground turn is active");
+    let active = store.load_session(&session.id).await.unwrap().unwrap();
+    let active_runtime = read_runtime_state(&active);
+    assert_eq!(active_runtime.status, AgentStatusState::Running);
+    assert_eq!(active_runtime.waiting_for_bash, waiting.waiting_for_bash);
+    assert_eq!(
+        serde_json::to_value(&active.messages).unwrap(),
+        serde_json::to_value(&session.messages).unwrap()
+    );
+    assert_eq!(inbox.inspect(&session.id).await.unwrap().pending, 0);
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+
+    session.add_message(Message::assistant("Foreground discussion finished.", None));
+    write_runtime_state(&mut session, &waiting);
+    session.set_last_run_status("suspended");
+    store.save_session(&session).await.unwrap();
+    registration.begin_finalization().await;
+    registration.finish(0).await.unwrap();
+    coordinator.agent_runners.write().await.remove(&session.id);
+    drop(held);
+    tokio::time::timeout(EXEC_RECOVERY_TEST_WAIT, &mut recovery)
+        .await
+        .expect("same backstop handles the wait when the foreground turn ends");
+
+    let recovered = store.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(recovered.created_at, session.created_at);
+    assert!(read_runtime_state(&recovered).waiting_for_bash.is_none());
+    assert!(!recovered
+        .metadata
+        .contains_key("runtime.background_exec_id"));
+    assert_eq!(recovered.messages.len(), session.messages.len() + 1);
+    assert_eq!(
+        serde_json::to_value(&recovered.messages[..session.messages.len()]).unwrap(),
+        serde_json::to_value(&session.messages).unwrap()
+    );
+    let notice = recovered.messages.last().unwrap();
+    let metadata = notice.metadata.as_ref().unwrap();
+    assert_eq!(metadata[RUNTIME_RESUME_MESSAGE_HIDDEN_KEY], true);
+    assert_eq!(
+        metadata[RUNTIME_RESUME_MESSAGE_KIND_KEY],
+        BASH_COMPLETION_RESUME_KIND
+    );
+    assert!(notice.content.contains(handle));
+    assert!(notice.content.contains("Completion is not confirmed"));
+    assert!(notice.content.contains("unknown outcome"));
+}
+
+#[tokio::test]
+async fn background_exec_recovery_ignores_replaced_wait_or_session_with_same_handles() {
+    for replace_session in [false, true] {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        let handle = "missing-command-handle";
+        let (mut session, mut runtime) = saved_exec_wait("replaced-background-exec", handle);
+        store.save_session(&session).await.unwrap();
+        let original_birth = session.created_at;
+        let expected_wait = runtime.waiting_for_bash.clone().unwrap();
+        let (coordinator, gate) =
+            BackgroundExecRecoveryLoadGate::install(coordinator, &store, &session.id, false);
+        let recovery = coordinator.bash_self_resume(
+            session.id.clone(),
+            expected_wait.bash_ids.clone(),
+            Some(original_birth),
+            Some(expected_wait),
+        );
+        tokio::pin!(recovery);
+        gate.wait_for_locked_load(recovery.as_mut()).await;
+
+        if replace_session {
+            assert!(store.delete_session(&session.id).await.unwrap());
+            session = store
+                .recreate_root_session(&session.id, "model")
+                .await
+                .unwrap();
+            assert_ne!(session.created_at, original_birth);
+            session.set_last_run_status("suspended");
+            session
+                .metadata
+                .insert("runtime.suspend_reason".into(), "waiting_for_bash".into());
+            session
+                .metadata
+                .insert("runtime.background_exec_id".into(), handle.into());
+        } else {
+            runtime.waiting_for_bash.as_mut().unwrap().registered_at +=
+                chrono::Duration::seconds(1);
+        }
+        session.add_message(Message::user("The replacement owns this conversation."));
+        write_runtime_state(&mut session, &runtime);
+        store.save_session(&session).await.unwrap();
+        gate.release.notify_one();
+        tokio::time::timeout(EXEC_RECOVERY_TEST_WAIT, &mut recovery)
+            .await
+            .expect("locked backstop exits without handling the replacement");
+
+        let latest = store.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(latest.created_at, session.created_at);
+        assert_eq!(
+            read_runtime_state(&latest).waiting_for_bash,
+            runtime.waiting_for_bash
+        );
+        assert_eq!(
+            serde_json::to_value(&latest.messages).unwrap(),
+            serde_json::to_value(&session.messages).unwrap()
+        );
+        assert_eq!(inbox.inspect(&session.id).await.unwrap().pending, 0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[test]
 fn background_exec_restart_or_wait_ceiling_never_claims_command_completion() {
     for timed_out in [false, true] {
@@ -270,7 +541,9 @@ async fn background_exec_unconfirmed_stop_remains_retryable_and_blocks_its_wake(
         .perform_bash_resume(
             &session.id,
             exec_wait_resume_message(&[handle.into()], false),
-            &[handle.into()],
+            session.created_at,
+            runtime.waiting_for_bash.as_ref().unwrap(),
+            0,
         )
         .await;
     assert_eq!(inbox.inspect(&session.id).await.unwrap().pending, 0);
