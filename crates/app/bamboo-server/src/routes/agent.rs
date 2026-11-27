@@ -477,6 +477,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::patch().to(agent::schedules::patch_schedule),
         )
         .route(
+            "/schedules/{schedule_id}/name",
+            web::patch().to(agent::schedules::rename_schedule),
+        )
+        .route(
             "/schedules/{schedule_id}",
             web::delete().to(agent::schedules::delete_schedule),
         )

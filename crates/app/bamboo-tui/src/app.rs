@@ -1930,6 +1930,18 @@ struct PendingScheduleToggle {
     enabled: bool,
 }
 
+struct PendingScheduleRename {
+    generation: u64,
+    schedule_id: String,
+    name: String,
+}
+
+pub(crate) struct ScheduleRename {
+    schedule_id: String,
+    pub(crate) draft: String,
+    pub(crate) error: Option<String>,
+}
+
 pub(crate) enum ScheduleRunsContent {
     Loading,
     Loaded(Vec<ScheduleRunView>),
@@ -5171,6 +5183,9 @@ pub struct App {
     /// In-progress new-schedule form (Schedules tab). When `Some`, a modal
     /// captures the fields.
     pub schedule_form: Option<ScheduleForm>,
+    pub(crate) schedule_rename: Option<ScheduleRename>,
+    pending_schedule_rename: Option<PendingScheduleRename>,
+    schedule_rename_generation: u64,
     pub(crate) schedule_runs: Option<ScheduleRunsPane>,
     schedule_runs_request_id: u64,
     pub(crate) schedule_sessions: Option<ScheduleSessionsPane>,
@@ -5427,6 +5442,9 @@ impl App {
             pending_question: None,
             dismissed_question: None,
             schedule_form: None,
+            schedule_rename: None,
+            pending_schedule_rename: None,
+            schedule_rename_generation: 0,
             schedule_runs: None,
             schedule_runs_request_id: 0,
             schedule_sessions: None,
@@ -5654,6 +5672,7 @@ impl App {
         self.terminal_settings = None;
         self.fence_copy_picker = None;
         self.close_schedule_sessions();
+        self.schedule_rename = None;
         self.chat.pressed_block = None;
         self.chat.pressed_attachment_remove = None;
         self.invalidate_permission_mode_context();
@@ -5677,6 +5696,7 @@ impl App {
             && !self.active_needs_history_refresh
         {
             self.chat.background_unread = 0;
+            self.schedule_rename = None;
             self.tab = Tab::Chat;
             self.status_message = "Session already active".to_string();
             self.discover_active_loop();
@@ -6818,6 +6838,13 @@ impl App {
                 result,
             } => {
                 self.finish_schedule_toggle(generation, schedule_id, result);
+            }
+            AppEvent::ScheduleRenameFinished {
+                generation,
+                schedule_id,
+                result,
+            } => {
+                self.finish_schedule_rename(generation, schedule_id, result);
             }
             AppEvent::SkillsLoaded(r) => {
                 self.skills.loading = false;
@@ -9032,6 +9059,7 @@ impl App {
             || self.pending_delete.is_some()
             || self.pending_schedule_delete.is_some()
             || self.schedule_form.is_some()
+            || self.schedule_rename.is_some()
             || self.schedule_runs.is_some()
             || self.schedule_sessions.is_some()
             || self.config_editor.is_some()
@@ -9769,6 +9797,7 @@ impl App {
             || self.model_picker.is_some()
             || self.command_palette.is_some()
             || self.schedule_form.is_some()
+            || self.schedule_rename.is_some()
             || self.schedule_runs.is_some()
             || self.schedule_sessions.is_some()
             || self.fence_copy_picker.is_some()
@@ -9840,6 +9869,8 @@ impl App {
             ActionContext::ModelPicker
         } else if self.command_palette.is_some() {
             ActionContext::CommandPalette
+        } else if self.schedule_rename.is_some() {
+            ActionContext::ScheduleRename
         } else if self.schedule_form.is_some() {
             ActionContext::ScheduleForm
         } else if self.schedule_sessions.is_some() {
@@ -9937,6 +9968,8 @@ impl App {
         let message = format!("{} — {reason}", action.label());
         if let Some(question) = self.pending_question.as_mut() {
             question.error = Some(message.clone());
+        } else if let Some(rename) = self.schedule_rename.as_mut() {
+            rename.error = Some(message.clone());
         } else if let Some(form) = self.schedule_form.as_mut() {
             form.error = Some(message.clone());
         } else if let Some(editor) = self.config_editor.as_mut() {
@@ -10209,6 +10242,7 @@ impl App {
             | ActionContext::SessionPickerPinning => self.handle_session_picker_key(key).await?,
             ActionContext::ModelPicker => self.handle_model_picker_key(key).await?,
             ActionContext::CommandPalette => self.handle_command_palette_key(key),
+            ActionContext::ScheduleRename => self.handle_schedule_rename_key(key),
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
             ActionContext::ScheduleRuns => self.handle_schedule_runs_key(key),
             ActionContext::ScheduleSessions => self.handle_schedule_sessions_key(key),
@@ -15064,6 +15098,7 @@ impl App {
             Some(ActionId::Activate) => self.open_schedule_runs(),
             Some(ActionId::OpenScheduleSessions) => self.open_schedule_sessions(),
             Some(ActionId::ToggleScheduleEnabled) => self.toggle_selected_schedule(),
+            Some(ActionId::RenameSchedule) => self.open_schedule_rename(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
                     (self.schedules.selected + 1).min(self.schedules.schedules.len() - 1);
@@ -15080,6 +15115,10 @@ impl App {
                     return Ok(());
                 }
                 if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
+                    if self.schedule_rename_pending_for(&schedule.id) {
+                        self.notify(NoticeLevel::Warn, "Wait for the schedule rename to finish");
+                        return Ok(());
+                    }
                     self.pending_schedule_delete = Some((
                         schedule.id.clone(),
                         schedule
@@ -15114,6 +15153,142 @@ impl App {
         Ok(())
     }
 
+    fn open_schedule_rename(&mut self) {
+        let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) else {
+            return;
+        };
+        if self.schedule_rename_is_saving()
+            || self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
+            || self
+                .schedules
+                .pending_toggle
+                .as_ref()
+                .is_some_and(|pending| pending.schedule_id == schedule.id)
+        {
+            self.notify(NoticeLevel::Warn, "Wait for the schedule update to finish");
+            return;
+        }
+        self.schedule_rename = Some(ScheduleRename {
+            schedule_id: schedule.id.clone(),
+            draft: schedule.name.clone().unwrap_or_default(),
+            error: None,
+        });
+    }
+
+    pub(crate) fn schedule_rename_is_saving(&self) -> bool {
+        self.pending_schedule_rename.is_some()
+    }
+
+    fn schedule_rename_pending_for(&self, schedule_id: &str) -> bool {
+        self.pending_schedule_rename
+            .as_ref()
+            .is_some_and(|rename| rename.schedule_id == schedule_id)
+    }
+
+    fn handle_schedule_rename_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::ScheduleRename, key);
+        if self.schedule_rename_is_saving() {
+            return;
+        }
+        let Some(rename) = self.schedule_rename.as_mut() else {
+            return;
+        };
+        match action {
+            Some(ActionId::Cancel) => self.schedule_rename = None,
+            Some(ActionId::Backspace) => {
+                rename.draft.pop();
+                rename.error = None;
+            }
+            Some(ActionId::Activate) => {
+                let name = rename.draft.trim().to_owned();
+                if name.is_empty() {
+                    rename.error = Some("Enter a schedule name".into());
+                    return;
+                }
+                let Some(tx) = self.event_tx.clone() else {
+                    rename.error = Some("Host connection is unavailable".into());
+                    return;
+                };
+                let schedule_id = rename.schedule_id.clone();
+                self.schedule_rename_generation = self.schedule_rename_generation.wrapping_add(1);
+                let generation = self.schedule_rename_generation;
+                self.pending_schedule_rename = Some(PendingScheduleRename {
+                    generation,
+                    schedule_id: schedule_id.clone(),
+                    name: name.clone(),
+                });
+                rename.error = None;
+
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .rename_schedule(&schedule_id, &name)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::ScheduleRenameFinished {
+                        generation,
+                        schedule_id,
+                        result,
+                    });
+                });
+            }
+            None => {
+                if let Some(character) = text_character(key) {
+                    rename.draft.push(character);
+                    rename.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_schedule_rename(
+        &mut self,
+        generation: u64,
+        schedule_id: String,
+        result: Result<String, String>,
+    ) {
+        let Some(pending) = self.pending_schedule_rename.take_if(|pending| {
+            pending.generation == generation && pending.schedule_id == schedule_id
+        }) else {
+            return;
+        };
+        match result {
+            Ok(name) if name == pending.name => {
+                if let Some(row) = self
+                    .schedules
+                    .schedules
+                    .iter_mut()
+                    .find(|row| row.id == schedule_id)
+                {
+                    row.name = Some(name);
+                }
+                if self.schedule_rename.take().is_some() {
+                    self.status_message = "Schedule renamed".into();
+                }
+                self.refresh_schedule_catalog_after_change();
+            }
+            result => {
+                if let Some(rename) = self.schedule_rename.as_mut() {
+                    rename.error = Some(
+                        result
+                            .err()
+                            .unwrap_or_else(|| "Invalid schedule rename response".into()),
+                    );
+                }
+            }
+        }
+    }
+
+    fn refresh_schedule_catalog_after_change(&mut self) {
+        // A catalog already in flight may have read the old saved fields.
+        if std::mem::take(&mut self.schedules.loading) {
+            if let Some(tx) = self.event_tx.clone() {
+                self.load_schedule_catalog(self.client.clone(), tx);
+            }
+        }
+    }
+
     fn toggle_selected_schedule(&mut self) {
         if self.schedules.has_pending_toggle() {
             return;
@@ -15127,7 +15302,9 @@ impl App {
         let Some(enabled) = schedule.enabled else {
             return;
         };
-        if self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str()) {
+        if self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
+            || self.schedule_rename_pending_for(&schedule.id)
+        {
             return;
         }
 
@@ -15186,13 +15363,7 @@ impl App {
                 if let Some(row) = row {
                     *row = schedule;
                 }
-                // Any catalog request already in flight may have read the old
-                // enabled flag. Replace it with a read after the mutation.
-                if std::mem::take(&mut self.schedules.loading) {
-                    if let Some(tx) = self.event_tx.clone() {
-                        self.load_schedule_catalog(self.client.clone(), tx);
-                    }
-                }
+                self.refresh_schedule_catalog_after_change();
             }
             Err(error) if row.is_some() => {
                 self.schedules.toggle_error = Some((schedule_id, error));
@@ -23044,9 +23215,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    15_697_706_785_549_981_363
+                    12_211_857_472_602_947_752
                 } else {
-                    6_997_252_207_367_741_014
+                    3_376_749_861_922_315_373
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -24473,6 +24644,282 @@ mod question_tests {
         ));
         assert!(app.schedule_form.is_none());
         server.await.unwrap();
+    }
+
+    fn schedule_rename_preview(app: &App, phase: &str) -> String {
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(60)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_RENAME").is_some() {
+            eprintln!(
+                "SCHEDULE RENAME {phase} PREVIEW\n{text}\nEND SCHEDULE RENAME {phase} PREVIEW"
+            );
+        }
+        text
+    }
+
+    #[tokio::test]
+    async fn schedule_rename_uses_the_dedicated_keyboard_path_and_fences_catalogs() {
+        use tokio::sync::oneshot;
+
+        const ID: &str = "ship/review?weekly";
+        const ORIGINAL: &str = r#"{"schedules":[
+            {"id":"ship/review?weekly","name":"Weekly review","enabled":true,
+             "trigger":{"type":"interval","every_seconds":90},
+             "state":{"next_fire_at":"2028-01-26T09:10:00Z"},
+             "run_config":{"task_message":"Check the release"}},
+            {"id":"other","name":"Weekly review","enabled":false}
+        ]}"#;
+        let confirmed_catalog = ORIGINAL.replacen("Weekly review", "Weekly plan", 1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (old_seen, old_started) = oneshot::channel();
+        let (rename_seen, rename_started) = oneshot::channel();
+        let (allow_rename, wait_rename) = oneshot::channel();
+        let (allow_fresh, wait_fresh) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut initial, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut initial).await, "/api/v1/schedules");
+            respond_test_http(&mut initial, "application/json", ORIGINAL).await;
+
+            let (mut stale, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut stale).await, "/api/v1/schedules");
+            old_seen.send(()).unwrap();
+            let (mut patch, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut patch).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next(),
+                Some("PATCH /api/v1/schedules/ship%2Freview%3Fweekly/name HTTP/1.1")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({"name": "Weekly plan"})
+            );
+            rename_seen.send(()).unwrap();
+            wait_rename.await.unwrap();
+            respond_test_http(
+                &mut patch,
+                "application/json",
+                r#"{"id":"ship/review?weekly","name":"Weekly plan"}"#,
+            )
+            .await;
+
+            let (mut fresh, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut fresh).await.lines().next(),
+                Some("GET /api/v1/schedules HTTP/1.1")
+            );
+            respond_test_http(&mut stale, "application/json", ORIGINAL).await;
+            wait_fresh.await.unwrap();
+            respond_test_http(&mut fresh, "application/json", &confirmed_catalog).await;
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Mcp;
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[{"context":"schedules","action":"rename-schedule","keys":["/"]}]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        let budget = Duration::from_secs(5);
+        async fn event(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        let next_run = app.schedules.schedules[0].next_run;
+        app.handle_key(key(KeyCode::Char('e'))).await.unwrap();
+        assert!(app.schedule_rename.is_none());
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        tokio::time::timeout(budget, old_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        assert_eq!(app.schedule_rename.as_ref().unwrap().draft, "Weekly review");
+        for _ in 0.."review".len() {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "plan  ".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        let before = schedule_rename_preview(&app, "EDITING");
+        assert!(before.contains("Rename schedule") && before.contains("Name: Weekly plan"));
+        assert!(before.contains("Enter save") && before.contains("Esc cancel"));
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        tokio::time::timeout(budget, rename_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_event(AppEvent::ScheduleRenameFinished {
+            generation: app.schedule_rename_generation,
+            schedule_id: "other".into(),
+            result: Ok("Weekly plan".into()),
+        })
+        .await
+        .unwrap();
+        assert!(app.schedule_rename_is_saving());
+        assert_eq!(
+            app.schedules.schedules[0].name.as_deref(),
+            Some("Weekly review")
+        );
+        assert!(schedule_rename_preview(&app, "PENDING").contains("Saving…"));
+
+        allow_rename.send(()).unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert!(app.schedule_rename.is_none());
+        let assert_saved = |app: &App| {
+            let selected = &app.schedules.schedules[app.schedules.selected];
+            assert_eq!(selected.id, ID);
+            assert_eq!(selected.name.as_deref(), Some("Weekly plan"));
+            assert_eq!(selected.enabled, Some(true));
+            assert_eq!(selected.next_run, next_run);
+            assert_eq!(selected.prompt.as_deref(), Some("Check the release"));
+            assert_eq!(
+                app.schedules.schedules[1].name.as_deref(),
+                Some("Weekly review")
+            );
+        };
+        assert_saved(&app);
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert_saved(&app);
+        allow_fresh.send(()).unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert_saved(&app);
+        assert!(schedule_rename_preview(&app, "SAVED").contains("Weekly plan"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_rename_keeps_the_draft_on_an_older_host() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut stream).await.lines().next(),
+                Some("PATCH /api/v1/schedules/selected/name HTTP/1.1")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(120), listener.accept())
+                    .await
+                    .is_err(),
+                "the older Host received a second request"
+            );
+        });
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        let view = serde_json::from_str(r#"{"id":"selected","name":"Original"}"#).unwrap();
+        app.schedules.schedules = vec![Schedule::from_view(view)];
+        app.handle_key(key(KeyCode::Char('e'))).await.unwrap();
+        for _ in 0.."Original".len() {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let rename = app.schedule_rename.as_ref().unwrap();
+        assert_eq!(rename.error.as_deref(), Some("Enter a schedule name"));
+        assert!(!app.schedule_rename_is_saving());
+        for character in "New title".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(event).await.unwrap();
+        let rename = app.schedule_rename.as_ref().unwrap();
+        assert_eq!(rename.draft, "New title");
+        assert_eq!(
+            rename.error.as_deref(),
+            Some("Renaming requires a newer Host")
+        );
+        assert!(!app.schedule_rename_is_saving());
+        let visible = schedule_rename_preview(&app, "UNSUPPORTED");
+        assert!(visible.contains("Name: New title"));
+        assert!(visible.contains("Renaming requires a newer Host"));
+        assert_eq!(app.schedules.schedules[0].name.as_deref(), Some("Original"));
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_rename.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_rename_closes_on_a_session_switch_and_reconciles_an_inflight_save() {
+        let client = BambooClient::new("http://127.0.0.1:0");
+        for submitted in [false, true] {
+            let mut app = schedule_run_session_test_app(client.clone());
+            app.handle_key(key(KeyCode::Char('e'))).await.unwrap();
+            assert!(app.schedule_rename.is_some());
+            let schedule_id = app.schedules.schedules[0].id.clone();
+            if submitted {
+                app.pending_schedule_rename = Some(PendingScheduleRename {
+                    generation: 2,
+                    schedule_id: schedule_id.clone(),
+                    name: "Saved after switching".into(),
+                });
+            }
+
+            app.handle_event(AppEvent::SessionDeleted {
+                session_id: "current-session".into(),
+                result: Ok(()),
+                session_picker_epoch: None,
+            })
+            .await
+            .unwrap();
+            assert_eq!(app.tab, Tab::Chat);
+            assert!(app.schedule_rename.is_none());
+            assert_eq!(app.schedule_rename_is_saving(), submitted);
+            let chat_status = app.status_message.clone();
+            for (generation, title) in [(1, "Earlier rename"), (2, "Saved after switching")] {
+                app.handle_event(AppEvent::ScheduleRenameFinished {
+                    generation,
+                    schedule_id: schedule_id.clone(),
+                    result: Ok(title.into()),
+                })
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                app.schedules.schedules[0].name.as_deref() == Some("Saved after switching"),
+                submitted
+            );
+            assert_eq!(app.status_message, chat_status);
+            assert!(app.schedule_rename.is_none());
+            assert!(!app.schedule_rename_is_saving());
+        }
     }
 
     #[tokio::test]

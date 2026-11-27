@@ -88,6 +88,18 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(" · Refresh failed", Style::default().fg(colors::error())),
         );
     }
+    if !app.schedules.schedules.is_empty() {
+        let key = app
+            .keymap
+            .primary_hint(ActionContext::Schedules, ActionId::RenameSchedule);
+        header.spans.insert(
+            1,
+            Span::styled(
+                format!(" · {key} rename"),
+                Style::default().fg(colors::inactive()),
+            ),
+        );
+    }
     f.render_widget(Paragraph::new(header), chunks[0]);
 
     let body = chunks[1];
@@ -532,6 +544,7 @@ mod tests {
             "runs action footer missing:\n{text}"
         );
         assert!(text.contains("s sessions"), "{text}");
+        assert!(text.contains("e rename"), "{text}");
         assert!(text.contains('›'), "selected-row glyph missing:\n{text}");
         assert!(!text.contains("Cadence"), "{text}");
     }

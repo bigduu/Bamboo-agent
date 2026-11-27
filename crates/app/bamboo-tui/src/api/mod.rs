@@ -305,7 +305,7 @@ fn parse_auto_resume_status(body: &str) -> std::result::Result<String, RespondFa
     }
 }
 
-const MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SCHEDULE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 enum ScheduleBodyError {
     TooLarge,
@@ -333,7 +333,7 @@ async fn read_bounded_schedule_body(
     Ok(body)
 }
 
-async fn schedule_has_no_future_occurrence(response: reqwest::Response) -> bool {
+async fn schedule_response_has_code(response: reqwest::Response, code: &str) -> bool {
     const MAX_ERROR_BYTES: usize = 8 * 1024;
     let Ok(body) = read_bounded_schedule_body(response, MAX_ERROR_BYTES).await else {
         return false;
@@ -344,7 +344,7 @@ async fn schedule_has_no_future_occurrence(response: reqwest::Response) -> bool 
             error
                 .pointer("/error/code")
                 .and_then(serde_json::Value::as_str)
-                == Some("schedule_no_future_occurrence")
+                == Some(code)
         })
 }
 
@@ -1154,10 +1154,86 @@ impl BambooClient {
             reply.view.enabled = reply.enabled;
             return Ok(Schedule::from_view(reply.view));
         }
-        if status == StatusCode::CONFLICT && schedule_has_no_future_occurrence(response).await {
+        if status == StatusCode::CONFLICT
+            && schedule_response_has_code(response, "schedule_no_future_occurrence").await
+        {
             anyhow::bail!("Schedule has no future occurrence");
         }
         anyhow::bail!("Could not update schedule (HTTP {})", status.as_u16());
+    }
+
+    pub(crate) async fn rename_schedule(&self, schedule_id: &str, name: &str) -> Result<String> {
+        use reqwest::StatusCode;
+
+        #[derive(serde::Deserialize)]
+        struct RenameReply {
+            id: String,
+            name: String,
+        }
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "Enter a schedule name");
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "name"]);
+        // The dedicated route guarantees that a rename preserves saved cadence.
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not connect to the Host to rename the schedule"))?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to rename the schedule")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to rename the schedule")
+                }
+            })?;
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            if schedule_response_has_code(response, "schedule_not_found").await {
+                anyhow::bail!("Schedule no longer exists");
+            }
+            anyhow::bail!("Renaming requires a newer Host");
+        }
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            anyhow::bail!("Renaming requires a newer Host");
+        }
+        anyhow::ensure!(
+            status == StatusCode::OK,
+            "Could not rename schedule (HTTP {})",
+            status.as_u16()
+        );
+
+        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                ScheduleBodyError::TooLarge => {
+                    anyhow::anyhow!("Schedule rename response is too large (2 MiB limit)")
+                }
+                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for the schedule rename response")
+                }
+                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid schedule rename response"),
+            })?;
+        let reply: RenameReply = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid schedule rename response"))?;
+        anyhow::ensure!(
+            reply.id == schedule_id && reply.name == name,
+            "Schedule rename response does not match the request"
+        );
+        Ok(reply.name)
     }
 
     pub async fn list_schedule_sessions(&self, schedule_id: &str) -> Result<Vec<SessionSummary>> {
@@ -1189,7 +1265,7 @@ impl BambooClient {
             "Could not fetch schedule sessions (HTTP {})",
             status.as_u16()
         );
-        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES)
+        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
             .await
             .map_err(|error| match error {
                 ScheduleBodyError::TooLarge => {
@@ -1865,7 +1941,7 @@ mod tests {
                 if advertised {
                     let headers = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                        MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES + 1
+                        MAX_SCHEDULE_RESPONSE_BYTES + 1
                     );
                     socket.write_all(headers.as_bytes()).await.unwrap();
                 } else {
@@ -1877,7 +1953,7 @@ mod tests {
                     let mut frame = format!("{CHUNK_BYTES:x}\r\n").into_bytes();
                     frame.resize(frame.len() + CHUNK_BYTES, b'x');
                     frame.extend_from_slice(b"\r\n");
-                    for _ in 0..(MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES / CHUNK_BYTES) {
+                    for _ in 0..(MAX_SCHEDULE_RESPONSE_BYTES / CHUNK_BYTES) {
                         socket.write_all(&frame).await.unwrap();
                     }
                     socket.write_all(b"1\r\nx\r\n").await.unwrap();
@@ -2032,6 +2108,66 @@ mod tests {
     }
 
     const TOGGLE_SCHEDULE_ID: &str = "schedule/17 ?#%";
+
+    #[tokio::test]
+    async fn rename_schedule_requires_the_exact_receipt_and_keeps_the_dedicated_route() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        for (status, extra, body, expected) in [
+            (
+                "200 OK",
+                "",
+                r#"{"id":"other","name":"Weekly plan"}"#,
+                "Schedule rename response does not match the request",
+            ),
+            (
+                "200 OK",
+                "",
+                r#"{"id":"schedule-17","name":"Earlier title"}"#,
+                "Schedule rename response does not match the request",
+            ),
+            (
+                "404 Not Found",
+                "",
+                r#"{"error":{"code":"schedule_not_found","message":"RAW_DETAILS"}}"#,
+                "Schedule no longer exists",
+            ),
+            (
+                "307 Temporary Redirect",
+                "Location: /api/v1/schedules/schedule-17\r\n",
+                "",
+                "Could not rename schedule (HTTP 307)",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let serve = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut socket).await;
+                assert_eq!(
+                    request.lines().next(),
+                    Some("PATCH /api/v1/schedules/schedule-17/name HTTP/1.1")
+                );
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+                if !extra.is_empty() {
+                    assert!(timeout(Duration::from_millis(120), listener.accept())
+                        .await
+                        .is_err());
+                }
+            };
+            let (result, ()) = timeout(Duration::from_secs(5), async {
+                tokio::join!(client.rename_schedule("schedule-17", "Weekly plan"), serve)
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap_err().to_string(), expected);
+        }
+    }
 
     #[tokio::test]
     async fn set_schedule_enabled_patches_only_the_saved_flag_and_projects_the_reply() {

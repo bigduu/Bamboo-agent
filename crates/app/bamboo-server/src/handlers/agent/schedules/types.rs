@@ -99,6 +99,13 @@ pub struct PatchScheduleRequest {
     pub run_config: Option<ScheduleRunConfig>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum RenameScheduleRequest {
+    // This struct variant requires named JSON fields.
+    Title { name: String },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduleRunRecordView {
     pub run_id: String,
