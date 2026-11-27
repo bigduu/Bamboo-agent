@@ -1262,6 +1262,22 @@ mod tests {
             .collect()
     }
 
+    fn visible_transcript_row(terminal: &Terminal<TestBackend>, row: usize) -> String {
+        // A wide glyph covers its continuation cell even when TestBackend
+        // retains a symbol there from the previous draw.
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area().width);
+        let cells = &buffer.content()[row * width..(row + 1) * width];
+        let mut text = String::new();
+        let mut column = 0;
+        while let Some(cell) = cells.get(column) {
+            let symbol = cell.symbol();
+            text.push_str(symbol);
+            column += crate::text::grapheme_cell_width(symbol).max(1);
+        }
+        text
+    }
+
     fn fence_rows<'a>(rows: &'a [String], language: &str) -> &'a [String] {
         let top = rows
             .iter()
@@ -1713,20 +1729,7 @@ mod tests {
                     .unwrap_or_else(|| {
                         panic!("missing rounded diagram at {width}:\n{}", rows.join("\n"))
                     });
-                // A wide glyph covers its continuation cell even when TestBackend
-                // retains a symbol there from the previous draw.
-                let width_in_cells = usize::from(width);
-                let first_cell = (top + 1) * width_in_cells;
-                let buffer = terminal.backend().buffer();
-                let cells = &buffer.content()[first_cell..first_cell + width_in_cells];
-                let mut label_row = String::new();
-                let mut column = 0;
-                while let Some(cell) = cells.get(column) {
-                    let symbol = cell.symbol();
-                    label_row.push_str(symbol);
-                    column += crate::text::grapheme_cell_width(symbol).max(1);
-                }
-                rows[top + 1] = label_row;
+                rows[top + 1] = visible_transcript_row(&terminal, top + 1);
                 let rendered = rows.join("\n");
                 if direction == "TD" {
                     assert_eq!(rows[top].trim_end(), "╭─────────╮");
@@ -1760,6 +1763,84 @@ mod tests {
             let (_, fences) = markdown::copyable_fences(&saved.chat.messages[0].content);
             assert_eq!(
                 fences,
+                [markdown::CopyableFence {
+                    language: Some("mermaid"),
+                    source: &body,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn testbackend_previews_mermaid_edge_labels_only_after_settling_and_when_they_fit() {
+        const LABEL: &str = "需要复核 🧭";
+        for (direction, connector) in [("TD", '↓'), ("LR", '→')] {
+            let body = format!(
+                "flowchart {direction}\r\nA(Collect) -->|{LABEL}| B[Review]\r\nB --> C(Done)\r\n"
+            );
+            let source = format!(
+                "Before the diagram.\r\n\r\n~~~mermaid\r\n{body}~~~\r\n\r\nAfter the diagram."
+            );
+            let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+            live.chat.streaming = true;
+            live.chat.current_turn_id = Some("run:mermaid-edge-label".into());
+            live.chat.current_response = source.clone();
+            let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            let streaming = transcript_rows(&mut terminal, &live, true);
+            let fence = fence_rows(&streaming, "mermaid");
+            assert!(fence[2]
+                .replace(' ', "")
+                .contains("A(Collect)-->|需要复核🧭|B[Review]"));
+            assert!(!streaming.iter().any(|row| row.contains(connector)));
+
+            let saved = assistant_transcript(&source);
+            if direction == "LR" {
+                terminal.backend_mut().resize(38, 24);
+                let narrow = transcript_rows(&mut terminal, &saved, false);
+                assert!(narrow
+                    .iter()
+                    .any(|row| row.trim() == "Mermaid source · diagram too wide"));
+                assert!(fence_rows(&narrow, "mermaid")[1].contains("flowchart LR"));
+                assert!(!narrow.iter().any(|row| row.contains(connector)));
+            }
+
+            for width in [60, 120] {
+                terminal.backend_mut().resize(width, 24);
+                let mut rows = transcript_rows(&mut terminal, &saved, false);
+                let top = rows
+                    .iter()
+                    .position(|row| row.starts_with('╭'))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing labeled {direction} at {width}:\n{}",
+                            rows.join("\n")
+                        )
+                    });
+                let label_row = if direction == "TD" { top + 3 } else { top };
+                rows[label_row] = visible_transcript_row(&terminal, label_row);
+                if direction == "TD" {
+                    assert_eq!(rows[label_row].trim(), format!("↓ {LABEL}"));
+                    assert!(rows[top + 4].starts_with('┌'));
+                    assert_eq!(rows[top + 7].trim(), "↓");
+                } else {
+                    assert!(rows[label_row].contains(&format!("╮ {LABEL} ┌")));
+                    let dashes = "─".repeat(crate::text::grapheme_cell_width(LABEL) + 1);
+                    assert!(rows[top + 1].contains(&format!("├{dashes}→┤ Review ├──→┤")));
+                }
+                let rendered = rows.join("\n");
+                assert!(rendered.contains("After the diagram."));
+                assert!(!rendered.contains("Mermaid source") && !rendered.contains("-->"));
+                if width == 60
+                    && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_EDGE_LABEL").is_some()
+                {
+                    eprintln!(
+                        "MERMAID EDGE {direction} PREVIEW\n{rendered}\nEND MERMAID EDGE PREVIEW"
+                    );
+                }
+            }
+            assert_eq!(saved.chat.messages[0].content, source);
+            assert_eq!(
+                markdown::copyable_fences(&saved.chat.messages[0].content).1,
                 [markdown::CopyableFence {
                     language: Some("mermaid"),
                     source: &body,

@@ -26,10 +26,6 @@ impl Unavailable {
 /// access the original fence.
 pub(super) fn render(source: &str, width: usize) -> Result<Vec<Line<'static>>, Unavailable> {
     let (direction, nodes) = parse_path(source).ok_or(Unavailable::Unsupported)?;
-    let nodes: Vec<_> = nodes
-        .into_iter()
-        .map(|node| (node, grapheme_cell_width(node.label)))
-        .collect();
     let border = Style::default().fg(colors::code_border());
     match direction {
         Direction::TopDown => render_vertical(nodes, width, border),
@@ -38,22 +34,29 @@ pub(super) fn render(source: &str, width: usize) -> Result<Vec<Line<'static>>, U
 }
 
 fn render_vertical(
-    nodes: Vec<(NodeDisplay<'_>, usize)>,
+    nodes: Vec<PathStep<'_>>,
     width: usize,
     border: Style,
 ) -> Result<Vec<Line<'static>>, Unavailable> {
-    let label_width = nodes.iter().map(|(_, cells)| *cells).max().unwrap_or(0);
-    if label_width + 4 > width {
+    let label_width = nodes.iter().map(|step| step.cells).max().unwrap_or(0);
+    let center = (label_width + 3) / 2;
+    let edge_width = nodes
+        .iter()
+        .filter_map(|step| step.outgoing_label)
+        .map(|label| center + 2 + label.cells)
+        .max()
+        .unwrap_or(0);
+    if (label_width + 4).max(edge_width) > width {
         return Err(Unavailable::TooWide);
     }
 
-    let center = (label_width + 3) / 2;
     let rule_left = "─".repeat(center - 1);
     let rule_right = "─".repeat(label_width + 2 - center);
     let arrow = format!("{}↓", " ".repeat(center));
     let mut rows = Vec::with_capacity(nodes.len() * 4 - 1);
     let last_index = nodes.len() - 1;
-    for (index, (node, cells)) in nodes.into_iter().enumerate() {
+    for (index, step) in nodes.into_iter().enumerate() {
+        let node = step.display;
         let [top_left, top_right, bottom_left, bottom_right] = node.shape.corners();
         let top_center = if index == 0 { '─' } else { '┴' };
         let bottom_center = if index == last_index { '─' } else { '┬' };
@@ -64,42 +67,52 @@ fn render_vertical(
         rows.push(Line::from(vec![
             Span::styled("│ ", border),
             Span::raw(node.label.to_owned()),
-            Span::styled(format!("{} │", " ".repeat(label_width - cells)), border),
+            Span::styled(
+                format!("{} │", " ".repeat(label_width - step.cells)),
+                border,
+            ),
         ]));
         rows.push(Line::styled(
             format!("{bottom_left}{rule_left}{bottom_center}{rule_right}{bottom_right}"),
             border,
         ));
         if index != last_index {
-            rows.push(Line::styled(arrow.clone(), border));
+            let row = match step.outgoing_label {
+                Some(label) => Line::from(vec![
+                    Span::styled(arrow.clone(), border),
+                    Span::raw(format!(" {}", label.text)),
+                ]),
+                None => Line::styled(arrow.clone(), border),
+            };
+            rows.push(row);
         }
     }
     Ok(rows)
 }
 
 fn render_horizontal(
-    nodes: Vec<(NodeDisplay<'_>, usize)>,
+    nodes: Vec<PathStep<'_>>,
     width: usize,
     border: Style,
 ) -> Result<Vec<Line<'static>>, Unavailable> {
-    let arrow = "──→";
-    let gap_width = grapheme_cell_width(arrow);
-    let box_widths: usize = nodes.iter().map(|(_, cells)| cells + 4).sum();
-    if box_widths + gap_width * (nodes.len() - 1) > width {
+    let last_index = nodes.len() - 1;
+    let box_widths: usize = nodes.iter().map(|step| step.cells + 4).sum();
+    let gap_widths: usize = nodes[..last_index]
+        .iter()
+        .map(PathStep::horizontal_gap)
+        .sum();
+    if box_widths + gap_widths > width {
         return Err(Unavailable::TooWide);
     }
 
-    let gap = " ".repeat(gap_width);
-    let mut top = String::new();
+    let mut top = Vec::new();
     let mut middle = Vec::new();
     let mut bottom = String::new();
-    let last_index = nodes.len() - 1;
-    for (index, (node, cells)) in nodes.into_iter().enumerate() {
+    for (index, step) in nodes.into_iter().enumerate() {
+        let node = step.display;
         let [top_left, top_right, bottom_left, bottom_right] = node.shape.corners();
-        let rule = "─".repeat(cells + 2);
-        top.push(top_left);
-        top.push_str(&rule);
-        top.push(top_right);
+        let rule = "─".repeat(step.cells + 2);
+        top.push(Span::styled(format!("{top_left}{rule}{top_right}"), border));
         bottom.push(bottom_left);
         bottom.push_str(&rule);
         bottom.push(bottom_right);
@@ -110,13 +123,21 @@ fn render_horizontal(
         middle.push(Span::raw(node.label.to_owned()));
         middle.push(Span::styled(right_side, border));
         if index != last_index {
-            top.push_str(&gap);
-            middle.push(Span::styled(arrow, border));
-            bottom.push_str(&gap);
+            let gap_width = step.horizontal_gap();
+            if let Some(label) = step.outgoing_label {
+                top.push(Span::raw(format!(" {} ", label.text)));
+            } else {
+                top.push(Span::styled("   ", border));
+            }
+            middle.push(Span::styled(
+                format!("{}→", "─".repeat(gap_width - 1)),
+                border,
+            ));
+            bottom.push_str(&" ".repeat(gap_width));
         }
     }
     Ok(vec![
-        Line::styled(top, border),
+        Line::from(top),
         Line::from(middle),
         Line::styled(bottom, border),
     ])
@@ -155,13 +176,37 @@ struct NodeRef<'a> {
     display: Option<NodeDisplay<'a>>,
 }
 
+#[derive(Clone, Copy)]
+struct EdgeLabel<'a> {
+    text: &'a str,
+    cells: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Edge<'a> {
+    target: usize,
+    label: Option<EdgeLabel<'a>>,
+}
+
 struct Node<'a> {
     reference: NodeRef<'a>,
     incoming: bool,
-    next: Option<usize>,
+    next: Option<Edge<'a>>,
 }
 
-fn parse_path(source: &str) -> Option<(Direction, Vec<NodeDisplay<'_>>)> {
+struct PathStep<'a> {
+    display: NodeDisplay<'a>,
+    cells: usize,
+    outgoing_label: Option<EdgeLabel<'a>>,
+}
+
+impl PathStep<'_> {
+    fn horizontal_gap(&self) -> usize {
+        self.outgoing_label.map_or(3, |label| label.cells + 2)
+    }
+}
+
+fn parse_path(source: &str) -> Option<(Direction, Vec<PathStep<'_>>)> {
     if source.len() > MAX_SOURCE_BYTES {
         return None;
     }
@@ -190,12 +235,13 @@ fn parse_path(source: &str) -> Option<(Direction, Vec<NodeDisplay<'_>>)> {
         if rest.is_empty() {
             continue;
         }
-        let (to, rest) = parse_node(rest.strip_prefix("-->")?.trim_ascii_start())?;
+        let (label, rest) = parse_link(rest)?;
+        let (to, rest) = parse_node(rest)?;
         let to = register(&mut nodes, to)?;
         if !rest.is_empty() || from == to || nodes[from].next.is_some() || nodes[to].incoming {
             return None;
         }
-        nodes[from].next = Some(to);
+        nodes[from].next = Some(Edge { target: to, label });
         nodes[to].incoming = true;
     }
 
@@ -210,16 +256,38 @@ fn parse_path(source: &str) -> Option<(Direction, Vec<NodeDisplay<'_>>)> {
     let mut path = Vec::with_capacity(nodes.len());
     for _ in 0..nodes.len() {
         let node = &nodes[index];
-        path.push(node.reference.display.unwrap_or(NodeDisplay {
+        let display = node.reference.display.unwrap_or(NodeDisplay {
             label: node.reference.id,
             shape: NodeShape::Rectangle,
-        }));
+        });
+        path.push(PathStep {
+            display,
+            cells: grapheme_cell_width(display.label),
+            outgoing_label: node.next.and_then(|edge| edge.label),
+        });
         match node.next {
-            Some(next) => index = next,
+            Some(edge) => index = edge.target,
             None => return (path.len() == nodes.len()).then_some((direction, path)),
         }
     }
     None
+}
+
+fn parse_link(input: &str) -> Option<(Option<EdgeLabel<'_>>, &str)> {
+    let rest = input.strip_prefix("-->")?.trim_ascii_start();
+    let Some(body) = rest.strip_prefix('|') else {
+        return Some((None, rest));
+    };
+    let (label, rest) = body.split_once('|')?;
+    let text = label.trim_matches([' ', '\t']);
+    if text.trim().is_empty()
+        || text.chars().any(char::is_control)
+        || text.contains(['[', ']', '(', ')', '{', '}', '"', '<', '>', '`', '\\', '#'])
+    {
+        return None;
+    }
+    let cells = grapheme_cell_width(text);
+    (cells != 0).then_some((Some(EdgeLabel { text, cells }), rest.trim_ascii_start()))
 }
 
 fn register<'a>(nodes: &mut Vec<Node<'a>>, reference: NodeRef<'a>) -> Option<usize> {
@@ -328,8 +396,10 @@ mod tests {
         );
         let (direction, nodes) = parse_path(source).unwrap();
         assert_eq!(direction, Direction::TopDown);
-        assert!(nodes.iter().all(|node| node.shape == NodeShape::Rectangle));
-        let labels: Vec<_> = nodes.iter().map(|node| node.label).collect();
+        assert!(nodes
+            .iter()
+            .all(|step| step.display.shape == NodeShape::Rectangle));
+        let labels: Vec<_> = nodes.iter().map(|step| step.display.label).collect();
         assert_eq!(labels, ["计划 🧭", "Verify", "Deploy (done) & verify"]);
     }
 
@@ -347,7 +417,6 @@ mod tests {
             "A --> B\nA(Same)\nA[Same]",
             "A --> B\nA[Same]\nA(Same)",
             "A --> B\nA(different)\nA(conflicting)",
-            "A[Plan] -->|Yes| B",
             "A[Plan] --> B --> C",
             "A[(Disk)] --> B",
             "A((Circle)) --> B",
@@ -378,6 +447,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn refuses_malformed_labels_and_other_edge_syntax() {
+        for body in [
+            "A -->|| B",
+            "A -->| \t | B",
+            "A -->|\u{a0}| B",
+            "A -->|\u{301}| B",
+            "A -->|Unclosed B",
+            "A -->|Done|",
+            "A -->|Yes|No| B",
+            "A -->|Label\ncontinues| B",
+            "A -->|\"Quoted\"| B",
+            "A -->|\"`Markdown`\"| B",
+            "A -->|<b>HTML</b>| B",
+            "A -->|Nested (text)| B",
+            "A -->|[Link]| B",
+            "A -->|#alp; entity| B",
+            "A -->|line\tbreak| B",
+            r"A -->|Yes\|No| B",
+            "A -- Label --> B",
+            "A ---|Open| B",
+            "A -.->|Dotted| B",
+            "A ==>|Thick| B",
+            "A --->|Longer| B",
+            "A -->|Different| B\nA -->|Branch| C",
+            "A -->|First| B\nB -->|Back| A",
+            "A -->|First| B\nA -->|Duplicate| B",
+            "A -->|Chained| B --> C",
+        ] {
+            assert_eq!(
+                render(&format!("flowchart LR\n{body}"), 120),
+                Err(Unavailable::Unsupported),
+                "{body:?}",
+            );
+        }
+    }
+
+    const MIXED_EDGES: &str = concat!(
+        "C --> D[Done];\r\n",
+        "B[Check] -->\t| 审核 👩‍💻 | C(Review)\r\n",
+        "A(Plan) -->|Go|B",
+    );
+
+    #[test]
+    fn vertical_labels_follow_their_edges_and_fit_by_cells() {
+        let source = format!("flowchart TD\r\n{MIXED_EDGES}");
+        let rows = render(&source, 13).unwrap();
+        assert_eq!(rows.len(), 15);
+        assert_eq!(rows[0].to_string(), "╭────────╮");
+        assert_eq!(rows[3].to_string(), "    ↓ Go");
+        assert_eq!(rows[4].to_string(), "┌───┴────┐");
+        assert_eq!(rows[7].to_string(), "    ↓ 审核 👩‍💻");
+        assert_eq!(rows[11].to_string(), "    ↓");
+        assert_eq!(grapheme_cell_width(&rows[7].to_string()), 13);
+        assert_eq!(render(&source, 12), Err(Unavailable::TooWide));
+    }
+
+    #[test]
+    fn horizontal_labels_widen_only_their_own_gaps_and_fit_by_cells() {
+        let source = format!("graph LR\r\n{MIXED_EDGES}");
+        let rows = render(&source, 51).unwrap();
+        let content: Vec<_> = rows.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            content,
+            [
+                "╭──────╮ Go ┌───────┐ 审核 👩‍💻 ╭────────╮   ┌──────┐",
+                "│ Plan ├───→┤ Check ├────────→┤ Review ├──→┤ Done │",
+                "╰──────╯    └───────┘         ╰────────╯   └──────┘",
+            ]
+        );
+        assert!(content.iter().all(|row| grapheme_cell_width(row) == 51));
+        assert_eq!(render(&source, 50), Err(Unavailable::TooWide));
     }
 
     #[test]
