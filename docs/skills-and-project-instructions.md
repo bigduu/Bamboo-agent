@@ -60,8 +60,10 @@ Skills also follow the documented
 [Codex Skill bundle model](https://learn.chatgpt.com/docs/build-skills).
 
 For repository instructions Bamboo finds the nearest Git workspace boundary and reads applicable
-`AGENTS.md` and `CLAUDE.md` files from that root down to the active workspace directory. Root rules
-are injected first and deeper rules later, so the most specific scope can refine the repository
-defaults. Files above the Git workspace and symlinked instruction files are ignored. A Git worktree
-has its own `.git` boundary and receives the same checked-out repository instructions. This context
-is assembled by the shared runtime prompt path used by both primary and child agents.
+files from that root down to the active workspace directory. In each directory it reads
+`AGENTS.md`, `CLAUDE.md`, then `AGENT.md` when present. Use `AGENTS.md` when writing new repository
+instructions. Root rules are injected first and deeper rules later, so the most specific scope can
+refine the repository defaults. Without a Git boundary Bamboo reads only the active workspace
+directory. Files above the Git workspace and symlinked instruction files are ignored. A Git
+worktree has its own `.git` boundary and receives the same checked-out repository instructions.
+This context is assembled by the shared runtime prompt path used by both primary and child agents.
