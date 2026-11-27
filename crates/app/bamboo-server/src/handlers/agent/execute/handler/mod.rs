@@ -200,7 +200,7 @@ struct RestoredFreshAdmission {
 
 enum ExecuteAdmissionSource {
     Ordinary,
-    FreshSync(RestoredFreshAdmission),
+    FreshSync(Box<RestoredFreshAdmission>),
     Interrupted(Box<bamboo_domain::Session>),
 }
 
@@ -298,13 +298,13 @@ async fn handle_execute_inner(
             native_main,
             live_bootstrap_resume,
         } = handoff;
-        restored = Some(RestoredFreshAdmission {
+        restored = Some(Box::new(RestoredFreshAdmission {
             inputs,
             witness,
             generate_title,
             native_main,
             live_bootstrap_resume,
-        });
+        }));
         Ok(Some(reservation))
     } else {
         match selected.as_ref() {
@@ -351,7 +351,7 @@ async fn handle_reserved_execute(
 ) -> HttpResponse {
     let (restored, interrupted_expected) = match source {
         ExecuteAdmissionSource::Ordinary => (None, None),
-        ExecuteAdmissionSource::FreshSync(admission) => (Some(admission), None),
+        ExecuteAdmissionSource::FreshSync(admission) => (Some(*admission), None),
         ExecuteAdmissionSource::Interrupted(observed) => (None, Some(observed)),
     };
     let restored_owner = restored.is_some();
