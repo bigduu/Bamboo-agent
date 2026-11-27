@@ -298,7 +298,7 @@ impl Host {
             .join("\n")
     }
 
-    fn initial_execute_evidence(&mut self, generation: &str) -> String {
+    fn request_failure_evidence(&mut self, generation: &str) -> String {
         let liveness = match self.child.try_wait() {
             Ok(Some(status)) => format!("exited ({status})"),
             Ok(None) => "running".into(),
@@ -632,7 +632,7 @@ async fn planned_update_commits_real_predecessor_and_resumes_roots_in_a_successo
             .await;
         let elapsed = started.elapsed();
         check_initial_execute_response(response, started + WAIT, || {
-            old.initial_execute_evidence("managed-old")
+            old.request_failure_evidence("managed-old")
         })
         .await
         .unwrap_or_else(|evidence| {
@@ -1066,6 +1066,10 @@ impl Fixture {
         })).unwrap()).unwrap();
         let client = reqwest::Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            // Starting the second Host can outlive the first Host's idle keep-alive.
+            .pool_max_idle_per_host(0)
             .timeout(Duration::from_secs(150))
             .build()
             .unwrap();
@@ -1137,7 +1141,13 @@ impl Fixture {
             }))
             .send()
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "fixture initial chat request failed: {error:?}\n{}\n{}",
+                    a.request_failure_evidence("a"),
+                    b.request_failure_evidence("b"),
+                )
+            });
         assert!(
             response.status().is_success(),
             "chat: {}",
