@@ -964,6 +964,152 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires the Playwright Chromium runtime"]
+    async fn multilingual_dom_bounds_remain_readable_over_the_host_transport() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const CHAT: &str = "dom-unicode-fixture";
+        const SNAPSHOT_ANCHOR: &str = "可见正文锚点";
+        const HTML_ANCHOR: &str = "文稿注释锚点";
+        const BOUNDARY: &str = "🧪";
+        const TITLE: &str = "多语言文档";
+
+        let render_page = |snapshot_padding, html_padding| {
+            format!(
+                "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\"><title>{TITLE}</title>\
+                 <!--阅读😀{HTML_ANCHOR}{}{BOUNDARY}尾部--></head>\
+                 <body><p>阅读😀{SNAPSHOT_ANCHOR}{}{BOUNDARY}尾部</p></body></html>",
+                "文".repeat(html_padding),
+                "文".repeat(snapshot_padding),
+            )
+        };
+        let (page, served_page) = tokio::sync::watch::channel(render_page(0, 0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let fixture = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let served_page = served_page.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    if socket.read(&mut request).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let body = served_page.borrow().clone();
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                         Cache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    if socket.write_all(headers.as_bytes()).await.is_ok() {
+                        let _ = socket.write_all(body.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        // Measure real Chromium serialization offsets on a short document. The HTML
+        // comment precedes the visible paragraph and is absent from the snapshot, so
+        // its padding controls the HTML boundary independently.
+        let padding = |result: &Value, field: &str, marker: &str, limit: usize| {
+            let (prefix, suffix) = result[field].as_str()?.split_once(marker)?;
+            suffix.strip_prefix(BOUNDARY)?;
+            (limit - 1).checked_sub(prefix.encode_utf16().count() + marker.encode_utf16().count())
+        };
+        let browser = BrowserManager::default();
+        let bounded_url = format!("{url}/bounded");
+        let observed = async {
+            let opened = browser.open(CHAT).await.map_err(|_| "open")?;
+            // Observe the first document before measuring the compact page. Playwright
+            // adds a frame prefix to accessibility references after navigation.
+            let first_page = browser
+                .command(
+                    CHAT,
+                    "navigate",
+                    json!({"url": format!("{url}/initial"), "expected_epoch": opened["page_epoch"]}),
+                )
+                .await
+                .map_err(|_| "initial navigation")?;
+            browser
+                .command(CHAT, "dom", json!({}))
+                .await
+                .map_err(|_| "initial DOM")?;
+            let compact_page = browser
+                .command(
+                    CHAT,
+                    "navigate",
+                    json!({
+                        "url": format!("{url}/compact"), "expected_epoch": first_page["page_epoch"],
+                    }),
+                )
+                .await
+                .map_err(|_| "compact navigation")?;
+            let compact = browser
+                .command(CHAT, "dom", json!({}))
+                .await
+                .map_err(|_| "compact DOM")?;
+            let snapshot_padding = padding(&compact, "snapshot", SNAPSHOT_ANCHOR, 80_000)
+                .ok_or("snapshot calibration")?;
+            let html_padding =
+                padding(&compact, "html", HTML_ANCHOR, 100_000).ok_or("HTML calibration")?;
+            page.send_replace(render_page(snapshot_padding, html_padding));
+            let bounded_page = browser
+                .command(
+                    CHAT,
+                    "navigate",
+                    json!({
+                        "url": bounded_url, "expected_epoch": compact_page["page_epoch"],
+                    }),
+                )
+                .await
+                .map_err(|_| "bounded navigation")?;
+            let bounded = browser
+                .command(CHAT, "dom", json!({}))
+                .await
+                .map_err(|_| "bounded DOM")?;
+            let current = browser.state(CHAT).await.map_err(|_| "follow-up state")?;
+            Ok::<_, &str>((compact, bounded_page, bounded, current))
+        }
+        .await;
+        let closed = browser.close(CHAT).await;
+        fixture.abort();
+        let _ = fixture.await;
+        let (compact, bounded_page, bounded, current) =
+            observed.unwrap_or_else(|stage| panic!("Unicode DOM fixture failed during {stage}"));
+        assert!(closed.is_ok(), "fixture browser close failed");
+
+        for (field, flag, limit) in [
+            ("snapshot", "snapshot_truncated", 80_000),
+            ("html", "html_truncated", 100_000),
+        ] {
+            assert_eq!(compact[flag].as_bool(), Some(false));
+            assert_eq!(bounded[flag].as_bool(), Some(true));
+            let content = bounded[field].as_str().expect("bounded DOM text");
+            assert_eq!(
+                content.encode_utf16().count(),
+                limit - 1,
+                "{field} boundary"
+            );
+            assert!(content.contains("阅读😀"), "{field} lost complete Unicode");
+            assert!(
+                content.ends_with('文'),
+                "{field} lost its final complete character"
+            );
+        }
+        assert_eq!(bounded["title"].as_str(), Some(TITLE));
+        let epoch = bounded_page["page_epoch"]
+            .as_u64()
+            .expect("navigation epoch");
+        let tab = bounded_page["active_tab_id"]
+            .as_str()
+            .expect("navigation tab");
+        for reply in [&bounded, &current] {
+            assert_eq!(reply["page_epoch"].as_u64(), Some(epoch));
+            assert_eq!(reply["active_tab_id"].as_str(), Some(tab));
+            assert_eq!(reply["url"].as_str(), Some(bounded_url.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
     async fn model_download_returns_binary_bytes_without_replacing_shared_page() {
         use base64::Engine as _;
         use sha2::{Digest as _, Sha256};
