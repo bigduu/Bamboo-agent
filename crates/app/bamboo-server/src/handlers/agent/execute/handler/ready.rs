@@ -419,22 +419,20 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
                 ) {
                     (Some(expected), Some(owner)) => {
                         let cache = state.sessions.clone();
-                        state
-                            .session_store
-                            .save_interrupted_root_startup(
-                                &owner,
-                                &mut session,
-                                expected,
-                                std::sync::Arc::new(move |saved| {
-                                    cache.insert(
-                                        saved.id.clone(),
-                                        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(
-                                            saved.clone(),
-                                        )),
-                                    );
-                                }),
-                            )
-                            .await
+                        Box::pin(state.session_store.save_interrupted_root_startup(
+                            &owner,
+                            &mut session,
+                            expected,
+                            std::sync::Arc::new(move |saved| {
+                                cache.insert(
+                                    saved.id.clone(),
+                                    std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(
+                                        saved.clone(),
+                                    )),
+                                );
+                            }),
+                        ))
+                        .await
                     }
                     _ => Err(std::io::Error::other(
                         "interrupted resume has no Root execution writer",

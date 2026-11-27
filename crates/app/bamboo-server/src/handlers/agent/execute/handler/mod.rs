@@ -263,23 +263,13 @@ async fn handle_execute_inner(
     // delayed failure from turn A must never poison a newer turn B.
     drop(startup_lock);
     if req.resume_interrupted {
-        let (mut reservation, observed) =
-            match super::interrupted::reserve(&state, &session_id).await {
-                Ok((reservation, observed)) => (Some(reservation), observed),
-                Err(response) => return *response,
-            };
-        let response = handle_reserved_execute(
+        return Box::pin(handle_interrupted_execute(
             state,
             session_id,
             req,
-            &mut startup_guard,
-            &mut reservation,
-            ExecuteAdmissionSource::Interrupted(Box::new(observed)),
-            origin,
-        )
+            startup_guard,
+        ))
         .await;
-        abandon_admission_reservation(&mut reservation).await;
-        return response;
     }
     // A resync handoff contains the original non-clonable reservation and
     // freshly admitted input. Never recreate it from history or a receipt.
@@ -338,6 +328,33 @@ async fn handle_execute_inner(
     // cancellation-safe Drop remains the fallback if this HTTP future is lost.
     abandon_admission_reservation(&mut admission_reservation).await;
     receipt::annotate(response, selected)
+}
+
+// Keep the manual-resume reservation and its durable snapshot out of the
+// ordinary Execute future. Both paths still use the same guarded start.
+async fn handle_interrupted_execute(
+    state: web::Data<AppState>,
+    session_id: String,
+    req: web::Json<ExecuteRequest>,
+    mut startup_guard: crate::handlers::agent::events::ExecuteStartupGuard,
+) -> HttpResponse {
+    let (reservation, observed) = match super::interrupted::reserve(&state, &session_id).await {
+        Ok(ready) => ready,
+        Err(response) => return *response,
+    };
+    let mut reservation = Some(reservation);
+    let response = handle_reserved_execute(
+        state,
+        session_id,
+        req,
+        &mut startup_guard,
+        &mut reservation,
+        ExecuteAdmissionSource::Interrupted(Box::new(observed)),
+        ExecuteOrigin::Http,
+    )
+    .await;
+    abandon_admission_reservation(&mut reservation).await;
+    response
 }
 
 async fn handle_reserved_execute(
