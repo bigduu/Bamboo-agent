@@ -6,7 +6,8 @@ use crate::schedule_app::{ScheduleRunJob, ScheduleRunStatus};
 
 use super::super::types::{
     CreateScheduleRequest, PatchScheduleRequest, RenameScheduleRequest, ScheduleRunRecordView,
-    ScheduleView, SetScheduleIntervalRequest, SetSchedulePromptRequest,
+    ScheduleView, SetScheduleDailyTimeRequest, SetScheduleIntervalRequest,
+    SetSchedulePromptRequest,
 };
 use super::super::validation::{
     resolve_create_schedule_definition, resolve_patch_schedule_definition,
@@ -199,6 +200,58 @@ pub async fn set_schedule_interval(
                 SchedulePatchRejection::NoFutureOccurrence | SchedulePatchRejection::InvalidWindow,
             ) => Ok(schedule_no_future_occurrence()),
             _ => Err(internal_server_error("change schedule interval", error)),
+        },
+    }
+}
+
+fn invalid_schedule_daily_time() -> HttpResponse {
+    crate::error::json_error_with_code(
+        StatusCode::BAD_REQUEST,
+        "Enter a valid daily time (HH:MM[:SS])".into(),
+        Some("invalid_schedule_daily_time"),
+    )
+}
+
+/// `PATCH /api/v1/schedules/{schedule_id}/daily-time`
+pub async fn set_schedule_daily_time(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    req: Result<web::Json<SetScheduleDailyTimeRequest>>,
+) -> Result<HttpResponse> {
+    let SetScheduleDailyTimeRequest::Clock {
+        hour,
+        minute,
+        second,
+    } = match req {
+        Ok(req) => req.into_inner(),
+        Err(error) if error.as_response_error().status_code() == StatusCode::BAD_REQUEST => {
+            return Ok(invalid_schedule_daily_time());
+        }
+        Err(error) => return Err(error),
+    };
+    match state
+        .schedule_store
+        .patch_daily_time(&path, hour, minute, second)
+        .await
+    {
+        Ok(Some(schedule)) => Ok(HttpResponse::Ok().json(ScheduleView::from(schedule))),
+        Ok(None) => Ok(crate::error::json_error_with_code(
+            StatusCode::NOT_FOUND,
+            "Schedule not found".into(),
+            Some("schedule_not_found"),
+        )),
+        Err(error) => match error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<SchedulePatchRejection>())
+        {
+            Some(SchedulePatchRejection::InvalidDailyTime) => Ok(invalid_schedule_daily_time()),
+            Some(SchedulePatchRejection::TriggerChanged) => Ok(crate::error::json_error_with_code(
+                StatusCode::CONFLICT,
+                "Schedule no longer uses an editable Daily trigger".into(),
+                Some("schedule_trigger_changed"),
+            )),
+            Some(SchedulePatchRejection::NoFutureOccurrence) => Ok(schedule_no_future_occurrence()),
+            _ => Err(internal_server_error("change schedule daily time", error)),
         },
     }
 }
@@ -799,6 +852,405 @@ mod tests {
             assert_eq!(store.get_schedule(&schedule.id).await, Some(exhausted));
             assert_eq!(store.get_schedule(&once.id).await, Some(once));
             assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), saved);
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_daily_time_preserves_saved_timezone_and_admitted_run() {
+            use chrono::{Duration, Utc};
+
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let store = &state.schedule_store;
+            let day = (Utc::now() + Duration::days(3)).date_naive();
+            let occurrence = day.and_hms_opt(2, 0, 0).unwrap().and_utc();
+            let config = ScheduleRunConfig {
+                task_message: Some("Review the saved report".into()),
+                system_prompt: Some("Keep the saved format".into()),
+                auto_execute: true,
+                ..Default::default()
+            };
+            let entry = store
+                .create_schedule_with_definition(
+                    "Daily review".into(),
+                    true,
+                    config.clone(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(ScheduleTrigger::Daily {
+                            hour: 10,
+                            minute: 0,
+                            second: 0,
+                        }),
+                        timezone: Some("Asia/Shanghai".into()),
+                        start_at: Some(occurrence),
+                        end_at: Some(occurrence + Duration::days(2)),
+                        misfire_policy: Some(MisFirePolicy::RunOnce),
+                        overlap_policy: Some(OverlapPolicy::Allow),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(entry.state.next_fire_at, Some(occurrence));
+            let claims = store.claim_due_runs(occurrence).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].scheduled_for, occurrence);
+            let before = store
+                .patch_schedule(&entry.id, None, Some(false), None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!before.enabled);
+            assert_eq!(before.state.last_scheduled_at, Some(occurrence));
+            assert_eq!(before.state.queued_run_count, 1);
+            let records = store.list_run_records_for_schedule(&entry.id).await;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].run_id, claims[0].run_id);
+            assert_eq!(records[0].status, ScheduleRunStatus::Queued);
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let uri = format!("/api/v1/schedules/{}/daily-time", entry.id);
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&uri)
+                    .set_json(serde_json::json!({"hour":9,"minute":45,"second":7}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let view: Value = test::read_body_json(response).await;
+            let saved = store.get_schedule(&entry.id).await.unwrap();
+            let mut expected = before;
+            expected.trigger = ScheduleTrigger::Daily {
+                hour: 9,
+                minute: 45,
+                second: 7,
+            };
+            // The chosen clock has already passed on the last claim's local date.
+            expected.state.next_fire_at =
+                Some(occurrence + Duration::days(1) - Duration::minutes(15) + Duration::seconds(7));
+            assert_ne!(saved.updated_at, expected.updated_at);
+            expected.updated_at = saved.updated_at;
+            assert_eq!(saved, expected);
+            assert_eq!(
+                view,
+                serde_json::to_value(ScheduleView::from(expected.clone())).unwrap()
+            );
+            assert_eq!(claims[0].run_config, config);
+            assert_eq!(
+                store.list_run_records_for_schedule(&entry.id).await,
+                records
+            );
+            let reopened = ScheduleStore::new(store.index_path().parent().unwrap().to_path_buf())
+                .await
+                .unwrap();
+            assert_eq!(reopened.get_schedule(&entry.id).await, Some(expected));
+            assert_eq!(
+                reopened.list_run_records_for_schedule(&entry.id).await,
+                records
+            );
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_daily_time_keeps_legacy_seconds_and_inclusive_window_boundaries() {
+            use chrono::{Duration, Utc};
+
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let seed = ScheduleStore::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let day = (Utc::now() + Duration::days(3)).date_naive();
+            let clock = day.and_hms_opt(2, 15, 19).unwrap().and_utc();
+            let windows = [
+                (clock, clock),
+                (clock + Duration::minutes(30), clock + Duration::days(1)),
+            ];
+            let mut ids = Vec::new();
+            for (start, end) in windows {
+                let entry = seed
+                    .create_schedule_with_definition(
+                        "Daily report".into(),
+                        false,
+                        ScheduleRunConfig::default(),
+                        ScheduleDefinitionChanges {
+                            trigger: Some(ScheduleTrigger::Daily {
+                                hour: 9,
+                                minute: 0,
+                                second: 0,
+                            }),
+                            timezone: Some("Asia/Shanghai".into()),
+                            start_at: Some(start),
+                            end_at: Some(end),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                ids.push(entry.id);
+            }
+            let mut persisted: Value =
+                serde_json::from_slice(&tokio::fs::read(seed.index_path()).await.unwrap()).unwrap();
+            for id in &ids {
+                assert_eq!(
+                    persisted["schedules"][id.as_str()]["trigger"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("second"),
+                    Some(serde_json::json!(0))
+                );
+            }
+            tokio::fs::write(seed.index_path(), serde_json::to_vec(&persisted).unwrap())
+                .await
+                .unwrap();
+            drop(seed);
+
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let store = &state.schedule_store;
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            for (id, (start, expected_fire)) in ids.into_iter().zip(windows) {
+                let saved = store.get_schedule(&id).await.unwrap();
+                assert_eq!(
+                    saved.trigger,
+                    ScheduleTrigger::Daily {
+                        hour: 9,
+                        minute: 0,
+                        second: 0,
+                    }
+                );
+                assert_eq!(saved.state.next_fire_at, Some(start));
+                let uri = format!("/api/v1/schedules/{id}/daily-time");
+                let before = tokio::fs::read(store.index_path()).await.unwrap();
+                let noop = test::call_service(
+                    &app,
+                    test::TestRequest::patch()
+                        .uri(&uri)
+                        .set_json(serde_json::json!({"hour":9,"minute":0,"second":0}))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(noop.status(), StatusCode::OK);
+                assert_eq!(
+                    test::read_body_json::<Value, _>(noop).await,
+                    serde_json::to_value(ScheduleView::from(saved.clone())).unwrap()
+                );
+                assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), before);
+
+                let edited = test::call_service(
+                    &app,
+                    test::TestRequest::patch()
+                        .uri(&uri)
+                        .set_json(serde_json::json!({"hour":10,"minute":15,"second":19}))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(edited.status(), StatusCode::OK);
+                let view: Value = test::read_body_json(edited).await;
+                let mut expected = serde_json::to_value(ScheduleView::from(saved)).unwrap();
+                expected["trigger"] =
+                    serde_json::json!({"type":"daily","hour":10,"minute":15,"second":19});
+                expected["state"]["next_fire_at"] = serde_json::json!(expected_fire);
+                expected["updated_at"] = view["updated_at"].clone();
+                assert_eq!(view, expected);
+            }
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_daily_time_refuses_invalid_missing_and_unusable_schedules() {
+            use chrono::{Duration, Utc};
+
+            let temp_dir = tempdir().unwrap();
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let seed = ScheduleStore::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let day = (Utc::now() + Duration::days(3)).date_naive();
+            let occurrence = day.and_hms_opt(10, 0, 0).unwrap().and_utc();
+            let daily = ScheduleTrigger::Daily {
+                hour: 10,
+                minute: 0,
+                second: 0,
+            };
+            let ended = seed
+                .create_schedule_with_definition(
+                    "Finite daily review".into(),
+                    true,
+                    ScheduleRunConfig::default(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(daily.clone()),
+                        start_at: Some(occurrence),
+                        end_at: Some(occurrence + Duration::seconds(30)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let once = seed
+                .create_schedule(
+                    "One-shot task".into(),
+                    ScheduleTrigger::Once { at: occurrence },
+                    false,
+                    ScheduleRunConfig::default(),
+                )
+                .await
+                .unwrap();
+            // The public creation route rejects Workflow + Daily. Retain an
+            // incompatible persisted row to check that this edit rejects it too.
+            let workflow = seed
+                .create_schedule(
+                    "Legacy Workflow".into(),
+                    daily,
+                    false,
+                    ScheduleRunConfig {
+                        workflow_target: Some(bamboo_domain::ScheduledWorkflowTarget {
+                            workflow_id: "fixture-workflow".into(),
+                            revision: 1,
+                            args: serde_json::json!({}),
+                        }),
+                        auto_execute: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            // Use the serialized inactive monitor shape without starting a scan.
+            let monitor = seed
+                .create_schedule(
+                    "Inactive monitor".into(),
+                    ScheduleTrigger::legacy_interval(60, None),
+                    false,
+                    ScheduleRunConfig::default(),
+                )
+                .await
+                .unwrap();
+            let claims = seed.claim_due_runs(occurrence).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].schedule_id, ended.id);
+            let ended = seed.get_schedule(&ended.id).await.unwrap();
+            assert!(!ended.enabled);
+            assert_eq!(ended.state.next_fire_at, None);
+            let mut persisted: Value =
+                serde_json::from_slice(&tokio::fs::read(seed.index_path()).await.unwrap()).unwrap();
+            let stamp = occurrence;
+            let file = serde_json::json!({"device":1,"inode":2});
+            persisted["schedules"][monitor.id.as_str()]["log_monitor"] = serde_json::json!({
+                "owner": {
+                    "supervisor": {"session_id":"fixture", "incarnation_id": uuid::Uuid::nil()},
+                    "created_at": stamp
+                },
+                "spec": {
+                    "project_id": "fixture-project", "relative_path": "fixture.log",
+                    "every_seconds": 60, "workspace": temp_dir.path(), "workspace_identity": file
+                },
+                "active": false, "generation": uuid::Uuid::nil(), "session_created_at": stamp,
+                "cursor": {
+                    "file": file, "offset": 0, "skip_partial_line": false,
+                    "checkpoint": vec![0; 32]
+                },
+                "pending_alert": null
+            });
+            tokio::fs::write(seed.index_path(), serde_json::to_vec(&persisted).unwrap())
+                .await
+                .unwrap();
+            drop(seed);
+
+            let state = web::Data::new(AppState::new(temp_dir.path().to_path_buf()).await.unwrap());
+            let store = &state.schedule_store;
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let saved = tokio::fs::read(store.index_path()).await.unwrap();
+            let ended_uri = format!("/api/v1/schedules/{}/daily-time", ended.id);
+            for payload in [
+                r#"{"hour":9,"minute":0"#,
+                "[9,0,0]",
+                r#"{"hour":9,"minute":0}"#,
+                r#"{"hour":-1,"minute":0,"second":0}"#,
+                r#"{"hour":24,"minute":0,"second":0}"#,
+                r#"{"hour":9,"minute":60,"second":0}"#,
+                r#"{"hour":9,"minute":0,"second":60}"#,
+                r#"{"hour":9,"minute":0,"second":0,"enabled":true}"#,
+            ] {
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::patch()
+                        .uri(&ended_uri)
+                        .insert_header(("Content-Type", "application/json"))
+                        .set_payload(payload)
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{payload}");
+                let body: Value = test::read_body_json(response).await;
+                assert_eq!(body["error"]["type"], "api_error");
+                assert_eq!(body["error"]["code"], "invalid_schedule_daily_time");
+            }
+            for (id, status, code) in [
+                (
+                    ended.id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_no_future_occurrence",
+                ),
+                (
+                    once.id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_trigger_changed",
+                ),
+                (
+                    workflow.id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_trigger_changed",
+                ),
+                (
+                    monitor.id.as_str(),
+                    StatusCode::NOT_FOUND,
+                    "schedule_not_found",
+                ),
+                ("missing", StatusCode::NOT_FOUND, "schedule_not_found"),
+            ] {
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::patch()
+                        .uri(&format!("/api/v1/schedules/{id}/daily-time"))
+                        .set_json(serde_json::json!({"hour":9,"minute":0,"second":0}))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), status, "{id}");
+                let body: Value = test::read_body_json(response).await;
+                assert_eq!(body["error"]["type"], "api_error");
+                assert_eq!(body["error"]["code"], code);
+            }
+            let noop = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&ended_uri)
+                    .set_json(serde_json::json!({"hour":10,"minute":0,"second":0}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(noop.status(), StatusCode::OK);
+            assert_eq!(
+                test::read_body_json::<Value, _>(noop).await,
+                serde_json::to_value(ScheduleView::from(ended.clone())).unwrap()
+            );
+            assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), saved);
+            assert_eq!(store.get_schedule(&ended.id).await, Some(ended));
+            assert_eq!(store.get_schedule(&once.id).await, Some(once));
+            assert_eq!(store.get_schedule(&workflow.id).await, Some(workflow));
         }
 
         #[actix_web::test]

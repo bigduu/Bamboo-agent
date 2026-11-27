@@ -2373,6 +2373,7 @@ pub(super) fn render_schedule_rename(f: &mut Frame, app: &App) {
             f,
             app,
             ActionContext::ScheduleRename,
+            None,
             &rename.draft,
             rename.error.as_deref(),
             app.schedule_rename_is_saving(),
@@ -2380,15 +2381,16 @@ pub(super) fn render_schedule_rename(f: &mut Frame, app: &App) {
     }
 }
 
-pub(super) fn render_schedule_interval(f: &mut Frame, app: &App) {
-    if let Some(interval) = &app.schedule_interval {
+pub(super) fn render_schedule_cadence(f: &mut Frame, app: &App) {
+    if let Some(cadence) = &app.schedule_cadence {
         render_schedule_editor(
             f,
             app,
             ActionContext::ScheduleInterval,
-            &interval.draft,
-            interval.error.as_deref(),
-            app.schedule_interval_is_saving(),
+            cadence.timezone.as_deref(),
+            &cadence.draft,
+            cadence.error.as_deref(),
+            app.schedule_cadence_is_saving(),
         );
     }
 }
@@ -2441,12 +2443,14 @@ fn render_schedule_editor(
     f: &mut Frame,
     app: &App,
     context: ActionContext,
+    timezone: Option<&str>,
     draft: &str,
     error: Option<&str>,
     saving: bool,
 ) {
-    let (title, label) = match context {
-        ActionContext::ScheduleInterval => (" Edit interval ", "  Every (seconds): "),
+    let (title, label) = match (context, timezone) {
+        (ActionContext::ScheduleInterval, Some(_)) => (" Edit daily time ", "  Time: "),
+        (ActionContext::ScheduleInterval, None) => (" Edit interval ", "  Every (seconds): "),
         _ => (" Rename schedule ", "  Name: "),
     };
     let screen = f.area();
@@ -2464,6 +2468,12 @@ fn render_schedule_editor(
             Style::default().fg(colors::brand()),
         ),
     ])];
+    if let Some(timezone) = timezone {
+        lines.push(Line::styled(
+            clip_cells(&format!("  Time zone  {timezone}"), width),
+            muted,
+        ));
+    }
     if saving {
         lines.push(Line::styled("  Saving…", muted));
     } else {
@@ -4219,9 +4229,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             if cfg!(target_os = "macos") {
-                [5_758_516_726_624_600_194, 4_315_808_556_407_004_248]
+                [1_868_699_155_225_402_874, 4_165_422_283_641_237_300]
             } else {
-                [1_475_273_007_039_437_660, 7_645_557_427_789_226_886]
+                [2_647_920_646_281_492_704, 16_885_064_876_783_252_414]
             },
             "complete help-overlay buffer golden changed"
         );

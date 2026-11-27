@@ -1,7 +1,8 @@
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::api::types::{
-    CreateScheduleRequest, ScheduleRunConfigReq, ScheduleTriggerReq, ScheduleWeekdayReq,
+    CreateScheduleRequest, ScheduleDailyTime, ScheduleRunConfigReq, ScheduleTriggerReq,
+    ScheduleWeekdayReq,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -245,21 +246,26 @@ fn shifted_index(index: usize, direction: isize, len: usize) -> usize {
 }
 
 fn parse_clock(timing: &str) -> Result<(u8, u8, u8), &'static str> {
-    const ERROR: &str = "Enter a UTC time in HH:MM or HH:MM:SS format";
-    let component = |part: &str, max: u8| {
+    parse_daily_clock(timing)
+        .map(|time| (time.hour, time.minute, time.second))
+        .ok_or("Enter a UTC time in HH:MM or HH:MM:SS format")
+}
+
+pub(crate) fn parse_daily_clock(input: &str) -> Option<ScheduleDailyTime> {
+    let component = |part: &str| {
         if part.len() != 2 || !part.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        part.parse::<u8>().ok().filter(|value| *value <= max)
+        part.parse::<u8>().ok()
     };
-    let mut parts = timing.split(':');
-    let hour = component(parts.next().unwrap_or_default(), 23).ok_or(ERROR)?;
-    let minute = component(parts.next().unwrap_or_default(), 59).ok_or(ERROR)?;
-    let second = component(parts.next().unwrap_or("00"), 59).ok_or(ERROR)?;
+    let mut parts = input.trim().split(':');
+    let hour = component(parts.next()?)?;
+    let minute = component(parts.next()?)?;
+    let second = component(parts.next().unwrap_or("00"))?;
     if parts.next().is_some() {
-        return Err(ERROR);
+        return None;
     }
-    Ok((hour, minute, second))
+    ScheduleDailyTime::new(hour, minute, second)
 }
 
 fn parse_days<T>(
@@ -310,6 +316,31 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         "2030-02-03T00:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn daily_clock_parses_wall_time_and_preserves_creation_validation() {
+        assert_eq!(parse_daily_clock("08:15"), ScheduleDailyTime::new(8, 15, 0));
+        assert_eq!(
+            parse_daily_clock(" 23:59:59 "),
+            ScheduleDailyTime::new(23, 59, 59)
+        );
+        for invalid in [
+            "",
+            "8:15",
+            "08:5",
+            "24:00",
+            "08:60",
+            "08:15:60",
+            "08:15:00:00",
+            "08:15Z",
+        ] {
+            assert_eq!(parse_daily_clock(invalid), None, "{invalid:?}");
+        }
+        assert_eq!(
+            parse_clock("24:00"),
+            Err("Enter a UTC time in HH:MM or HH:MM:SS format")
+        );
     }
 
     #[test]

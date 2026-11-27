@@ -33,7 +33,7 @@ use crate::keymap::{
     text_character, text_widget_input_allowed, ActionAvailability, ActionContext, ActionId,
     HelpEntry, KeyResolution, Keymap, PendingSequence,
 };
-use crate::schedule_form::ScheduleForm;
+use crate::schedule_form::{parse_daily_clock, ScheduleForm};
 use crate::search::ranked_indices;
 use crate::subagents::{SubagentTreeState, SubagentTreeStatus, MAX_SUBAGENT_TREE_SESSIONS};
 use crate::task_plan::{TaskPlanOverlayState, TaskPlanPane, TaskProgressState};
@@ -1942,16 +1942,79 @@ pub(crate) struct ScheduleRename {
     pub(crate) error: Option<String>,
 }
 
-struct PendingScheduleInterval {
+struct PendingScheduleCadence {
     generation: u64,
     schedule_id: String,
-    every_seconds: u64,
+    value: ScheduleCadenceValue,
 }
 
-pub(crate) struct ScheduleIntervalEdit {
+#[derive(Clone, Copy)]
+enum ScheduleCadenceKind {
+    Interval,
+    Daily,
+}
+
+#[derive(Clone, Copy)]
+enum ScheduleCadenceValue {
+    Interval(u64),
+    Daily(ScheduleDailyTime),
+}
+
+const INTERVAL_INPUT_ERROR: &str = "Enter a positive whole number of seconds";
+const INTERVAL_TOO_LARGE: &str = "Interval is too large";
+const DAILY_TIME_INPUT_ERROR: &str = "Enter a time in HH:MM or HH:MM:SS format";
+
+pub(crate) struct ScheduleCadenceEdit {
     schedule_id: String,
+    kind: ScheduleCadenceKind,
+    pub(crate) timezone: Option<String>,
     pub(crate) draft: String,
     pub(crate) error: Option<String>,
+}
+
+impl ScheduleCadenceEdit {
+    fn value(&self) -> Result<ScheduleCadenceValue, &'static str> {
+        match self.kind {
+            ScheduleCadenceKind::Interval if self.draft.bytes().all(|byte| byte == b'0') => {
+                Err(INTERVAL_INPUT_ERROR)
+            }
+            ScheduleCadenceKind::Interval => self
+                .draft
+                .parse::<u64>()
+                .ok()
+                .filter(|seconds| is_valid_schedule_interval(*seconds))
+                .map(ScheduleCadenceValue::Interval)
+                .ok_or(INTERVAL_TOO_LARGE),
+            ScheduleCadenceKind::Daily => parse_daily_clock(&self.draft)
+                .map(ScheduleCadenceValue::Daily)
+                .ok_or(DAILY_TIME_INPUT_ERROR),
+        }
+    }
+
+    fn push_character(&mut self, character: char) {
+        let (allowed, limit, invalid, overflow) = match self.kind {
+            ScheduleCadenceKind::Interval => (
+                character.is_ascii_digit(),
+                20,
+                INTERVAL_INPUT_ERROR,
+                INTERVAL_TOO_LARGE,
+            ),
+            ScheduleCadenceKind::Daily => (
+                character.is_ascii_digit() || character == ':',
+                8,
+                DAILY_TIME_INPUT_ERROR,
+                DAILY_TIME_INPUT_ERROR,
+            ),
+        };
+        if !allowed {
+            self.error = Some(invalid.into());
+        } else if self.draft.len() >= limit {
+            self.error = Some(overflow.into());
+        } else {
+            self.draft.push(character);
+            self.error = None;
+        }
+    }
 }
 
 struct PendingSchedulePrompt {
@@ -5210,9 +5273,9 @@ pub struct App {
     pub(crate) schedule_rename: Option<ScheduleRename>,
     pending_schedule_rename: Option<PendingScheduleRename>,
     schedule_rename_generation: u64,
-    pub(crate) schedule_interval: Option<ScheduleIntervalEdit>,
-    pending_schedule_interval: Option<PendingScheduleInterval>,
-    schedule_interval_generation: u64,
+    pub(crate) schedule_cadence: Option<ScheduleCadenceEdit>,
+    pending_schedule_cadence: Option<PendingScheduleCadence>,
+    schedule_cadence_generation: u64,
     pub(crate) schedule_prompt: Option<SchedulePromptEdit>,
     pending_schedule_prompt: Option<PendingSchedulePrompt>,
     schedule_prompt_generation: u64,
@@ -5475,9 +5538,9 @@ impl App {
             schedule_rename: None,
             pending_schedule_rename: None,
             schedule_rename_generation: 0,
-            schedule_interval: None,
-            pending_schedule_interval: None,
-            schedule_interval_generation: 0,
+            schedule_cadence: None,
+            pending_schedule_cadence: None,
+            schedule_cadence_generation: 0,
             schedule_prompt: None,
             pending_schedule_prompt: None,
             schedule_prompt_generation: 0,
@@ -5709,7 +5772,7 @@ impl App {
         self.fence_copy_picker = None;
         self.close_schedule_sessions();
         self.schedule_rename = None;
-        self.schedule_interval = None;
+        self.schedule_cadence = None;
         self.schedule_prompt = None;
         self.chat.pressed_block = None;
         self.chat.pressed_attachment_remove = None;
@@ -5735,7 +5798,7 @@ impl App {
         {
             self.chat.background_unread = 0;
             self.schedule_rename = None;
-            self.schedule_interval = None;
+            self.schedule_cadence = None;
             self.schedule_prompt = None;
             self.tab = Tab::Chat;
             self.status_message = "Session already active".to_string();
@@ -6897,12 +6960,12 @@ impl App {
             } => {
                 self.finish_schedule_rename(generation, schedule_id, result);
             }
-            AppEvent::ScheduleIntervalFinished {
+            AppEvent::ScheduleCadenceFinished {
                 generation,
                 schedule_id,
                 result,
             } => {
-                self.finish_schedule_interval(generation, schedule_id, result);
+                self.finish_schedule_cadence(generation, schedule_id, result);
             }
             AppEvent::SchedulePromptFinished {
                 generation,
@@ -9125,7 +9188,7 @@ impl App {
             || self.pending_schedule_delete.is_some()
             || self.schedule_form.is_some()
             || self.schedule_rename.is_some()
-            || self.schedule_interval.is_some()
+            || self.schedule_cadence.is_some()
             || self.schedule_prompt.is_some()
             || self.schedule_runs.is_some()
             || self.schedule_sessions.is_some()
@@ -9865,7 +9928,7 @@ impl App {
             || self.command_palette.is_some()
             || self.schedule_form.is_some()
             || self.schedule_rename.is_some()
-            || self.schedule_interval.is_some()
+            || self.schedule_cadence.is_some()
             || self.schedule_prompt.is_some()
             || self.schedule_runs.is_some()
             || self.schedule_sessions.is_some()
@@ -9940,7 +10003,7 @@ impl App {
             ActionContext::CommandPalette
         } else if self.schedule_rename.is_some() {
             ActionContext::ScheduleRename
-        } else if self.schedule_interval.is_some() {
+        } else if self.schedule_cadence.is_some() {
             ActionContext::ScheduleInterval
         } else if self.schedule_prompt.is_some() {
             ActionContext::SchedulePrompt
@@ -10043,8 +10106,8 @@ impl App {
             question.error = Some(message.clone());
         } else if let Some(rename) = self.schedule_rename.as_mut() {
             rename.error = Some(message.clone());
-        } else if let Some(interval) = self.schedule_interval.as_mut() {
-            interval.error = Some(message.clone());
+        } else if let Some(cadence) = self.schedule_cadence.as_mut() {
+            cadence.error = Some(message.clone());
         } else if let Some(editor) = self.schedule_prompt.as_mut() {
             editor.error = Some(message.clone());
         } else if let Some(form) = self.schedule_form.as_mut() {
@@ -10320,7 +10383,7 @@ impl App {
             ActionContext::ModelPicker => self.handle_model_picker_key(key).await?,
             ActionContext::CommandPalette => self.handle_command_palette_key(key),
             ActionContext::ScheduleRename => self.handle_schedule_rename_key(key),
-            ActionContext::ScheduleInterval => self.handle_schedule_interval_key(key),
+            ActionContext::ScheduleInterval => self.handle_schedule_cadence_key(key),
             ActionContext::SchedulePrompt => self.handle_schedule_prompt_key(key),
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
             ActionContext::ScheduleRuns => self.handle_schedule_runs_key(key),
@@ -15178,7 +15241,12 @@ impl App {
             Some(ActionId::OpenScheduleSessions) => self.open_schedule_sessions(),
             Some(ActionId::ToggleScheduleEnabled) => self.toggle_selected_schedule(),
             Some(ActionId::RenameSchedule) => self.open_schedule_rename(),
-            Some(ActionId::EditScheduleInterval) => self.open_schedule_interval(),
+            Some(ActionId::EditScheduleInterval) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::Interval)
+            }
+            Some(ActionId::EditScheduleDailyTime) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::Daily)
+            }
             Some(ActionId::EditSchedulePrompt) => self.open_schedule_prompt(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
@@ -15197,7 +15265,7 @@ impl App {
                 }
                 if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
                     if self.schedule_rename_pending_for(&schedule.id)
-                        || self.schedule_interval_pending_for(&schedule.id)
+                        || self.schedule_cadence_pending_for(&schedule.id)
                         || self.schedule_prompt_pending_for(&schedule.id)
                     {
                         self.notify(NoticeLevel::Warn, "Wait for the schedule update to finish");
@@ -15242,7 +15310,7 @@ impl App {
             return;
         };
         if self.schedule_rename_is_saving()
-            || self.schedule_interval_pending_for(&schedule.id)
+            || self.schedule_cadence_pending_for(&schedule.id)
             || self.schedule_prompt_pending_for(&schedule.id)
             || self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
             || self
@@ -15366,14 +15434,36 @@ impl App {
         }
     }
 
-    fn open_schedule_interval(&mut self) {
+    fn open_schedule_cadence(&mut self, kind: ScheduleCadenceKind) {
         let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) else {
             return;
         };
-        let Some(every_seconds) = schedule.interval_seconds else {
-            return;
+        let (draft, timezone) = match kind {
+            ScheduleCadenceKind::Interval => {
+                let Some(every_seconds) = schedule.interval_seconds else {
+                    return;
+                };
+                (every_seconds.to_string(), None)
+            }
+            ScheduleCadenceKind::Daily => {
+                let Some(ScheduleDailyTime {
+                    hour,
+                    minute,
+                    second,
+                }) = schedule.daily_time
+                else {
+                    return;
+                };
+                let draft = if second == 0 {
+                    format!("{hour:02}:{minute:02}")
+                } else {
+                    format!("{hour:02}:{minute:02}:{second:02}")
+                };
+                let timezone = schedule.timezone.as_deref().unwrap_or("UTC").to_owned();
+                (draft, Some(timezone))
+            }
         };
-        if self.schedule_interval_is_saving()
+        if self.schedule_cadence_is_saving()
             || self.schedule_rename_pending_for(&schedule.id)
             || self.schedule_prompt_pending_for(&schedule.id)
             || self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
@@ -15382,142 +15472,152 @@ impl App {
             self.notify(NoticeLevel::Warn, "Wait for the schedule update to finish");
             return;
         }
-        self.schedule_interval = Some(ScheduleIntervalEdit {
+        self.schedule_cadence = Some(ScheduleCadenceEdit {
             schedule_id: schedule.id.clone(),
-            draft: every_seconds.to_string(),
+            kind,
+            timezone,
+            draft,
             error: None,
         });
     }
 
-    pub(crate) fn schedule_interval_is_saving(&self) -> bool {
-        self.pending_schedule_interval.is_some()
+    pub(crate) fn schedule_cadence_is_saving(&self) -> bool {
+        self.pending_schedule_cadence.is_some()
     }
 
-    fn schedule_interval_pending_for(&self, schedule_id: &str) -> bool {
-        self.pending_schedule_interval
+    fn schedule_cadence_pending_for(&self, schedule_id: &str) -> bool {
+        self.pending_schedule_cadence
             .as_ref()
             .is_some_and(|edit| edit.schedule_id == schedule_id)
     }
 
-    fn handle_schedule_interval_key(&mut self, key: KeyEvent) {
-        const INPUT_ERROR: &str = "Enter a positive whole number of seconds";
-        const MAX_INTERVAL_DIGITS: usize = 20;
-
+    fn handle_schedule_cadence_key(&mut self, key: KeyEvent) {
+        // Share the existing cadence editor's input and remappable save keys.
         let action = self.resolve_context_action(ActionContext::ScheduleInterval, key);
-        if self.schedule_interval_is_saving() {
+        if self.schedule_cadence_is_saving() {
             return;
         }
-        let Some(edit) = self.schedule_interval.as_mut() else {
+        let Some(edit) = self.schedule_cadence.as_mut() else {
             return;
         };
         match action {
-            Some(ActionId::Cancel) => self.schedule_interval = None,
+            Some(ActionId::Cancel) => self.schedule_cadence = None,
             Some(ActionId::Backspace) => {
                 edit.draft.pop();
                 edit.error = None;
             }
             Some(ActionId::Activate) => {
-                if edit.draft.bytes().all(|byte| byte == b'0') {
-                    edit.error = Some(INPUT_ERROR.into());
-                    return;
-                }
-                let Some(every_seconds) = edit
-                    .draft
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|seconds| is_valid_schedule_interval(*seconds))
-                else {
-                    edit.error = Some("Interval is too large".into());
-                    return;
+                let value = match edit.value() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        edit.error = Some(error.into());
+                        return;
+                    }
                 };
                 let Some(tx) = self.event_tx.clone() else {
                     edit.error = Some("Host connection is unavailable".into());
                     return;
                 };
                 let schedule_id = edit.schedule_id.clone();
-                self.schedule_interval_generation =
-                    self.schedule_interval_generation.wrapping_add(1);
-                let generation = self.schedule_interval_generation;
-                self.pending_schedule_interval = Some(PendingScheduleInterval {
+                self.schedule_cadence_generation = self.schedule_cadence_generation.wrapping_add(1);
+                let generation = self.schedule_cadence_generation;
+                self.pending_schedule_cadence = Some(PendingScheduleCadence {
                     generation,
                     schedule_id: schedule_id.clone(),
-                    every_seconds,
+                    value,
                 });
                 edit.error = None;
 
                 let client = self.client.clone();
                 tokio::spawn(async move {
-                    let result = client
-                        .update_schedule_interval(&schedule_id, every_seconds)
-                        .await
-                        .map_err(|error| error.to_string());
-                    let _ = tx.send(AppEvent::ScheduleIntervalFinished {
+                    let result = match value {
+                        ScheduleCadenceValue::Interval(seconds) => {
+                            client.update_schedule_interval(&schedule_id, seconds).await
+                        }
+                        ScheduleCadenceValue::Daily(time) => {
+                            client.update_schedule_daily_time(&schedule_id, time).await
+                        }
+                    };
+                    let _ = tx.send(AppEvent::ScheduleCadenceFinished {
                         generation,
                         schedule_id,
-                        result,
+                        result: result.map_err(|error| error.to_string()),
                     });
                 });
             }
             None => {
-                if let Some(digit) = text_character(key) {
-                    if !digit.is_ascii_digit() {
-                        edit.error = Some(INPUT_ERROR.into());
-                    } else if edit.draft.len() < MAX_INTERVAL_DIGITS {
-                        edit.draft.push(digit);
-                        edit.error = None;
-                    } else {
-                        edit.error = Some("Interval is too large".into());
-                    }
+                if let Some(character) = text_character(key) {
+                    edit.push_character(character);
                 }
             }
             _ => {}
         }
     }
 
-    fn finish_schedule_interval(
+    fn finish_schedule_cadence(
         &mut self,
         generation: u64,
         schedule_id: String,
         result: Result<Schedule, String>,
     ) {
-        let Some(pending) = self.pending_schedule_interval.take_if(|pending| {
+        let Some(pending) = self.pending_schedule_cadence.take_if(|pending| {
             pending.generation == generation && pending.schedule_id == schedule_id
         }) else {
             return;
         };
+        let (invalid_response, saved_status) = match pending.value {
+            ScheduleCadenceValue::Interval(_) => (
+                "Invalid schedule interval response",
+                "Schedule interval saved",
+            ),
+            ScheduleCadenceValue::Daily(_) => {
+                ("Invalid Daily time response", "Daily schedule time saved")
+            }
+        };
+        let correct_value = |schedule: &Schedule| match pending.value {
+            ScheduleCadenceValue::Interval(seconds) => schedule.interval_seconds == Some(seconds),
+            ScheduleCadenceValue::Daily(time) => schedule.daily_time == Some(time),
+        };
         let result = result.and_then(|schedule| {
-            if schedule.id == schedule_id
-                && schedule.interval_seconds == Some(pending.every_seconds)
-            {
+            if schedule.id == schedule_id && correct_value(&schedule) {
                 Ok(schedule)
             } else {
-                Err("Invalid schedule interval response".into())
+                Err(invalid_response.into())
             }
         });
         match result {
             Ok(schedule) => {
-                if let Some(row) = self
-                    .schedules
-                    .schedules
-                    .iter_mut()
-                    .find(|row| row.id == schedule_id && row.interval_seconds.is_some())
-                {
-                    row.interval_seconds = schedule.interval_seconds;
+                if let Some(row) = self.schedules.schedules.iter_mut().find(|row| {
+                    row.id == schedule_id
+                        && match pending.value {
+                            ScheduleCadenceValue::Interval(_) => row.interval_seconds.is_some(),
+                            ScheduleCadenceValue::Daily(_) => row.daily_time.is_some(),
+                        }
+                }) {
+                    match pending.value {
+                        ScheduleCadenceValue::Interval(seconds) => {
+                            row.interval_seconds = Some(seconds);
+                        }
+                        ScheduleCadenceValue::Daily(time) => {
+                            row.daily_time = Some(time);
+                            row.timezone = schedule.timezone;
+                        }
+                    }
                     row.cadence_detail = schedule.cadence_detail;
                     row.next_run = schedule.next_run;
                 }
                 if self
-                    .schedule_interval
+                    .schedule_cadence
                     .take_if(|edit| edit.schedule_id == schedule_id)
                     .is_some()
                 {
-                    self.status_message = "Schedule interval saved".into();
+                    self.status_message = saved_status.into();
                 }
                 self.refresh_schedule_catalog_after_change();
             }
             Err(error) => {
                 if let Some(edit) = self
-                    .schedule_interval
+                    .schedule_cadence
                     .as_mut()
                     .filter(|edit| edit.schedule_id == schedule_id)
                 {
@@ -15540,7 +15640,7 @@ impl App {
         };
         if self.schedule_prompt_is_saving()
             || self.schedule_rename_pending_for(&schedule.id)
-            || self.schedule_interval_pending_for(&schedule.id)
+            || self.schedule_cadence_pending_for(&schedule.id)
             || self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
             || self.schedules.toggle_pending_for(&schedule.id)
         {
@@ -15692,7 +15792,7 @@ impl App {
         };
         if self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
             || self.schedule_rename_pending_for(&schedule.id)
-            || self.schedule_interval_pending_for(&schedule.id)
+            || self.schedule_cadence_pending_for(&schedule.id)
             || self.schedule_prompt_pending_for(&schedule.id)
         {
             return;
@@ -23605,9 +23705,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    2_178_642_964_832_313_249
+                    16_885_997_091_093_420_072
                 } else {
-                    3_386_411_761_011_315_760
+                    14_826_755_300_198_355_364
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -25495,6 +25595,190 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn schedule_daily_time_edits_the_selected_clock_and_preserves_a_refused_draft() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        const ORIGINAL: &str = r#"{
+            "id":"daily/review","name":"Daily review","enabled":false,"timezone":"Asia/Shanghai",
+            "trigger":{"type":"daily","hour":9,"minute":15},
+            "run_config":{"task_message":"Review the report"},
+            "state":{"next_fire_at":"2028-01-26T01:15:00Z"}
+        }"#;
+        const CONFIRMED: &str = r#"{
+            "id":"daily/review","name":"Unrelated name","enabled":true,"timezone":"Asia/Shanghai",
+            "trigger":{"type":"daily","hour":16,"minute":30,"second":45},
+            "run_config":{"task_message":"Unrelated prompt"},
+            "state":{"next_fire_at":"2028-01-26T08:30:45Z"}
+        }"#;
+        let time = ScheduleDailyTime {
+            hour: 16,
+            minute: 30,
+            second: 45,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (catalog_seen, old_catalog_started) = oneshot::channel();
+        let (seen, request_seen) = oneshot::channel();
+        let (allow, resume) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let read_patch = |request: &str| {
+                let (head, body) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    head.lines().next(),
+                    Some("PATCH /api/v1/schedules/daily%2Freview/daily-time HTTP/1.1")
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    serde_json::json!({"hour": 16, "minute": 30, "second": 45}),
+                );
+            };
+            let (mut old_catalog, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut old_catalog).await,
+                "/api/v1/schedules"
+            );
+            catalog_seen.send(()).unwrap();
+
+            let (mut older_host, _) = listener.accept().await.unwrap();
+            read_patch(&read_test_http_request(&mut older_host).await);
+            older_host
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            older_host.shutdown().await.unwrap();
+
+            let (mut patch, _) = listener.accept().await.unwrap();
+            read_patch(&read_test_http_request(&mut patch).await);
+            seen.send(()).unwrap();
+            resume.await.unwrap();
+            respond_test_http(&mut patch, "application/json", CONFIRMED).await;
+
+            let (mut catalog, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut catalog).await, "/api/v1/schedules");
+            respond_test_http(
+                &mut old_catalog,
+                "application/json",
+                &format!(r#"{{"schedules":[{ORIGINAL}]}}"#),
+            )
+            .await;
+            let mut updated: serde_json::Value = serde_json::from_str(ORIGINAL).unwrap();
+            let confirmed: serde_json::Value = serde_json::from_str(CONFIRMED).unwrap();
+            updated["trigger"] = confirmed["trigger"].clone();
+            updated["state"] = confirmed["state"].clone();
+            let catalog_body = serde_json::json!({"schedules": [updated, {
+                "id":"interval","name":"Interval","trigger":{"type":"interval","every_seconds":60}
+            }]})
+            .to_string();
+            respond_test_http(&mut catalog, "application/json", &catalog_body).await;
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx.clone());
+        app.tab = Tab::Schedules;
+        let original = Schedule::from_view(serde_json::from_str(ORIGINAL).unwrap());
+        let interval = Schedule::from_view(
+            serde_json::from_str(
+                r#"{"id":"interval","name":"Interval","trigger":{"type":"interval","every_seconds":60}}"#,
+            )
+            .unwrap(),
+        );
+        app.schedules.schedules = vec![original.clone(), interval];
+
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('c'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert!(!schedule_editor_preview(&app, "DAILY", "OTHER").contains("edit daily time"));
+        app.handle_key(key(KeyCode::Up)).await.unwrap();
+        assert!(schedule_editor_preview(&app, "DAILY", "READY").contains("c edit daily time"));
+        app.handle_key(key(KeyCode::Char('c'))).await.unwrap();
+        let opened = schedule_editor_preview(&app, "DAILY", "EDITING");
+        assert!(opened.contains("Edit daily time") && opened.contains("Time: 09:15"));
+        assert!(opened.contains("Time zone  Asia/Shanghai"));
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "25:00".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_cadence_is_saving());
+        assert_eq!(
+            app.schedule_cadence.as_ref().unwrap().error.as_deref(),
+            Some(DAILY_TIME_INPUT_ERROR)
+        );
+
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "16:30:45".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        let budget = Duration::from_secs(5);
+        app.load_schedule_catalog(app.client.clone(), tx);
+        tokio::time::timeout(budget, old_catalog_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let refused = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(refused).await.unwrap();
+        let edit = app.schedule_cadence.as_ref().unwrap();
+        assert_eq!(edit.draft, "16:30:45");
+        assert_eq!(
+            edit.error.as_deref(),
+            Some("Editing Daily time requires a newer Host")
+        );
+        assert_eq!(app.schedules.schedules[0].daily_time, original.daily_time);
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        tokio::time::timeout(budget, request_seen)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(schedule_editor_preview(&app, "DAILY", "PENDING").contains("Saving…"));
+        app.handle_event(AppEvent::ScheduleCadenceFinished {
+            generation: app.schedule_cadence_generation,
+            schedule_id: "interval".into(),
+            result: Err("Unrelated reply".into()),
+        })
+        .await
+        .unwrap();
+        assert!(app.schedule_cadence_is_saving());
+        allow.send(()).unwrap();
+        let saved = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(saved).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        let row = &app.schedules.schedules[0];
+        assert_eq!(row.daily_time, Some(time));
+        assert_eq!(row.timezone, original.timezone);
+        assert_eq!(row.name, original.name);
+        assert_eq!(row.enabled, Some(false));
+        assert_eq!(row.prompt, original.prompt);
+        assert_eq!(row.next_run, Some("2028-01-26T08:30:45Z".parse().unwrap()));
+        assert_eq!(app.schedules.schedules[1].interval_seconds, Some(60));
+        for _ in 0..2 {
+            let catalog = tokio::time::timeout(budget, rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_event(catalog).await.unwrap();
+            assert_eq!(app.schedules.schedules[0].daily_time, Some(time));
+            assert_eq!(app.schedules.schedules[1].interval_seconds, Some(60));
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn schedule_interval_updates_one_row_through_the_host_and_fences_catalogs() {
         use tokio::sync::oneshot;
 
@@ -25576,11 +25860,11 @@ mod question_tests {
         assert!(schedule_editor_preview(&app, "INTERVAL", "READY").contains("/ edit interval"));
         app.handle_key(key(KeyCode::Down)).await.unwrap();
         app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
-        assert!(app.schedule_interval.is_none());
+        assert!(app.schedule_cadence.is_none());
         assert!(!schedule_editor_preview(&app, "INTERVAL", "UNKNOWN").contains("edit interval"));
         app.handle_key(key(KeyCode::Up)).await.unwrap();
         app.handle_key(key(KeyCode::Char('i'))).await.unwrap();
-        assert!(app.schedule_interval.is_none());
+        assert!(app.schedule_cadence.is_none());
 
         app.load_schedule_catalog(client, tx);
         let budget = Duration::from_secs(5);
@@ -25607,20 +25891,20 @@ mod question_tests {
             .unwrap()
             .unwrap();
         app.handle_key(key(KeyCode::Enter)).await.unwrap();
-        app.handle_event(AppEvent::ScheduleIntervalFinished {
-            generation: app.schedule_interval_generation,
+        app.handle_event(AppEvent::ScheduleCadenceFinished {
+            generation: app.schedule_cadence_generation,
             schedule_id: "other".into(),
             result: Err("Stale acknowledgement".into()),
         })
         .await
         .unwrap();
-        assert!(app.schedule_interval_is_saving());
+        assert!(app.schedule_cadence_is_saving());
         assert_eq!(app.schedules.schedules[0].interval_seconds, Some(90));
         assert!(schedule_editor_preview(&app, "INTERVAL", "PENDING").contains("Saving…"));
 
         allow_edit.send(()).unwrap();
         app.handle_event(event(&mut rx).await).await.unwrap();
-        assert!(app.schedule_interval.is_none());
+        assert!(app.schedule_cadence.is_none());
         let assert_saved = |app: &App| {
             let selected = &app.schedules.schedules[app.schedules.selected];
             assert_eq!(selected.id, ID);
@@ -25710,13 +25994,13 @@ mod question_tests {
         }
         let invalid = schedule_editor_preview(&app, "INTERVAL", "INVALID");
         assert!(invalid.contains("Enter a positive whole number of seconds"));
-        assert!(!app.schedule_interval_is_saving());
+        assert!(!app.schedule_cadence_is_saving());
         app.handle_key(key(KeyCode::Backspace)).await.unwrap();
         for _ in 0..21 {
             app.handle_key(key(KeyCode::Char('9'))).await.unwrap();
         }
         app.handle_key(key(KeyCode::Enter)).await.unwrap();
-        let draft = app.schedule_interval.as_ref().unwrap();
+        let draft = app.schedule_cadence.as_ref().unwrap();
         assert_eq!(draft.draft.len(), 20);
         assert_eq!(draft.error.as_deref(), Some("Interval is too large"));
         for _ in 0..20 {
@@ -25735,17 +26019,17 @@ mod question_tests {
                 .unwrap()
                 .unwrap();
             app.handle_event(event).await.unwrap();
-            let edit = app.schedule_interval.as_ref().unwrap();
+            let edit = app.schedule_cadence.as_ref().unwrap();
             assert_eq!(edit.draft, "60");
             assert_eq!(edit.error.as_deref(), Some(error));
-            assert!(!app.schedule_interval_is_saving());
+            assert!(!app.schedule_cadence_is_saving());
             assert_eq!(app.schedules.schedules[0].interval_seconds, Some(15));
             let visible = schedule_editor_preview(&app, "INTERVAL", phase);
             assert!(visible.contains("Every (seconds): 60") && visible.contains(error));
             assert!(!visible.contains("internal details"));
         }
         app.handle_key(key(KeyCode::Esc)).await.unwrap();
-        assert!(app.schedule_interval.is_none());
+        assert!(app.schedule_cadence.is_none());
         assert_eq!(
             app.schedules.schedules[app.schedules.selected].id,
             "selected"
@@ -25762,11 +26046,11 @@ mod question_tests {
         .unwrap();
         app.schedules.schedules[0] = Schedule::from_view(view);
         app.handle_key(key(KeyCode::Char('i'))).await.unwrap();
-        assert!(app.schedule_interval.is_some());
-        app.pending_schedule_interval = Some(PendingScheduleInterval {
+        assert!(app.schedule_cadence.is_some());
+        app.pending_schedule_cadence = Some(PendingScheduleCadence {
             generation: 2,
             schedule_id: "schedule".into(),
-            every_seconds: 120,
+            value: ScheduleCadenceValue::Interval(120),
         });
 
         app.handle_event(AppEvent::SessionDeleted {
@@ -25777,25 +26061,25 @@ mod question_tests {
         .await
         .unwrap();
         assert_eq!(app.tab, Tab::Chat);
-        assert!(app.schedule_interval.is_none());
-        assert!(app.schedule_interval_is_saving());
+        assert!(app.schedule_cadence.is_none());
+        assert!(app.schedule_cadence_is_saving());
         let chat_status = app.status_message.clone();
         let mut confirmed = app.schedules.schedules[0].clone();
         confirmed.interval_seconds = Some(120);
         confirmed.cadence_detail = Some("Every 120 seconds".into());
         for generation in [1, 2] {
-            app.handle_event(AppEvent::ScheduleIntervalFinished {
+            app.handle_event(AppEvent::ScheduleCadenceFinished {
                 generation,
                 schedule_id: "schedule".into(),
                 result: Ok(confirmed.clone()),
             })
             .await
             .unwrap();
-            assert_eq!(app.schedule_interval_is_saving(), generation == 1);
+            assert_eq!(app.schedule_cadence_is_saving(), generation == 1);
         }
         assert_eq!(app.schedules.schedules[0].interval_seconds, Some(120));
         assert_eq!(app.status_message, chat_status);
-        assert!(app.schedule_interval.is_none());
+        assert!(app.schedule_cadence.is_none());
     }
 
     #[tokio::test]
@@ -26506,6 +26790,8 @@ mod question_tests {
                 cron: None,
                 cadence_detail: None,
                 interval_seconds: None,
+                daily_time: None,
+                timezone: None,
                 enabled: Some(true),
                 prompt: None,
                 last_run: None,
@@ -26598,6 +26884,8 @@ mod question_tests {
             cron: None,
             cadence_detail: None,
             interval_seconds: None,
+            daily_time: None,
+            timezone: None,
             enabled: Some(true),
             prompt: None,
             last_run: None,
@@ -27138,6 +27426,8 @@ mod question_tests {
             cron: Some("0 * * * *".to_string()),
             cadence_detail: None,
             interval_seconds: None,
+            daily_time: None,
+            timezone: None,
             enabled: Some(true),
             prompt: None,
             last_run: None,
