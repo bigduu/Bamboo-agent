@@ -1174,6 +1174,12 @@ impl Session {
         let state = self
             .model_context_state
             .get_or_insert_with(Default::default);
+        let preview_count = state.tool_output_previews.len();
+        state.tool_output_previews.retain(|id, preview| {
+            self.messages
+                .iter()
+                .any(|message| message.id == *id && !message.compressed && preview.matches(message))
+        });
         // Several repair steps can participate in one deliberate history
         // rewrite before another model request is dispatched. Coalesce those
         // steps into the already-pending boundary instead of advancing through
@@ -1185,7 +1191,9 @@ impl Session {
             && state.transcript_item_sha256.is_empty()
             && state.last_reset_reason.is_some();
         if reset_is_pending {
-            if state.last_reset_reason != Some(reason) {
+            if state.last_reset_reason != Some(reason)
+                || state.tool_output_previews.len() != preview_count
+            {
                 state.last_reset_reason = Some(reason);
                 state.advance_state_revision();
             }

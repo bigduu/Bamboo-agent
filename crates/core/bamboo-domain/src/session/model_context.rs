@@ -55,6 +55,10 @@ pub struct ModelContextState {
     /// prompt text here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transcript_item_sha256: Vec<String>,
+    /// Saved renderings of old tool results. The source message remains in the
+    /// canonical transcript and these renderings survive a prefix epoch reset.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_output_previews: BTreeMap<String, ToolOutputPreview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reset_reason: Option<ModelContextResetReason>,
 }
@@ -70,8 +74,28 @@ impl Default for ModelContextState {
             events: Vec::new(),
             cache_scope_sha256: None,
             transcript_item_sha256: Vec::new(),
+            tool_output_previews: BTreeMap::new(),
             last_reset_reason: None,
         }
+    }
+}
+
+pub const MAX_TOOL_OUTPUT_PREVIEWS: usize = 128;
+pub const MAX_TOOL_OUTPUT_PREVIEW_BYTES: usize = 2048;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputPreview {
+    pub source_sha256: String,
+    pub rendered_text: String,
+}
+
+impl ToolOutputPreview {
+    pub fn matches(&self, message: &Message) -> bool {
+        message.role == super::Role::Tool
+            && !message.never_compress
+            && !super::history::is_hidden_from_ui(message)
+            && message.content_parts.as_ref().is_none_or(Vec::is_empty)
+            && self.source_sha256 == sha256_hex(message.content.as_bytes())
     }
 }
 

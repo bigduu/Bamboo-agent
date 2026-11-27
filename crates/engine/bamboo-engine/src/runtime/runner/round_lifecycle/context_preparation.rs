@@ -49,6 +49,7 @@ use super::super::prompt_context::{
 
 mod logging;
 mod ocr_cache;
+pub(super) mod tool_output_pruning;
 mod transforms;
 
 const FORCE_CONTEXT_COMPRESSION_PERCENT: f64 = 98.0;
@@ -455,6 +456,7 @@ fn enforce_model_context_ledger_retention(
 
 fn refit_transformed_context(
     session: &Session,
+    config: &AgentLoopConfig,
     previous: PreparedContext,
     budget: &TokenBudget,
     counter: &dyn TokenCounter,
@@ -479,13 +481,13 @@ fn refit_transformed_context(
         .cloned()
         .collect();
 
-    let mut refitted = prepare_hybrid_context_with_fixed_tokens(
+    let mut refitted = fit_context(
         &refit_session,
+        config,
         budget,
         counter,
         additional_fixed_tokens,
-    )
-    .map_err(|error| AgentError::Budget(error.to_string()))?;
+    )?;
     refitted.truncation_occurred |= previous.truncation_occurred;
     refitted.segments_removed = refitted
         .segments_removed
@@ -504,6 +506,26 @@ fn refit_transformed_context(
     }
     refitted.compressed_message_ids = compressed_message_ids;
     Ok(refitted)
+}
+
+fn fit_context(
+    session: &Session,
+    config: &AgentLoopConfig,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+    fixed_tokens: u32,
+) -> Result<PreparedContext, AgentError> {
+    let result = if tool_output_pruning::enabled(session, config) {
+        bamboo_compression::preparation::prepare_hybrid_context_preserving_tool_outputs(
+            session,
+            budget,
+            counter,
+            fixed_tokens,
+        )
+    } else {
+        prepare_hybrid_context_with_fixed_tokens(session, budget, counter, fixed_tokens)
+    };
+    result.map_err(|error| AgentError::Budget(error.to_string()))
 }
 
 fn observe_compaction(
@@ -1003,6 +1025,8 @@ struct RetrievalWindowAccountingFrame {
 
 struct RetrievalWindowPreflight {
     active_tokens: u32,
+    ledger_rendered_bytes: usize,
+    history_slice_callable: bool,
 }
 
 enum RetrievalWindowPreparationOutcome {
@@ -1048,6 +1072,8 @@ async fn retrieval_window_preflight(
         active_tokens: projected
             .input_tokens
             .saturating_add(late_bound_tool_tokens),
+        ledger_rendered_bytes: projected.ledger_rendered_bytes,
+        history_slice_callable: projected.history_slice_callable,
     })
 }
 
@@ -1698,9 +1724,7 @@ async fn projected_summary_request_tokens(
         .metadata
         .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
     let ledger = enforce_model_context_ledger_retention(&mut staged, budget, counter);
-    let mut prepared =
-        prepare_hybrid_context_with_fixed_tokens(&staged, budget, counter, ledger.tokens)
-            .map_err(|error| AgentError::Budget(error.to_string()))?;
+    let mut prepared = fit_context(&staged, config, budget, counter, ledger.tokens)?;
     transforms::apply_message_transforms(config, &mut prepared, llm, session_id, model_name)
         .await?;
     let projected = super::stream_execution::project_request_usage(
@@ -1907,15 +1931,24 @@ async fn maybe_apply_summary_context_compression_with_budget(
         );
         return Ok(false);
     }
-    let active_tokens = exposure.active_tokens.max(preflight.active_tokens);
+    let pruning = tool_output_pruning::enabled(session, config) && preflight.history_slice_callable;
+    // A committed preview already saved tokens in this projection. Do not
+    // carry reported usage from the pre-prune prefix into a new summary trigger.
+    let active_tokens = if pruning {
+        preflight.active_tokens
+    } else {
+        exposure.active_tokens.max(preflight.active_tokens)
+    };
     let compression_window = budget.compression_window_tokens();
-    let usage_percent =
-        exposure
-            .active_usage_percent
-            .max(bamboo_compression::context_window_usage_percent(
-                preflight.active_tokens,
-                compression_window,
-            ));
+    let projected_usage_percent = bamboo_compression::context_window_usage_percent(
+        preflight.active_tokens,
+        compression_window,
+    );
+    let usage_percent = if pruning {
+        projected_usage_percent
+    } else {
+        exposure.active_usage_percent.max(projected_usage_percent)
+    };
     let auto_threshold =
         bamboo_compression::context_window_usage_percent(range.trigger_tokens, compression_window);
     let forced_requested = forced_trigger_type.is_some();
@@ -1976,6 +2009,26 @@ async fn maybe_apply_summary_context_compression_with_budget(
         "Resolved shared dynamic context compression range"
     );
 
+    if pruning
+        && !legacy_vision_images
+        && host_auto_requested
+        && !forced_requested
+        && !manual_requested
+        && Box::pin(tool_output_pruning::try_apply(
+            session,
+            config,
+            model_name,
+            tool_schemas,
+            llm,
+            budget,
+            &counter,
+            preflight.active_tokens,
+        ))
+        .await?
+    {
+        return Ok(false);
+    }
+
     // Cheap estimates cannot attest a paid legacy rewrite or provider-native
     // replay. Those paths use the complete staged projection below instead.
     let cheap_shortcuts = !legacy_vision_images && session.provider_transcript.groups().is_empty();
@@ -1991,6 +2044,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
     // prompt section degradation first. If a section can be stripped, skip the
     // expensive LLM summarization pass entirely.
     if !message_summary
+        && !pruning
         && cheap_shortcuts
         && host_auto_requested
         && !critical_fallback_requested
@@ -2038,6 +2092,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
     // Only skip the model when prompt-side compaction reaches the shared target.
     // Merely falling below the trigger would leave the context near capacity.
     if !message_summary
+        && !pruning
         && cheap_shortcuts
         && host_auto_requested
         && !critical_fallback_requested
@@ -3469,13 +3524,7 @@ pub(super) async fn prepare_round_context(
     let mut prepared_context = if let Some(prepared) = boundary_prepared {
         prepared
     } else {
-        let mut prepared = prepare_hybrid_context_with_fixed_tokens(
-            session,
-            &budget,
-            &counter,
-            ledger_usage.tokens,
-        )
-        .map_err(|error| AgentError::Budget(error.to_string()))?;
+        let mut prepared = fit_context(session, config, &budget, &counter, ledger_usage.tokens)?;
         transforms::apply_message_transforms(config, &mut prepared, llm, session_id, model_name)
             .await?;
         prepared
@@ -3581,6 +3630,7 @@ pub(super) async fn prepare_round_context(
         );
         prepared_context = refit_transformed_context(
             session,
+            config,
             prepared_context,
             &budget,
             &refit_counter,

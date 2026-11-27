@@ -1639,6 +1639,8 @@ impl Default for RetrievalWindowContextConfig {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ContextManagementConfig {
     pub strategy: ContextManagementStrategy,
+    /// Opt-in tool-result pruning before automatic summary compaction.
+    pub prune_old_tool_outputs: bool,
     /// Shared upper bound for proactive compression across every strategy.
     /// The effective token boundary can be earlier after output/safety reserves.
     pub trigger_usage_ratio: f64,
@@ -1651,6 +1653,7 @@ impl Default for ContextManagementConfig {
     fn default() -> Self {
         Self {
             strategy: ContextManagementStrategy::Summary,
+            prune_old_tool_outputs: false,
             trigger_usage_ratio: default_context_trigger_usage_ratio(),
             target_usage_ratio: default_context_target_usage_ratio(),
             retrieval_window: RetrievalWindowContextConfig::default(),
@@ -1733,6 +1736,7 @@ impl<'de> Deserialize<'de> for ContextManagementConfig {
         #[serde(default)]
         struct Wire {
             strategy: ContextManagementStrategy,
+            prune_old_tool_outputs: bool,
             trigger_usage_ratio: Option<f64>,
             target_usage_ratio: Option<f64>,
             retrieval_window: Option<RetrievalWindowContextConfig>,
@@ -1745,6 +1749,7 @@ impl<'de> Deserialize<'de> for ContextManagementConfig {
         // Explicit common fields take precedence on subsequent saves.
         let config = Self {
             strategy: wire.strategy,
+            prune_old_tool_outputs: wire.prune_old_tool_outputs,
             trigger_usage_ratio: wire.trigger_usage_ratio.unwrap_or_else(|| {
                 default_context_trigger_usage_ratio().min(retrieval_window.trigger_usage_ratio)
             }),
@@ -6088,6 +6093,7 @@ mod tests {
     #[test]
     fn context_management_defaults_to_summary_and_is_omitted() {
         let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!config.context_management.prune_old_tool_outputs);
         assert_eq!(
             config.context_management.strategy,
             ContextManagementStrategy::Summary
@@ -6105,6 +6111,22 @@ mod tests {
         );
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("context_management").is_none());
+    }
+
+    #[test]
+    fn context_management_tool_output_pruning_round_trips_as_opt_in() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "context_management": {"prune_old_tool_outputs": true}
+        }))
+        .unwrap();
+        assert_eq!(
+            config.context_management.strategy,
+            ContextManagementStrategy::Summary
+        );
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(saved["context_management"]["prune_old_tool_outputs"], true);
+        let reopened: Config = serde_json::from_value(saved).unwrap();
+        assert!(reopened.context_management.prune_old_tool_outputs);
     }
 
     #[test]

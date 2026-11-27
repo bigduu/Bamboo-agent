@@ -5,6 +5,7 @@ use bamboo_domain::session::provider_transcript::{
     ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor, ProviderTranscriptItem,
     ProviderTranscriptOrigin, ProviderTranscriptState,
 };
+use bamboo_domain::session::{MAX_TOOL_OUTPUT_PREVIEWS, MAX_TOOL_OUTPUT_PREVIEW_BYTES};
 use bamboo_domain::{
     deterministic_model_context_event_id, model_context_block_sha256, removed_model_context_sha256,
     render_model_context_removal, render_model_context_snapshot, sha256_hex, ActorActivationFence,
@@ -96,10 +97,16 @@ fn strict_leaf(raw: &str) -> std::result::Result<(), ActorTranscriptAppendError>
             "events",
             "cache_scope_sha256",
             "transcript_item_sha256",
+            "tool_output_previews",
             "last_reset_reason",
         ],
     )?;
     let fields = object(raw)?.0;
+    if let Some(previews) = fields.get("tool_output_previews") {
+        for preview in object(previews.get())?.0.values() {
+            strict_fields(preview.get(), &["source_sha256", "rendered_text"])?;
+        }
+    }
     if let Some(baselines) = fields.get("baselines") {
         for baseline in object(baselines.get())?.0.values() {
             strict_fields(baseline.get(), &["revision", "content_sha256"])?;
@@ -193,6 +200,12 @@ fn validate_state(id: &str, state: &ModelContextState) -> Result<()> {
         || state.next_sequence
             != u64::try_from(state.events.len()).map_err(|_| Error::Unsupported)?
         || state.transcript_item_sha256.iter().any(|s| !hex64(s))
+        || state.tool_output_previews.len() > MAX_TOOL_OUTPUT_PREVIEWS
+        || state.tool_output_previews.values().any(|preview| {
+            !hex64(&preview.source_sha256)
+                || preview.rendered_text.is_empty()
+                || preview.rendered_text.len() > MAX_TOOL_OUTPUT_PREVIEW_BYTES
+        })
     {
         return unsupported();
     }
@@ -371,6 +384,7 @@ fn validate_request(
     if next.prefix_epoch != old.prefix_epoch
         || next.cache_scope_sha256 != old.cache_scope_sha256
         || next.transcript_item_sha256 != old.transcript_item_sha256
+        || next.tool_output_previews != old.tool_output_previews
         || next.last_reset_reason != old.last_reset_reason
         || next.state_revision
             != old

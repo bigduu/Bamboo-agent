@@ -350,6 +350,8 @@ use bamboo_llm::{LLMChunk, LLMError};
 use futures::stream;
 use tokio::sync::mpsc;
 
+mod tool_output_pruning;
+
 fn isolate_prompt_safe_env_cache() -> MutexGuard<'static, ()> {
     let guard = crate::runtime::tests::env_cache_lock_acquire();
     let empty_data_dir = tempfile::tempdir().expect("temp dir for empty config");
@@ -741,6 +743,7 @@ fn retrieval_window_config(persistence: Arc<dyn RuntimeSessionPersistence>) -> A
             strategy: ContextManagementStrategy::RetrievalWindow,
             trigger_usage_ratio: 0.45,
             target_usage_ratio: 0.30,
+            prune_old_tool_outputs: false,
             retrieval_window: RetrievalWindowContextConfig {
                 min_recent_user_turns: 2,
                 trigger_usage_ratio: 0.45,
@@ -4036,6 +4039,7 @@ fn retrieval_window_capped_trigger_stays_above_capped_target() {
             strategy: ContextManagementStrategy::RetrievalWindow,
             trigger_usage_ratio: 0.95,
             target_usage_ratio: 0.90,
+            prune_old_tool_outputs: false,
             retrieval_window: RetrievalWindowContextConfig {
                 target_usage_ratio: 0.90,
                 trigger_usage_ratio: 0.95,

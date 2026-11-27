@@ -77,6 +77,33 @@ pub fn prepare_hybrid_context_with_fixed_tokens(
     counter: &dyn TokenCounter,
     additional_fixed_tokens: u32,
 ) -> Result<PreparedContext, BudgetError> {
+    prepare_hybrid_context_with_tool_policy(session, budget, counter, additional_fixed_tokens, true)
+}
+
+/// Fit the transcript without transiently rewriting tool results. The
+/// caller has selected any durable tool-output previews before this step.
+pub fn prepare_hybrid_context_preserving_tool_outputs(
+    session: &Session,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+    additional_fixed_tokens: u32,
+) -> Result<PreparedContext, BudgetError> {
+    prepare_hybrid_context_with_tool_policy(
+        session,
+        budget,
+        counter,
+        additional_fixed_tokens,
+        false,
+    )
+}
+
+fn prepare_hybrid_context_with_tool_policy(
+    session: &Session,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+    additional_fixed_tokens: u32,
+    transient_tool_compaction: bool,
+) -> Result<PreparedContext, BudgetError> {
     let segmenter = MessageSegmenter::new();
     let summary_message = session
         .conversation_summary
@@ -87,13 +114,25 @@ pub fn prepare_hybrid_context_with_fixed_tokens(
         .map(|message| counter.count_messages(std::slice::from_ref(message)))
         .unwrap_or(0);
     let active_messages = crate::compression_tooling::active_messages_for_budget(session);
-    let prompt_cache_result = maybe_compact_old_tool_outputs_for_prompt(
-        session,
-        active_messages,
-        budget,
-        counter,
-        summary_tokens.saturating_add(additional_fixed_tokens),
-    );
+    let fixed_tokens = summary_tokens.saturating_add(additional_fixed_tokens);
+    let prompt_cache_result = if transient_tool_compaction {
+        maybe_compact_old_tool_outputs_for_prompt(
+            session,
+            active_messages,
+            budget,
+            counter,
+            fixed_tokens,
+        )
+    } else {
+        PromptCacheCompactionResult {
+            total_tokens_after: counter
+                .count_messages(&active_messages)
+                .saturating_add(fixed_tokens),
+            messages: active_messages,
+            compacted_tool_outputs: 0,
+            tokens_saved: 0,
+        }
+    };
     let total_tokens_after_cache = prompt_cache_result.total_tokens_after;
     let active_messages = prompt_cache_result.messages;
 

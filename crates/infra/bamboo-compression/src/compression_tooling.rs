@@ -1649,6 +1649,15 @@ pub fn active_messages_for_budget(session: &Session) -> Vec<Message> {
         .cloned()
         .collect();
     crate::project_file_change_results(&mut messages);
+    if let Some(state) = &session.model_context_state {
+        for message in &mut messages {
+            if let Some(preview) = state.tool_output_previews.get(&message.id) {
+                if preview.matches(message) {
+                    message.content.clone_from(&preview.rendered_text);
+                }
+            }
+        }
+    }
     messages
 }
 
