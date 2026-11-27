@@ -1344,6 +1344,7 @@ impl BambooClient {
         let (route, invalid_code) = match kind {
             ScheduleClockKind::Daily => ("daily-time", "invalid_schedule_daily_time"),
             ScheduleClockKind::Weekly => ("weekly-time", "invalid_schedule_weekly_time"),
+            ScheduleClockKind::Monthly => ("monthly-time", "invalid_schedule_monthly_time"),
         };
 
         anyhow::ensure!(
@@ -2750,6 +2751,150 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn update_schedule_monthly_time_sends_only_clock_and_retains_reply_days() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Monthly review",
+            "enabled": false,
+            "trigger": {"type":"monthly","days":[31,2,1,31],"hour":8,"minute":15,"second":0},
+            "timezone": "Asia/Shanghai",
+            "state": {"next_fire_at":"2030-03-31T00:15:00Z"},
+            "run_config": {"task_message":"Review progress"},
+        });
+        let schedule =
+            schedule_clock_time_reply(ScheduleClockKind::Monthly, "200 OK", "", &body.to_string())
+                .await
+                .unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(
+            schedule.clock_time(ScheduleClockKind::Monthly),
+            ScheduleClockTime::new(8, 15, 0)
+        );
+        assert_eq!(schedule.clock_time(ScheduleClockKind::Daily), None);
+        assert_eq!(schedule.clock_time(ScheduleClockKind::Weekly), None);
+        assert_eq!(schedule.monthly_time.unwrap().days, [31, 2, 1, 31]);
+        assert_eq!(schedule.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(schedule.enabled, Some(false));
+        assert_eq!(
+            schedule.cadence_detail.as_deref(),
+            Some("Monthly 1–2, 31 at 08:15 Asia/Shanghai")
+        );
+        assert_eq!(
+            schedule.next_run.unwrap().to_rfc3339(),
+            "2030-03-31T00:15:00+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schedule_monthly_time_requires_an_exact_ordinary_monthly_receipt() {
+        let receipt = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "trigger": {"type":"monthly","days":[31],"hour":8,"minute":15,"second":0},
+            "state": {},
+            "run_config": {},
+        });
+        for (path, value) in [
+            ("/id", serde_json::json!("other-schedule")),
+            (
+                "/trigger",
+                serde_json::json!({"type":"daily","hour":8,"minute":15,"second":0}),
+            ),
+            ("/trigger/days", serde_json::json!([])),
+            ("/trigger/days", serde_json::json!([1, 32])),
+            ("/trigger/second", serde_json::json!(1)),
+            (
+                "/trigger",
+                serde_json::json!({"type":"monthly","days":[31],"hour":8,"minute":15}),
+            ),
+            (
+                "/run_config",
+                serde_json::json!({"workflow_target":{"workflow_id":"review"}}),
+            ),
+        ] {
+            let mut body = receipt.clone();
+            *body.pointer_mut(path).unwrap() = value;
+            assert_eq!(
+                schedule_clock_time_reply(
+                    ScheduleClockKind::Monthly,
+                    "200 OK",
+                    "",
+                    &body.to_string()
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                "Monthly time response does not match the request"
+            );
+        }
+        for field in ["state", "run_config"] {
+            let mut body = receipt.clone();
+            body.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                schedule_clock_time_reply(
+                    ScheduleClockKind::Monthly,
+                    "200 OK",
+                    "",
+                    &body.to_string()
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                "Invalid Monthly time response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_monthly_time_sanitizes_refusals_and_requires_a_supported_host() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                "invalid_schedule_monthly_time",
+                "Enter a Monthly time in HH:MM or HH:MM:SS format",
+            ),
+            (
+                "409 Conflict",
+                "schedule_trigger_changed",
+                "Schedule is no longer a Monthly schedule",
+            ),
+            (
+                "409 Conflict",
+                "schedule_no_future_occurrence",
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                "schedule_not_found",
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                "unknown_route",
+                "Editing Monthly time requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                "method_not_allowed",
+                "Editing Monthly time requires a newer Host",
+            ),
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}});
+            assert_eq!(
+                schedule_clock_time_reply(
+                    ScheduleClockKind::Monthly,
+                    status,
+                    "",
+                    &body.to_string()
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                expected
+            );
+        }
+    }
+
     async fn schedule_clock_time_reply(
         kind: ScheduleClockKind,
         status: &str,
@@ -2771,6 +2916,7 @@ mod tests {
                 Some(match kind {
                     ScheduleClockKind::Daily => "PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/daily-time HTTP/1.1",
                     ScheduleClockKind::Weekly => "PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/weekly-time HTTP/1.1",
+                    ScheduleClockKind::Monthly => "PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/monthly-time HTTP/1.1",
                 })
             );
             assert_eq!(

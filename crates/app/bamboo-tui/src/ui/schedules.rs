@@ -147,6 +147,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Some((ActionId::EditScheduleDailyTime, "edit daily time"))
             } else if schedule.weekly_time.is_some() {
                 Some((ActionId::EditScheduleWeeklyTime, "edit weekly time"))
+            } else if schedule.monthly_time.is_some() {
+                Some((ActionId::EditScheduleMonthlyTime, "edit monthly time"))
             } else {
                 None
             };
@@ -542,6 +544,7 @@ mod tests {
             interval_seconds: None,
             daily_time: None,
             weekly_time: None,
+            monthly_time: None,
             timezone: None,
         }
     }

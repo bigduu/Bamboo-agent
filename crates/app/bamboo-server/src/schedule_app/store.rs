@@ -372,6 +372,7 @@ pub(crate) enum SchedulePatchRejection {
 pub(crate) enum ScheduleClockKind {
     Daily,
     Weekly,
+    Monthly,
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -1365,6 +1366,16 @@ impl ScheduleStore {
             {
                 ScheduleTrigger::Weekly {
                     weekdays: weekdays.clone(),
+                    hour,
+                    minute,
+                    second,
+                }
+            }
+            (ScheduleTrigger::Monthly { days, .. }, ScheduleClockKind::Monthly)
+                if !days.is_empty() && days.iter().all(|day| (1..=31).contains(day)) =>
+            {
+                ScheduleTrigger::Monthly {
+                    days: days.clone(),
                     hour,
                     minute,
                     second,
