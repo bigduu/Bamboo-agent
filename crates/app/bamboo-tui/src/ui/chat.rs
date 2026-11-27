@@ -1772,12 +1772,11 @@ mod tests {
     }
 
     #[test]
-    fn testbackend_previews_mermaid_edge_labels_only_after_settling_and_when_they_fit() {
+    fn testbackend_previews_labeled_mermaid_chain_only_after_settling_and_when_it_fits() {
         const LABEL: &str = "需要复核 🧭";
         for (direction, connector) in [("TD", '↓'), ("LR", '→')] {
-            let body = format!(
-                "flowchart {direction}\r\nA(Collect) -->|{LABEL}| B[Review]\r\nB --> C(Done)\r\n"
-            );
+            let body =
+                format!("flowchart {direction}\r\nA(Collect)-->|{LABEL}|B[Review]-->C(Done);\r\n");
             let source = format!(
                 "Before the diagram.\r\n\r\n~~~mermaid\r\n{body}~~~\r\n\r\nAfter the diagram."
             );
@@ -1790,7 +1789,7 @@ mod tests {
             let fence = fence_rows(&streaming, "mermaid");
             assert!(fence[2]
                 .replace(' ', "")
-                .contains("A(Collect)-->|需要复核🧭|B[Review]"));
+                .contains("A(Collect)-->|需要复核🧭|B[Review]-->C(Done);"));
             assert!(!streaming.iter().any(|row| row.contains(connector)));
 
             let saved = assistant_transcript(&source);

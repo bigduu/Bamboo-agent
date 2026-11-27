@@ -22,8 +22,8 @@ impl Unavailable {
     }
 }
 
-/// Preview one path in its declared direction. The source picker can still
-/// access the original fence.
+/// Preview one path in its declared direction, including chains on a single
+/// line. The source picker can still access the original fence.
 pub(super) fn render(source: &str, width: usize) -> Result<Vec<Line<'static>>, Unavailable> {
     let (direction, nodes) = parse_path(source).ok_or(Unavailable::Unsupported)?;
     let border = Style::default().fg(colors::code_border());
@@ -230,19 +230,20 @@ fn parse_path(source: &str) -> Option<(Direction, Vec<PathStep<'_>>)> {
 
     let mut nodes = Vec::new();
     for statement in statements {
-        let (from, rest) = parse_node(statement)?;
-        let from = register(&mut nodes, from)?;
-        if rest.is_empty() {
-            continue;
+        let (first, mut rest) = parse_node(statement)?;
+        let mut from = register(&mut nodes, first)?;
+        while !rest.is_empty() {
+            let (label, after_link) = parse_link(rest)?;
+            let (target, after_node) = parse_node(after_link)?;
+            let to = register(&mut nodes, target)?;
+            if from == to || nodes[from].next.is_some() || nodes[to].incoming {
+                return None;
+            }
+            nodes[from].next = Some(Edge { target: to, label });
+            nodes[to].incoming = true;
+            from = to;
+            rest = after_node;
         }
-        let (label, rest) = parse_link(rest)?;
-        let (to, rest) = parse_node(rest)?;
-        let to = register(&mut nodes, to)?;
-        if !rest.is_empty() || from == to || nodes[from].next.is_some() || nodes[to].incoming {
-            return None;
-        }
-        nodes[from].next = Some(Edge { target: to, label });
-        nodes[to].incoming = true;
     }
 
     if nodes.len() < 2 {
@@ -417,7 +418,18 @@ mod tests {
             "A --> B\nA(Same)\nA[Same]",
             "A --> B\nA[Same]\nA(Same)",
             "A --> B\nA(different)\nA(conflicting)",
-            "A[Plan] --> B --> C",
+            "A --> B --> A",
+            "A --> B --> B",
+            "A --> B --> C\nB --> D",
+            "A --> B --> C\nD --> C",
+            "A --> B --> C\nA --> B",
+            "A --> B --> C\nD --> E",
+            "A --> B[Original] --> C\nB[Conflicting]",
+            "A --> B -->",
+            "A --> B -->\nC",
+            "A --> B --> C;;",
+            "A --> B; B --> C",
+            "A --> B --> C & D",
             "A[(Disk)] --> B",
             "A((Circle)) --> B",
             "A([Stadium]) --> B",
@@ -476,7 +488,8 @@ mod tests {
             "A -->|Different| B\nA -->|Branch| C",
             "A -->|First| B\nB -->|Back| A",
             "A -->|First| B\nA -->|Duplicate| B",
-            "A -->|Chained| B --> C",
+            "A --> B -->|Unclosed C",
+            "A --> B -- Label --> C",
         ] {
             assert_eq!(
                 render(&format!("flowchart LR\n{body}"), 120),
@@ -491,6 +504,23 @@ mod tests {
         "B[Check] -->\t| 审核 👩‍💻 | C(Review)\r\n",
         "A(Plan) -->|Go|B",
     );
+
+    #[test]
+    fn same_line_chains_match_separate_edges_in_both_directions() {
+        let compact = "B[Check];\r\nA(Plan)-->|Go|B[Check] -->\t| 审核 👩‍💻 |C(Review)-->D[Done];";
+        for (direction, width) in [("TD", 13), ("LR", 51)] {
+            let preview = |body, width| render(&format!("flowchart {direction}\r\n{body}"), width);
+            assert_eq!(
+                preview("A[Plan] --> B --> C", width).unwrap(),
+                preview("A[Plan] --> B\r\nB --> C", width).unwrap()
+            );
+            assert_eq!(
+                preview(compact, width).unwrap(),
+                preview(MIXED_EDGES, width).unwrap()
+            );
+            assert_eq!(preview(compact, width - 1), Err(Unavailable::TooWide));
+        }
+    }
 
     #[test]
     fn vertical_labels_follow_their_edges_and_fit_by_cells() {
@@ -541,9 +571,25 @@ mod tests {
             Err(Unavailable::Unsupported)
         );
 
-        let mut source = chain(2);
+        let compact = |nodes| {
+            let path = (0..nodes)
+                .map(|node| format!("N{node}"))
+                .collect::<Vec<_>>()
+                .join("-->");
+            format!("flowchart TD\n{path}")
+        };
+        assert_eq!(
+            render(&compact(MAX_NODES), 120).unwrap().len(),
+            MAX_NODES * 4 - 1
+        );
+        assert_eq!(
+            render(&compact(MAX_NODES + 1), 120),
+            Err(Unavailable::Unsupported)
+        );
+
+        let mut source = compact(3);
         source.push_str(&" ".repeat(MAX_SOURCE_BYTES - source.len()));
-        assert_eq!(render(&source, 120).unwrap().len(), 7);
+        assert_eq!(render(&source, 120).unwrap().len(), 11);
         source.push(' ');
         assert_eq!(render(&source, 120), Err(Unavailable::Unsupported));
     }
