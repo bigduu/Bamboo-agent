@@ -781,7 +781,7 @@ fn build_trimmed_history_reference(
         .filter(|message| {
             message.role == Role::User
                 && !bamboo_domain::is_system_resume_message(message)
-                && !bamboo_domain::is_hidden_from_ui(message)
+                && !bamboo_domain::session::history::is_hidden_from_ui(message)
                 && omitted_id_counts.get(message.id.as_str()) == Some(&1)
                 && !message.id.is_empty()
                 && message.id.len() <= 80

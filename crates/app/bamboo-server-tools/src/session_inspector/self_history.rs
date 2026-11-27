@@ -348,7 +348,7 @@ pub(super) async fn handle_read_slice(
     let projection =
         build_history_projection(&session, before_message_index, current_request_index);
     let Some((_, anchor)) = find_history_anchor(&projection, message_id).filter(|(_, anchor)| {
-        !bamboo_domain::is_hidden_from_ui(anchor.message)
+        !bamboo_domain::session::history::is_hidden_from_ui(anchor.message)
             && !bamboo_domain::is_system_resume_message(anchor.message)
     }) else {
         return Ok(history_result(json!({
