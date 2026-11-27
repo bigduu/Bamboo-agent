@@ -790,9 +790,13 @@ fn main_worktree_for_list(repo: &Path, common: &Path) -> Result<PathBuf, String>
     main_worktree_by(repo, common, Instant::now() + git_command_timeout())
 }
 
-/// Deadline-aware variant: called from `list_until`, so its probes must stay
-/// inside the inventory budget instead of restarting the clock per call.
-fn main_worktree_by(repo: &Path, common: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
+/// Verify a main checkout whose native Git list entry names its metadata.
+/// Inventory and merge state share this resolver and pass their scan deadline.
+pub(super) fn main_worktree_by(
+    repo: &Path,
+    common: &Path,
+    deadline_at: Instant,
+) -> Result<PathBuf, String> {
     let verify = |checkout: PathBuf| {
         if repository_by(&checkout, deadline_at)? == common
             && workspace_root_by(&checkout, deadline_at)? == checkout
