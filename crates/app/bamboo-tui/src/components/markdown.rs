@@ -43,7 +43,7 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
 /// Handles: backtick and tilde fences, inline `code`, **bold**, _italic_,
 /// links, image descriptions, ATX and single-line Setext headings, nested
 /// bullet and ordered lists, task lists, thematic breaks, quotes and tables.
-/// Completed top-level Mermaid fences can preview a short vertical path.
+/// Completed top-level Mermaid fences can preview a short vertical or horizontal path.
 pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     render_markdown_preview(text, width, false)
 }
@@ -1912,13 +1912,29 @@ mod tests {
     #[test]
     fn settled_unsupported_mermaid_adds_status_and_keeps_the_code_preview() {
         for source in [
-            "```mermaid\nflowchart LR\nA --> B\n```",
+            "```mermaid\nflowchart RL\nA --> B\n```",
             "~~~mermaid theme=neutral\nflowchart TD\nA --> B\n~~~",
         ] {
             let settled = render_markdown(source, 80);
             assert_eq!(text_of(&settled[0]), "Mermaid source · unsupported diagram");
             assert_eq!(settled[1..], render_streaming_markdown(source, 80));
         }
+    }
+
+    #[test]
+    fn horizontal_mermaid_picks_the_original_fence_source() {
+        let body = "flowchart LR\r\n\tA[计划 🧭] --> B[完成]\r\n";
+        let source = format!("~~~mermaid\r\n{body}~~~");
+        let lines = render_markdown(&source, 60);
+        assert_eq!(lines.len(), 3);
+        assert!(text_of(&lines[1]).contains("├──→┤"));
+        assert_eq!(
+            copyable_fences(&source).1,
+            [CopyableFence {
+                language: Some("mermaid"),
+                source: body,
+            }]
+        );
     }
 
     #[test]
