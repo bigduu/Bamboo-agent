@@ -1,4 +1,4 @@
-//! Instruction layer: loads instruction files (AGENTS.md, CLAUDE.md) from workspace.
+//! Instruction layer: loads AGENTS.md, CLAUDE.md, and AGENT.md from the workspace.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use bamboo_config::paths;
 pub const INSTRUCTION_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_INSTRUCTION_CONTEXT_START -->";
 pub const INSTRUCTION_CONTEXT_END_MARKER: &str = "<!-- BAMBOO_INSTRUCTION_CONTEXT_END -->";
 
-const INSTRUCTION_FILE_NAMES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+const INSTRUCTION_FILE_NAMES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", "AGENT.md"];
 const MAX_INSTRUCTION_BYTES_PER_FILE: usize = 32 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +192,20 @@ mod tests {
     }
 
     #[test]
+    fn build_instruction_prompt_context_collects_agent_md() {
+        let root = tempfile::tempdir().expect("temp dir");
+        std::fs::write(root.path().join("AGENT.md"), "singular workspace rule")
+            .expect("write AGENT.md");
+
+        let context = build_instruction_prompt_context(root.path().to_string_lossy().as_ref())
+            .expect("instruction context should exist");
+
+        assert!(context.starts_with(INSTRUCTION_CONTEXT_START_MARKER));
+        assert!(context.contains("## AGENT.md\nSource: AGENT.md\n\nsingular workspace rule"));
+        assert!(context.ends_with(INSTRUCTION_CONTEXT_END_MARKER));
+    }
+
+    #[test]
     fn build_instruction_prompt_context_returns_none_when_no_files_exist() {
         let root = tempfile::tempdir().expect("temp dir");
         assert!(build_instruction_prompt_context(root.path().to_string_lossy().as_ref()).is_none());
@@ -201,17 +215,29 @@ mod tests {
     fn instructions_are_root_to_leaf_and_stop_at_git_workspace_boundary() {
         let outer = tempfile::tempdir().expect("temp dir");
         std::fs::write(outer.path().join("AGENTS.md"), "outside").expect("outside");
+        std::fs::write(outer.path().join("AGENT.md"), "outside singular").expect("outside");
         let repo = outer.path().join("repo");
         let nested = repo.join("src/feature");
         std::fs::create_dir_all(repo.join(".git")).expect("git marker");
         std::fs::create_dir_all(&nested).expect("nested");
         std::fs::write(repo.join("AGENTS.md"), "root rule").expect("root");
+        std::fs::write(repo.join("CLAUDE.md"), "root claude").expect("claude");
+        std::fs::write(repo.join("AGENT.md"), "root singular").expect("singular");
         std::fs::write(repo.join("src/AGENTS.md"), "nested rule").expect("nested rule");
+        std::fs::write(nested.join("AGENT.md"), "leaf singular").expect("leaf singular");
 
         let files = collect_instruction_files(&nested);
         let contents: Vec<_> = files.iter().map(|file| file.content.as_str()).collect();
-        assert_eq!(contents, vec!["root rule", "nested rule"]);
-        assert!(files.iter().all(|file| !file.content.contains("outside")));
+        assert_eq!(
+            contents,
+            [
+                "root rule",
+                "root claude",
+                "root singular",
+                "nested rule",
+                "leaf singular",
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -223,6 +249,7 @@ mod tests {
         let outside = tempfile::NamedTempFile::new().expect("outside");
         std::fs::write(outside.path(), "outside policy").expect("write outside");
         symlink(outside.path(), root.path().join("AGENTS.md")).expect("symlink");
+        symlink(outside.path(), root.path().join("AGENT.md")).expect("symlink");
         assert!(collect_instruction_files(root.path()).is_empty());
     }
 
