@@ -831,7 +831,8 @@ pub struct Schedule {
     pub cron: Option<String>,
     pub cadence_detail: Option<String>,
     pub interval_seconds: Option<u64>,
-    pub daily_time: Option<ScheduleDailyTime>,
+    pub daily_time: Option<ScheduleClockTime>,
+    pub weekly_time: Option<ScheduleWeeklyTime>,
     pub timezone: Option<String>,
     pub enabled: Option<bool>,
     pub prompt: Option<String>,
@@ -851,19 +852,32 @@ impl Schedule {
                 None
             };
         let ordinary = v.run_config.workflow_target.is_none();
-        let daily_time =
-            if ordinary && v.trigger.get("type").and_then(|tag| tag.as_str()) == Some("daily") {
-                match ScheduleTriggerReq::deserialize(&v.trigger).ok() {
-                    Some(ScheduleTriggerReq::Daily {
-                        hour,
-                        minute,
-                        second,
-                    }) => ScheduleDailyTime::new(hour, minute, second),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+        let (daily_time, weekly_time) = if ordinary
+            && matches!(
+                v.trigger.get("type").and_then(|tag| tag.as_str()),
+                Some("daily" | "weekly")
+            ) {
+            match ScheduleTriggerReq::deserialize(&v.trigger).ok() {
+                Some(ScheduleTriggerReq::Daily {
+                    hour,
+                    minute,
+                    second,
+                }) => (ScheduleClockTime::new(hour, minute, second), None),
+                Some(ScheduleTriggerReq::Weekly {
+                    weekdays,
+                    hour,
+                    minute,
+                    second,
+                }) if !weekdays.is_empty() => (
+                    None,
+                    ScheduleClockTime::new(hour, minute, second)
+                        .map(|time| ScheduleWeeklyTime { time, weekdays }),
+                ),
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         let prompt = if ordinary {
             v.run_config.task_message
         } else {
@@ -874,6 +888,7 @@ impl Schedule {
             cadence_detail: Some(trigger_cadence(v.trigger, v.timezone.as_deref())),
             interval_seconds,
             daily_time,
+            weekly_time,
             timezone: v.timezone,
             name: Some(v.name),
             enabled: Some(v.enabled),
@@ -883,16 +898,38 @@ impl Schedule {
             id: v.id,
         }
     }
+
+    pub(crate) fn clock_time(&self, kind: ScheduleClockKind) -> Option<ScheduleClockTime> {
+        match kind {
+            ScheduleClockKind::Daily => self.daily_time,
+            ScheduleClockKind::Weekly => self.weekly_time.as_ref().map(|weekly| weekly.time),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScheduleClockKind {
+    Daily,
+    Weekly,
+}
+
+impl ScheduleClockKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Daily => "Daily",
+            Self::Weekly => "Weekly",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ScheduleDailyTime {
+pub struct ScheduleClockTime {
     pub hour: u8,
     pub minute: u8,
     pub second: u8,
 }
 
-impl ScheduleDailyTime {
+impl ScheduleClockTime {
     pub(crate) fn new(hour: u8, minute: u8, second: u8) -> Option<Self> {
         NaiveTime::from_hms_opt(hour.into(), minute.into(), second.into())?;
         Some(Self {
@@ -901,6 +938,12 @@ impl ScheduleDailyTime {
             second,
         })
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleWeeklyTime {
+    pub time: ScheduleClockTime,
+    pub weekdays: Vec<ScheduleWeekdayReq>,
 }
 
 pub(crate) fn is_valid_schedule_interval(every_seconds: u64) -> bool {
@@ -967,18 +1010,12 @@ fn known_trigger_cadence(trigger: ScheduleTriggerReq, timezone: Option<&str>) ->
             format!("Daily {} {}", cadence_time(hour, minute, second)?, zone())
         }
         ScheduleTriggerReq::Weekly {
-            mut weekdays,
+            weekdays,
             hour,
             minute,
             second,
         } if !weekdays.is_empty() => {
-            weekdays.sort_unstable();
-            weekdays.dedup();
-            let days = weekdays
-                .iter()
-                .map(ScheduleWeekdayReq::short_name)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let days = format_schedule_weekdays(&weekdays);
             format!(
                 "Weekly {days} at {} {}",
                 cadence_time(hour, minute, second)?,
@@ -1191,7 +1228,7 @@ pub enum ScheduleTriggerReq {
     },
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleWeekdayReq {
     Mon,
@@ -1204,7 +1241,7 @@ pub enum ScheduleWeekdayReq {
 }
 
 impl ScheduleWeekdayReq {
-    fn short_name(&self) -> &'static str {
+    pub(crate) fn short_name(&self) -> &'static str {
         match self {
             Self::Mon => "Mon",
             Self::Tue => "Tue",
@@ -1215,6 +1252,16 @@ impl ScheduleWeekdayReq {
             Self::Sun => "Sun",
         }
     }
+}
+
+pub(crate) fn format_schedule_weekdays(weekdays: &[ScheduleWeekdayReq]) -> String {
+    let mut days: Vec<_> = weekdays.iter().collect();
+    days.sort_unstable();
+    days.dedup();
+    days.into_iter()
+        .map(ScheduleWeekdayReq::short_name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -1426,14 +1473,14 @@ mod tests {
             Some("Asia/Shanghai"),
             serde_json::json!({}),
         );
-        assert_eq!(saved.daily_time, ScheduleDailyTime::new(8, 42, 31));
+        assert_eq!(saved.daily_time, ScheduleClockTime::new(8, 42, 31));
         assert_eq!(saved.timezone.as_deref(), Some("Asia/Shanghai"));
         let legacy = project(
             serde_json::json!({"type":"daily","hour":8,"minute":42}),
             None,
             serde_json::json!({}),
         );
-        assert_eq!(legacy.daily_time, ScheduleDailyTime::new(8, 42, 0));
+        assert_eq!(legacy.daily_time, ScheduleClockTime::new(8, 42, 0));
         assert_eq!(legacy.timezone, None);
         assert_eq!(legacy.cadence_detail.as_deref(), Some("Daily 08:42 UTC"));
 
@@ -1459,6 +1506,59 @@ mod tests {
             .daily_time,
             None
         );
+    }
+
+    #[test]
+    fn schedule_projection_exposes_only_valid_ordinary_weekly_clocks() {
+        let project = |trigger, run_config| {
+            let view = serde_json::from_value(serde_json::json!({
+                "id": "schedule-17",
+                "trigger": trigger,
+                "timezone": "Asia/Shanghai",
+                "run_config": run_config,
+            }))
+            .unwrap();
+            Schedule::from_view(view)
+        };
+        let trigger = serde_json::json!({
+            "type": "weekly", "weekdays": ["fri", "mon", "fri"], "hour": 8, "minute": 42
+        });
+        let saved = project(trigger.clone(), serde_json::json!({}));
+        assert_eq!(
+            saved.clock_time(ScheduleClockKind::Weekly),
+            ScheduleClockTime::new(8, 42, 0)
+        );
+        assert_eq!(saved.clock_time(ScheduleClockKind::Daily), None);
+        assert_eq!(saved.timezone.as_deref(), Some("Asia/Shanghai"));
+        let weekdays = saved.weekly_time.unwrap().weekdays;
+        assert_eq!(
+            weekdays,
+            [
+                ScheduleWeekdayReq::Fri,
+                ScheduleWeekdayReq::Mon,
+                ScheduleWeekdayReq::Fri,
+            ]
+        );
+        assert_eq!(format_schedule_weekdays(&weekdays), "Mon, Fri");
+        assert!(project(
+            trigger.clone(),
+            serde_json::json!({"workflow_target":{"workflow_id":"review"}}),
+        )
+        .weekly_time
+        .is_none());
+        for (field, invalid) in [
+            ("weekdays", serde_json::json!([])),
+            ("weekdays", serde_json::json!(["unknown"])),
+            ("hour", serde_json::json!(24)),
+            ("minute", serde_json::json!(60)),
+            ("second", serde_json::json!(null)),
+        ] {
+            let mut malformed = trigger.clone();
+            malformed[field] = invalid;
+            assert!(project(malformed, serde_json::json!({}))
+                .weekly_time
+                .is_none());
+        }
     }
 
     #[test]

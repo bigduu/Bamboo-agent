@@ -7,12 +7,12 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
-use crate::api::types::{PermissionDecisionKind, ReasoningEffort};
+use crate::api::types::{PermissionDecisionKind, ReasoningEffort, ScheduleClockKind};
 use crate::app::{
     ActiveQuestion, ActiveQuestionKind, ActivityKind, App, CommandPaletteEntry,
     CommandPaletteHitbox, CommandPaletteTrigger, ConnectionStatus, ModelPickerHitbox,
     ModelPickerHitboxKind, NoticeLevel, PermissionStage, QuestionOptionHitbox, RunPhase,
-    SessionActivityStatus, SessionPickerMode, Tab,
+    ScheduleCadenceEdit, ScheduleCadenceKind, SessionActivityStatus, SessionPickerMode, Tab,
 };
 use crate::keymap::{ActionContext, ActionId};
 use crate::schedule_form::ScheduleField;
@@ -2387,7 +2387,7 @@ pub(super) fn render_schedule_cadence(f: &mut Frame, app: &App) {
             f,
             app,
             ActionContext::ScheduleInterval,
-            cadence.timezone.as_deref(),
+            Some(cadence),
             &cadence.draft,
             cadence.error.as_deref(),
             app.schedule_cadence_is_saving(),
@@ -2443,15 +2443,20 @@ fn render_schedule_editor(
     f: &mut Frame,
     app: &App,
     context: ActionContext,
-    timezone: Option<&str>,
+    cadence: Option<&ScheduleCadenceEdit>,
     draft: &str,
     error: Option<&str>,
     saving: bool,
 ) {
-    let (title, label) = match (context, timezone) {
-        (ActionContext::ScheduleInterval, Some(_)) => (" Edit daily time ", "  Time: "),
-        (ActionContext::ScheduleInterval, None) => (" Edit interval ", "  Every (seconds): "),
-        _ => (" Rename schedule ", "  Name: "),
+    let (title, label) = match cadence.map(|edit| edit.kind) {
+        Some(ScheduleCadenceKind::Clock(ScheduleClockKind::Daily)) => {
+            (" Edit daily time ", "  Time: ")
+        }
+        Some(ScheduleCadenceKind::Clock(ScheduleClockKind::Weekly)) => {
+            (" Edit weekly time ", "  Time: ")
+        }
+        Some(ScheduleCadenceKind::Interval) => (" Edit interval ", "  Every (seconds): "),
+        None => (" Rename schedule ", "  Name: "),
     };
     let screen = f.area();
     let width = usize::from(centered_rect(90, 0, screen).width.saturating_sub(2));
@@ -2468,7 +2473,13 @@ fn render_schedule_editor(
             Style::default().fg(colors::brand()),
         ),
     ])];
-    if let Some(timezone) = timezone {
+    if let Some(weekdays) = cadence.and_then(|edit| edit.weekdays.as_deref()) {
+        lines.push(Line::styled(
+            clip_cells(&format!("  Weekdays  {weekdays}"), width),
+            muted,
+        ));
+    }
+    if let Some(timezone) = cadence.and_then(|edit| edit.timezone.as_deref()) {
         lines.push(Line::styled(
             clip_cells(&format!("  Time zone  {timezone}"), width),
             muted,
@@ -4229,9 +4240,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             if cfg!(target_os = "macos") {
-                [1_868_699_155_225_402_874, 4_165_422_283_641_237_300]
+                [13_512_617_242_485_126_738, 4_461_551_820_010_456_760]
             } else {
-                [2_647_920_646_281_492_704, 16_885_064_876_783_252_414]
+                [2_840_071_730_050_583_212, 1_397_032_988_677_360_470]
             },
             "complete help-overlay buffer golden changed"
         );

@@ -247,6 +247,7 @@ pub(crate) enum ActionId {
     RenameSchedule,
     EditScheduleInterval,
     EditScheduleDailyTime,
+    EditScheduleWeeklyTime,
     EditSchedulePrompt,
     SaveSchedulePrompt,
     OpenScheduleSessions,
@@ -1410,6 +1411,14 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [Schedules],
         [(Schedules, "c")]
+    ),
+    spec!(
+        EditScheduleWeeklyTime,
+        "Edit Weekly schedule time",
+        "Change the selected Weekly Task schedule's saved local clock time",
+        false,
+        [Schedules],
+        [(Schedules, "w")]
     ),
     spec!(
         EditSchedulePrompt,
