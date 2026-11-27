@@ -270,6 +270,127 @@ impl Fixture {
     pub fn plan(&self) -> TicketWorkerPlan {
         TicketWorkerPlan::from_runtime_receipt(self.service.clone(), &self.assignment).unwrap()
     }
+
+    pub fn freeze_question_before_unrelated_draft(
+        &self,
+        plan: TicketWorkerPlan,
+        call_id: &str,
+        args: &serde_json::Value,
+    ) -> impl WorkerLocalPlan {
+        let (_, before) = self.service.published().unwrap();
+        let assignment = &before.assignments[&self.assignment];
+        let list = TaskTool::task_list_from_work_args(
+            args,
+            &self.session.id,
+            self.session.task_list.as_ref(),
+        )
+        .unwrap();
+        let [step] = list.items.as_slice() else {
+            panic!("expected one blocked fixture step");
+        };
+        assert_eq!(step.status, TaskItemStatus::Blocked);
+        let packet = self
+            .service
+            .child_context_packet(&plan.authority, &self.assignment, 65536)
+            .unwrap();
+        let packet_hash =
+            bamboo_tickets::content_hash(&bamboo_tickets::canonical_bytes(&packet).unwrap());
+        let command = self
+            .service
+            .prepare_source_command(
+                &plan.authority,
+                &format!("worker-plan/{}/{call_id}", assignment.dispatch_key),
+                vec![
+                    Operation::ReplacePlan {
+                        assignment_id: self.assignment.clone(),
+                        expected_plan_revision: assignment.plan.plan_revision,
+                        steps: vec![LocalStep {
+                            id: step.id.clone(),
+                            parent: step.parent_id.clone(),
+                            title: step.description.clone(),
+                            completed: false,
+                            status: Some(StepStatus::Blocked),
+                        }],
+                    },
+                    Operation::Ask {
+                        work_id: self.work.clone(),
+                        temp_id: "question".into(),
+                        prompt: question_prompt(args).unwrap().unwrap(),
+                        action: None,
+                    },
+                    Operation::YieldForInput {
+                        assignment_id: self.assignment.clone(),
+                        request_id: "question".into(),
+                        packet_hash,
+                    },
+                ],
+                CommandSource::WorkerTask {
+                    arguments: args.clone(),
+                },
+            )
+            .unwrap();
+        let draft = self
+            .service
+            .prepare_command(
+                &self.supervisor,
+                "unrelated-draft",
+                vec![Operation::Create {
+                    temp_id: "unrelated".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: before.tickets[&self.work].contract.clone(),
+                    depends_on: BTreeSet::new(),
+                }],
+            )
+            .unwrap();
+        let receipt = self.service.execute(&self.supervisor, &draft).unwrap();
+        assert_eq!(receipt.committed_seq, command.expected_seq + 1);
+        FrozenQuestionPlan {
+            plan,
+            command,
+            call_id: call_id.into(),
+        }
+    }
+}
+
+// Pause the ordinary question command between preparation and execution by
+// injecting only the test port. TicketService still checks the frozen command.
+struct FrozenQuestionPlan {
+    plan: TicketWorkerPlan,
+    command: bamboo_tickets::Command,
+    call_id: String,
+}
+
+#[async_trait::async_trait]
+impl WorkerLocalPlan for FrozenQuestionPlan {
+    fn run_id(&self) -> &str {
+        self.plan.run_id()
+    }
+
+    fn bind_session(&self, session: &mut Session) -> Result<()> {
+        self.plan.bind_session(session)
+    }
+
+    async fn apply_task(
+        &self,
+        session: &mut Session,
+        call_id: &str,
+        args: &serde_json::Value,
+    ) -> Result<TaskList> {
+        self.plan.require_session_identity(session)?;
+        assert_eq!(call_id, self.call_id);
+        let Some(CommandSource::WorkerTask { arguments }) = &self.command.source else {
+            panic!("missing original question input");
+        };
+        assert_eq!(args, arguments);
+        let error = self
+            .plan
+            .service
+            .execute(&self.plan.authority, &self.command)
+            .expect_err("frozen question must not publish across the newer scope revision");
+        assert!(matches!(error, Error::RevisionConflict), "{error}");
+        Err(error)
+    }
 }
 
 #[tokio::test]

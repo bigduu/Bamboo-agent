@@ -9213,6 +9213,9 @@ fn extract_assignment(session: &Session) -> String {
 }
 
 #[cfg(test)]
+pub(crate) use self::tests::assert_ticket_question_history_checkpoint;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::SessionActivationRouter;
@@ -10917,6 +10920,139 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    pub(crate) async fn assert_ticket_question_history_checkpoint(
+        mut host: Session,
+        worker_messages: &[bamboo_agent_core::Message],
+        completions: &[AgentEvent],
+        fresh_call_id: &str,
+        committed_arguments: serde_json::Value,
+        question: bamboo_tickets::PendingRequest,
+    ) {
+        let prefix_len = host.messages.len();
+        let [stale_assistant, stale_tool, fresh_assistant, fresh_tool] =
+            &worker_messages[prefix_len..]
+        else {
+            panic!("expected exactly two Task pairs after the Host prefix");
+        };
+        assert_eq!(stale_tool.role, Role::Tool);
+        assert_eq!(fresh_tool.role, Role::Tool);
+        let [stale_complete, fresh_complete] = completions else {
+            panic!("expected exactly two actual ToolComplete events");
+        };
+        let committed = HashMap::from([(fresh_call_id.to_owned(), committed_arguments.clone())]);
+        let collect = |messages: &[bamboo_agent_core::Message]| {
+            let mut collector = LocalToolCollector::default();
+            for (assistant, completion, expected_success) in [
+                (stale_assistant, stale_complete, false),
+                (fresh_assistant, fresh_complete, true),
+            ] {
+                assert_eq!(assistant.role, Role::Assistant);
+                let [call] = assistant.tool_calls.as_deref().unwrap() else {
+                    panic!("expected one Task call per assistant message");
+                };
+                let AgentEvent::ToolComplete {
+                    tool_call_id,
+                    result,
+                } = completion
+                else {
+                    panic!("expected a ToolComplete event");
+                };
+                assert_eq!(tool_call_id, &call.id);
+                assert_eq!(result.success, expected_success);
+                assert_eq!(tool_call_id == fresh_call_id, expected_success);
+                assert_eq!(call.function.name, "Task");
+                let arguments: serde_json::Value =
+                    serde_json::from_str(&call.function.arguments).unwrap();
+                assert_eq!(arguments, committed_arguments);
+
+                // The result-handler fixture starts after tool admission.
+                let start = AgentEvent::ToolStart {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.function.name.clone(),
+                    arguments,
+                };
+                for event in [&start, completion] {
+                    let value = serde_json::to_value(event).unwrap();
+                    assert!(collector.ticket_event(&value, &committed).unwrap());
+                    assert!(collector.event(&value).unwrap());
+                }
+            }
+            collector.ticket_yield = Some((fresh_call_id.to_owned(), question.clone()));
+            let observation = bamboo_subagent::proto::LocalToolMessages::Complete {
+                version: 1,
+                messages: messages
+                    .iter()
+                    .map(|message| serde_json::to_value(message).unwrap())
+                    .collect(),
+            };
+            let value = serde_json::to_value(observation).unwrap();
+            assert!(collector.ticket_event(&value, &committed).unwrap());
+            assert!(!collector.event(&value).unwrap());
+            collector
+        };
+
+        let mut contradicted = worker_messages.to_vec();
+        let metadata = contradicted[prefix_len + 1]
+            .metadata
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        assert_eq!(
+            metadata.insert("success".into(), true.into()),
+            Some(false.into())
+        );
+        let tools = ["Task".to_owned()];
+        assert!(matches!(
+            collect(&contradicted).suffix(&host, &tools, false, Some("")),
+            Err(AgentError::LLM(message)) if message == "local_tool_history_unsupported"
+        ));
+
+        let run_id = host.agent_runtime_state.as_ref().unwrap().run_id.clone();
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let supervisor = Session::new(host.parent_session_id.as_deref().unwrap(), &host.model);
+        store.save_session(&supervisor).await.unwrap();
+        store.save_session(&host).await.unwrap();
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        ));
+        let locked = Arc::new(bamboo_storage::LockedSessionStore::new(store.clone()));
+        let binding = actor_binding(store, inbox, locked);
+        let _owner = binding
+            .router
+            .register_run(&host.id, &run_id)
+            .await
+            .unwrap();
+        commit_local_tool_history(
+            collect(worker_messages),
+            &mut host,
+            &binding,
+            &run_id,
+            (&tools, false),
+            LocalToolTerminal::Completed(Some("")),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let cold = bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+            .await
+            .unwrap()
+            .load_session(&host.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&cold.messages).unwrap(),
+            serde_json::to_value(worker_messages).unwrap(),
+            "the Host must append the complete pair of Task results exactly once"
+        );
     }
 
     #[test]
