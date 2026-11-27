@@ -24,7 +24,7 @@
 use super::merge_state::{MergeState, MergeVerdict};
 use serde::Deserialize;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Why the forge could not, or did not need to, answer.
 ///
@@ -187,15 +187,14 @@ pub fn credential_token() -> Option<String> {
 
 /// Resolve `origin` and confirm this build may query it, in one place so callers
 /// cannot accidentally query an unsupported forge with a GitHub token.
-pub fn github_remote(repo: &Path) -> Result<Remote, ForgeReason> {
-    support(&parse_remote(&remote_url(repo)?)).cloned()
+pub fn github_remote(repo: &Path, deadline: Instant) -> Result<Remote, ForgeReason> {
+    support(&parse_remote(&remote_url(repo, deadline)?)).cloned()
 }
 
 /// `gh auth token`, bounded. `gh` is optional: a missing, hung, unauthenticated or
 /// failing CLI is simply "no credential", never an error the caller must handle.
 fn gh_cli_token() -> Option<String> {
     use std::process::{Command, Stdio};
-    use std::time::Instant;
 
     let mut child = Command::new("gh")
         .args(["auth", "token"])
@@ -407,10 +406,8 @@ pub async fn query_github(
 
 /// Read `origin`'s URL with the same bounded, hook-free settings the rest of this
 /// module uses. A repository without `origin` is `no_remote`, not a failure.
-pub fn remote_url(repo: &Path) -> Result<String, ForgeReason> {
-    let output = super::git::git_command(repo)
-        .args(["remote", "get-url", "origin"])
-        .output()
+pub fn remote_url(repo: &Path, deadline: Instant) -> Result<String, ForgeReason> {
+    let output = super::git::command_by(repo, &["remote", "get-url", "origin"], deadline)
         .map_err(|_| ForgeReason::NoRemote)?;
     if !output.status.success() {
         return Err(ForgeReason::NoRemote);
