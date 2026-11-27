@@ -68,6 +68,7 @@ async fn eligible(state: &AppState, session: &Session) -> bool {
         || session
             .metadata
             .contains_key(bamboo_engine::ticket_runtime::TICKET_DISPATCH_KEY)
+        || bamboo_engine::runtime::counted_loop::reject_recovery(session).is_err()
         || !session
             .messages
             .iter()

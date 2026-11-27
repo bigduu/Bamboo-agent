@@ -1130,6 +1130,7 @@ mod execution_input_http {
             "waiting",
             "permission-handoff",
             "managed-work",
+            "counted-loop",
             "unresolved",
         ] {
             let id = format!("manual-interrupted-{case}");
@@ -1180,6 +1181,30 @@ mod execution_input_http {
                 session.metadata.insert(
                     TICKET_DISPATCH_KEY.into(),
                     serde_json::to_string(&dispatch).unwrap(),
+                );
+            }
+            if case == "counted-loop" {
+                use bamboo_engine::runtime::counted_loop::{
+                    LoopState, LoopStatus, LOOP_STATE_METADATA_KEY,
+                };
+                let generation = LoopState {
+                    schema_version: 1,
+                    generation: uuid::Uuid::from_u128(1).to_string(),
+                    revision: 1,
+                    objective_revision: 1,
+                    owner_execution_id: "previous-loop-run".into(),
+                    objective: "Repeated objective".into(),
+                    max_iterations: 3,
+                    max_total_rounds: 10,
+                    iterations_started: 1,
+                    iterations_completed: 0,
+                    rounds_started: 1,
+                    status: LoopStatus::Running,
+                    control: None,
+                };
+                session.metadata.insert(
+                    LOOP_STATE_METADATA_KEY.into(),
+                    serde_json::to_string(&generation).unwrap(),
                 );
             }
             if case == "unresolved" {
