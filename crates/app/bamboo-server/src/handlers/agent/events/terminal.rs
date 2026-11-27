@@ -558,10 +558,16 @@ pub(super) fn terminal_event_for_sources(
         return terminal_event_for_status(runner_status);
     }
 
-    match session
+    let runtime_status = session
         .and_then(|session| session.agent_runtime_state.as_ref())
-        .map(|runtime| runtime.status)
+        .map(|runtime| runtime.status);
+    if let Some(message) =
+        session.and_then(|session| saved_root_failure_message(session, runtime_status))
     {
+        return AgentEvent::Error { message };
+    }
+
+    match runtime_status {
         Some(AgentStatusState::Cancelled) => {
             terminal_event_for_status(Some(AgentStatus::Cancelled))
         }
@@ -572,6 +578,38 @@ pub(super) fn terminal_event_for_sources(
         },
         _ => terminal_event_for_status(None),
     }
+}
+
+fn saved_root_failure_message(
+    session: &Session,
+    runtime_status: Option<AgentStatusState>,
+) -> Option<String> {
+    if session.kind != SessionKind::Root || session.last_run_status().as_deref() != Some("error") {
+        return None;
+    }
+
+    let replay_saved_failure = match runtime_status {
+        Some(AgentStatusState::Failed) => true,
+        // Older sessions can retain a Running snapshot after saving a failed
+        // outcome. Require a reply after the latest User before trusting that
+        // outcome, so a trailing unmarked User can still await execution.
+        None | Some(AgentStatusState::Running) => session
+            .messages
+            .iter()
+            .rposition(|message| matches!(message.role, Role::User))
+            .is_some_and(|last_user| {
+                session.messages[last_user + 1..]
+                    .iter()
+                    .any(|message| matches!(message.role, Role::Assistant))
+            }),
+        _ => false,
+    };
+    if !replay_saved_failure {
+        return None;
+    }
+    session
+        .last_run_error()
+        .filter(|message| !message.trim().is_empty())
 }
 
 pub(super) fn session_prevents_terminal_event(
@@ -747,6 +785,62 @@ mod tests {
         session.add_message(Message::user("hello"));
         session.add_message(Message::assistant("done", None));
         assert!(!session_prevents_terminal_event(Some(&session), None));
+    }
+
+    #[test]
+    fn saved_root_failure_yields_to_success_cancellation_and_the_current_runner() {
+        let mut session = Session::new("saved-failure-precedence", "test-model");
+        session.add_message(Message::assistant("previous reply", None));
+        session.set_last_run_status("error");
+        session.set_last_run_error("older saved failure");
+        let mut runtime = AgentRuntimeState::new("run");
+        runtime.status = AgentStatusState::Completed;
+        session.agent_runtime_state = Some(runtime);
+        assert!(matches!(
+            terminal_event_for_sources(Some(&session), None),
+            AgentEvent::Complete { .. }
+        ));
+
+        session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Cancelled;
+        assert!(matches!(
+            terminal_event_for_sources(Some(&session), None),
+            AgentEvent::Cancelled { .. }
+        ));
+
+        session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Failed;
+        assert!(matches!(
+            terminal_event_for_sources(
+                Some(&session),
+                Some(AgentStatus::Error("current runner failure".into()))
+            ),
+            AgentEvent::Error { message } if message == "current runner failure"
+        ));
+    }
+
+    #[test]
+    fn stale_running_failure_does_not_replay_after_an_unmarked_new_user_turn() {
+        let mut session = Session::new("saved-failure-newer-user", "test-model");
+        session.add_message(Message::user("old request"));
+        session.add_message(Message::assistant("partial reply", None));
+        session.add_message(Message::user("new request"));
+        session.set_last_run_status("error");
+        session.set_last_run_error("older saved failure");
+        let mut runtime = AgentRuntimeState::new("run");
+        runtime.status = AgentStatusState::Running;
+        session.agent_runtime_state = Some(runtime);
+        assert!(session_prevents_terminal_event(Some(&session), None));
+
+        session.add_message(Message::system("workspace context"));
+        assert!(saved_root_failure_message(&session, Some(AgentStatusState::Running)).is_none());
+    }
+
+    #[test]
+    fn stale_running_failure_requires_a_user_turn() {
+        let mut session = Session::new("saved-failure-no-user", "test-model");
+        session.add_message(Message::assistant("imported reply", None));
+        session.set_last_run_status("error");
+        session.set_last_run_error("older saved failure");
+        assert!(saved_root_failure_message(&session, Some(AgentStatusState::Running)).is_none());
     }
 
     /// Regression: after answering a `conclusion_with_options` question the answer
