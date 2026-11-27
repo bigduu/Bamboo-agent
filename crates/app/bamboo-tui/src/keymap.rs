@@ -33,6 +33,7 @@ pub(crate) enum ActionContext {
     ScheduleForm,
     ScheduleRename,
     ScheduleInterval,
+    SchedulePrompt,
     ScheduleRuns,
     ScheduleSessions,
     FenceCopyPicker,
@@ -55,7 +56,7 @@ pub(crate) enum ActionContext {
 }
 
 impl ActionContext {
-    pub(crate) const ALL: [Self; 38] = [
+    pub(crate) const ALL: [Self; 39] = [
         Self::Chat,
         Self::ConversationBlock,
         Self::Global,
@@ -75,6 +76,7 @@ impl ActionContext {
         Self::ScheduleForm,
         Self::ScheduleRename,
         Self::ScheduleInterval,
+        Self::SchedulePrompt,
         Self::ScheduleRuns,
         Self::ScheduleSessions,
         Self::FenceCopyPicker,
@@ -117,6 +119,7 @@ impl ActionContext {
             Self::ScheduleForm => "Schedule form",
             Self::ScheduleRename => "Schedule rename",
             Self::ScheduleInterval => "Schedule interval",
+            Self::SchedulePrompt => "Schedule prompt",
             Self::ScheduleRuns => "Schedule runs",
             Self::ScheduleSessions => "Schedule Sessions",
             Self::FenceCopyPicker => "Code fence picker",
@@ -243,6 +246,8 @@ pub(crate) enum ActionId {
     NewSchedule,
     RenameSchedule,
     EditScheduleInterval,
+    EditSchedulePrompt,
+    SaveSchedulePrompt,
     OpenScheduleSessions,
     RunSchedule,
     ToggleScheduleEnabled,
@@ -877,6 +882,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             ScheduleForm,
             ScheduleRename,
             ScheduleInterval,
+            SchedulePrompt,
             ScheduleRuns,
             ScheduleSessions,
             FenceCopyPicker,
@@ -902,6 +908,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (ScheduleForm, "Esc"),
             (ScheduleRename, "Esc"),
             (ScheduleInterval, "Esc"),
+            (SchedulePrompt, "Esc"),
             (ScheduleRuns, "Esc"),
             (ScheduleSessions, "Esc"),
             (FenceCopyPicker, "Esc"),
@@ -1394,6 +1401,22 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [Schedules],
         [(Schedules, "i")]
+    ),
+    spec!(
+        EditSchedulePrompt,
+        "Edit task prompt",
+        "Edit the selected Task schedule's saved prompt",
+        false,
+        [Schedules],
+        [(Schedules, "p")]
+    ),
+    spec!(
+        SaveSchedulePrompt,
+        "Save task prompt",
+        "Save the task prompt editor buffer",
+        false,
+        [SchedulePrompt],
+        [(SchedulePrompt, "F2; Ctrl+S")]
     ),
     spec!(
         OpenScheduleSessions,

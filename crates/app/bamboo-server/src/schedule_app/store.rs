@@ -360,6 +360,10 @@ pub(crate) enum SchedulePatchRejection {
     InvalidInterval,
     #[error("schedule no longer uses an interval trigger")]
     TriggerChanged,
+    #[error("task message is required")]
+    InvalidPrompt,
+    #[error("schedule no longer has an editable task prompt")]
+    PromptChanged,
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -1303,6 +1307,53 @@ impl ScheduleStore {
         )?);
         candidate.updated_at = now;
 
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
+    }
+
+    pub(crate) async fn patch_task_prompt(
+        &self,
+        id: &str,
+        task_message: String,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        if task_message.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::InvalidPrompt,
+            ));
+        }
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        let Some(previous) = existing
+            .run_config
+            .task_message
+            .as_deref()
+            .filter(|prompt| {
+                !prompt.trim().is_empty() && existing.run_config.workflow_target.is_none()
+            })
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::PromptChanged,
+            ));
+        };
+        if previous == task_message {
+            return Ok(Some(existing.clone()));
+        }
+
+        let mut candidate = existing.clone();
+        candidate.run_config.task_message = Some(task_message);
+        candidate.updated_at = Utc::now();
         let mut next = index.clone();
         next.schedules.insert(id.to_owned(), candidate.clone());
         self.persist_updated_index(&mut next).await?;

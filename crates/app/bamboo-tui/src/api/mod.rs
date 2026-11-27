@@ -1332,6 +1332,88 @@ impl BambooClient {
         Ok(schedule)
     }
 
+    pub(crate) async fn set_schedule_prompt(
+        &self,
+        schedule_id: &str,
+        task_message: &str,
+    ) -> Result<String> {
+        use reqwest::StatusCode;
+
+        #[derive(serde::Deserialize)]
+        struct PromptReply {
+            id: String,
+            run_config: PromptRunConfig,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct PromptRunConfig {
+            task_message: String,
+        }
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        anyhow::ensure!(!task_message.trim().is_empty(), "Enter a task prompt");
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "prompt"]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not contact the Host to update the task prompt"))?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "task_message": task_message }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update the task prompt")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update the task prompt")
+                }
+            })?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let code = match status {
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                    schedule_response_code(response).await
+                }
+                _ => None,
+            };
+            let message = match (status, code.as_deref()) {
+                (StatusCode::BAD_REQUEST, Some("invalid_schedule_prompt")) => "Enter a task prompt",
+                (StatusCode::CONFLICT, Some("schedule_prompt_changed")) => {
+                    "Schedule task prompt can no longer be edited"
+                }
+                (StatusCode::NOT_FOUND, Some("schedule_not_found")) => "Schedule no longer exists",
+                (StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED, _) => {
+                    "Editing the task prompt requires a newer Host"
+                }
+                _ => anyhow::bail!("Could not update task prompt (HTTP {})", status.as_u16()),
+            };
+            anyhow::bail!("{message}");
+        }
+
+        let reply: PromptReply = response.json().await.map_err(|error| {
+            if error.is_timeout() {
+                anyhow::anyhow!("Timed out waiting for the task prompt response")
+            } else {
+                anyhow::anyhow!("Invalid schedule task prompt response")
+            }
+        })?;
+        anyhow::ensure!(
+            reply.id == schedule_id && reply.run_config.task_message == task_message,
+            "Schedule task prompt response does not match the request"
+        );
+        Ok(reply.run_config.task_message)
+    }
+
     pub async fn list_schedule_sessions(&self, schedule_id: &str) -> Result<Vec<SessionSummary>> {
         anyhow::ensure!(
             !matches!(schedule_id, "" | "." | ".."),
@@ -2426,6 +2508,179 @@ mod tests {
         let (result, ()) = timeout(Duration::from_secs(5), async {
             tokio::join!(
                 client.update_schedule_interval(TOGGLE_SCHEDULE_ID, 120),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    const SCHEDULE_TASK_PROMPT: &str =
+        "  Review the weekly report 🧪\r\n\n  Follow up in 中文.  \n";
+
+    #[tokio::test]
+    async fn set_schedule_prompt_sends_only_the_exact_multiline_task_and_accepts_the_echo() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Weekly review",
+            "enabled": false,
+            "trigger": {"type":"interval","every_seconds":60},
+            "state": {"next_fire_at":null},
+            "run_config": {
+                "task_message": SCHEDULE_TASK_PROMPT,
+                "system_prompt": "Keep the report concise"
+            }
+        });
+        assert_eq!(
+            schedule_prompt_reply("200 OK", "", &body.to_string())
+                .await
+                .unwrap(),
+            SCHEDULE_TASK_PROMPT
+        );
+    }
+
+    #[tokio::test]
+    async fn set_schedule_prompt_rejects_wrong_identity_and_missing_or_changed_task() {
+        for (body, expected) in [
+            (
+                serde_json::json!({"id":"another-schedule","run_config":{"task_message":SCHEDULE_TASK_PROMPT}}),
+                "Schedule task prompt response does not match the request",
+            ),
+            (
+                serde_json::json!({"id":TOGGLE_SCHEDULE_ID,"run_config":{"task_message":SCHEDULE_TASK_PROMPT.trim()}}),
+                "Schedule task prompt response does not match the request",
+            ),
+            (
+                serde_json::json!({"schedule_id":TOGGLE_SCHEDULE_ID,"run_config":{"task_message":SCHEDULE_TASK_PROMPT}}),
+                "Invalid schedule task prompt response",
+            ),
+            (
+                serde_json::json!({"id":TOGGLE_SCHEDULE_ID,"task_message":SCHEDULE_TASK_PROMPT}),
+                "Invalid schedule task prompt response",
+            ),
+            (
+                serde_json::json!({"id":TOGGLE_SCHEDULE_ID,"run_config":{"task_message":null}}),
+                "Invalid schedule task prompt response",
+            ),
+        ] {
+            assert_eq!(
+                schedule_prompt_reply("200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert_eq!(
+            BambooClient::new("unused")
+                .set_schedule_prompt("schedule-17", " \r\n\t")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Enter a task prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_schedule_prompt_reports_known_refusals_without_fallback_or_response_details() {
+        for (status, extra, code, expected) in [
+            (
+                "400 Bad Request",
+                "",
+                Some("invalid_schedule_prompt"),
+                "Enter a task prompt",
+            ),
+            (
+                "409 Conflict",
+                "",
+                Some("schedule_prompt_changed"),
+                "Schedule task prompt can no longer be edited",
+            ),
+            (
+                "404 Not Found",
+                "",
+                Some("schedule_not_found"),
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                "",
+                None,
+                "Editing the task prompt requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                "",
+                None,
+                "Editing the task prompt requires a newer Host",
+            ),
+            (
+                "503 Service Unavailable",
+                "",
+                Some("schedule_not_found"),
+                "Could not update task prompt (HTTP 503)",
+            ),
+            (
+                "307 Temporary Redirect",
+                "Location: /gateway/api/v1/schedules/schedule-17\r\n",
+                None,
+                "Could not update task prompt (HTTP 307)",
+            ),
+        ] {
+            let body = code.map_or_else(
+                || "RAW_DETAILS".to_owned(),
+                |code| {
+                    serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}}).to_string()
+                },
+            );
+            assert_eq!(
+                schedule_prompt_reply(status, extra, &body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    async fn schedule_prompt_reply(status: &str, extra: &str, body: &str) -> Result<String> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/prompt HTTP/1.1")
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({"task_message": SCHEDULE_TASK_PROMPT})
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            if matches!(
+                status,
+                "404 Not Found" | "405 Method Not Allowed" | "307 Temporary Redirect"
+            ) {
+                assert!(timeout(Duration::from_millis(120), listener.accept())
+                    .await
+                    .is_err());
+            }
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.set_schedule_prompt(TOGGLE_SCHEDULE_ID, SCHEDULE_TASK_PROMPT),
                 serve
             )
         })

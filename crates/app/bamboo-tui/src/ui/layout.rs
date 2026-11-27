@@ -2393,6 +2393,50 @@ pub(super) fn render_schedule_interval(f: &mut Frame, app: &App) {
     }
 }
 
+pub(super) fn render_schedule_prompt(f: &mut Frame, app: &App) {
+    let Some(editor) = &app.schedule_prompt else {
+        return;
+    };
+    let screen = f.area();
+    let area = centered_rect(90, screen.height.min(12), screen);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::brand()))
+        .title(" Edit task prompt ");
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(u16::from(editor.error.is_some())),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    f.render_widget(&editor.textarea, chunks[0]);
+    if let Some(error) = &editor.error {
+        f.render_widget(
+            Paragraph::new(clip_cells(error, usize::from(chunks[1].width)))
+                .style(Style::default().fg(colors::error())),
+            chunks[1],
+        );
+    }
+    let footer = if app.schedule_prompt_is_saving() {
+        " Saving…".into()
+    } else {
+        let hint = |action| app.primary_key_hint(ActionContext::SchedulePrompt, action);
+        format!(
+            " {} save · {} cancel",
+            hint(ActionId::SaveSchedulePrompt),
+            hint(ActionId::Cancel)
+        )
+    };
+    f.render_widget(
+        Paragraph::new(clip_cells(&footer, usize::from(chunks[2].width)))
+            .style(Style::default().fg(colors::inactive())),
+        chunks[2],
+    );
+}
+
 fn render_schedule_editor(
     f: &mut Frame,
     app: &App,
@@ -4175,9 +4219,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             if cfg!(target_os = "macos") {
-                [10_155_465_262_818_596_818, 1_561_752_803_135_469_316]
+                [5_758_516_726_624_600_194, 4_315_808_556_407_004_248]
             } else {
-                [8_527_637_959_075_279_648, 2_868_803_754_581_337_670]
+                [1_475_273_007_039_437_660, 7_645_557_427_789_226_886]
             },
             "complete help-overlay buffer golden changed"
         );

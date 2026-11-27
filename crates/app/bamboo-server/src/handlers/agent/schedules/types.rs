@@ -113,6 +113,13 @@ pub enum SetScheduleIntervalRequest {
     Period { every_seconds: u64 },
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum SetSchedulePromptRequest {
+    // This struct variant requires named JSON fields.
+    Prompt { task_message: String },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduleRunRecordView {
     pub run_id: String,
