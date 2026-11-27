@@ -361,30 +361,40 @@ fn compute_monthly_next(
     ))
 }
 
+pub(super) fn interval_duration(every_seconds: u64) -> Option<Duration> {
+    let seconds = i64::try_from(every_seconds).ok()?;
+    if seconds == 0 {
+        return None;
+    }
+    Duration::try_seconds(seconds)
+}
+
 fn compute_interval_next(
     every_seconds: u64,
     anchor_at: Option<DateTime<Utc>>,
     after: DateTime<Utc>,
 ) -> Result<Option<DateTime<Utc>>, TriggerComputationError> {
-    if every_seconds == 0 {
-        return Err(TriggerComputationError::InvalidTrigger(
-            "interval.every_seconds must be > 0".to_string(),
-        ));
-    }
-
-    let duration = Duration::seconds(every_seconds as i64);
+    let duration = interval_duration(every_seconds).ok_or_else(|| {
+        TriggerComputationError::InvalidTrigger(
+            "interval.every_seconds must be a positive representable duration".to_string(),
+        )
+    })?;
     let next = match anchor_at {
-        Some(anchor) if anchor > after => anchor,
+        Some(anchor) if anchor > after => Some(anchor),
         Some(anchor) => {
             let elapsed = after.signed_duration_since(anchor).num_seconds();
-            let step = every_seconds as i64;
-            let intervals_elapsed = elapsed.div_euclid(step) + 1;
-            anchor + Duration::seconds(intervals_elapsed * step)
+            let step = duration.num_seconds();
+            elapsed
+                .div_euclid(step)
+                .checked_add(1)
+                .and_then(|intervals| intervals.checked_mul(step))
+                .and_then(Duration::try_seconds)
+                .and_then(|offset| anchor.checked_add_signed(offset))
         }
-        None => after + duration,
+        None => after.checked_add_signed(duration),
     };
 
-    Ok(Some(next))
+    Ok(next)
 }
 
 fn apply_window(
@@ -486,6 +496,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(next, Some(anchor + Duration::seconds(120)));
+    }
+
+    #[test]
+    fn interval_next_rejects_an_invalid_period_and_reports_date_range_exhaustion() {
+        let after = DateTime::<Utc>::MAX_UTC - Duration::seconds(1);
+        for anchor_at in [None, Some(after - Duration::seconds(4))] {
+            assert_eq!(
+                compute_interval_next(1, anchor_at, after).unwrap(),
+                Some(DateTime::<Utc>::MAX_UTC)
+            );
+            assert_eq!(compute_interval_next(2, anchor_at, after).unwrap(), None);
+        }
+        let future_anchor = Some(DateTime::<Utc>::MAX_UTC);
+        for invalid in [0, u64::MAX, i64::MAX as u64] {
+            assert!(matches!(
+                compute_interval_next(invalid, future_anchor, after),
+                Err(TriggerComputationError::InvalidTrigger(_))
+            ));
+        }
     }
 
     #[test]

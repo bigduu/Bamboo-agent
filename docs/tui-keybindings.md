@@ -114,6 +114,9 @@ Action and context IDs are stable kebab-case strings:
   `confirm` and `reject`
 - `sessions`, `mcp`, `schedules`, `schedule-form`, `skills`, `config`,
   `config-editor`: the actions shown in the corresponding F1 group
+- `schedules`: `edit-schedule-interval` defaults to `i` on a saved Interval
+  schedule. In `schedule-interval`, `activate` saves, `backspace` edits the
+  period, and `cancel` closes the editor.
 - `session-picker-browse`, `session-picker-rename`,
   `session-picker-pinning`, `model-picker`, `command-palette`, `terminal-settings`: the actions
   shown in each picker group

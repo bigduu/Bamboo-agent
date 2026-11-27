@@ -106,6 +106,13 @@ pub enum RenameScheduleRequest {
     Title { name: String },
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum SetScheduleIntervalRequest {
+    // This struct variant requires named JSON fields.
+    Period { every_seconds: u64 },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduleRunRecordView {
     pub run_id: String,

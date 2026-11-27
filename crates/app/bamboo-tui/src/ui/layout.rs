@@ -2368,20 +2368,53 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
 }
 
 pub(super) fn render_schedule_rename(f: &mut Frame, app: &App) {
-    let Some(rename) = &app.schedule_rename else {
-        return;
+    if let Some(rename) = &app.schedule_rename {
+        render_schedule_editor(
+            f,
+            app,
+            ActionContext::ScheduleRename,
+            &rename.draft,
+            rename.error.as_deref(),
+            app.schedule_rename_is_saving(),
+        );
+    }
+}
+
+pub(super) fn render_schedule_interval(f: &mut Frame, app: &App) {
+    if let Some(interval) = &app.schedule_interval {
+        render_schedule_editor(
+            f,
+            app,
+            ActionContext::ScheduleInterval,
+            &interval.draft,
+            interval.error.as_deref(),
+            app.schedule_interval_is_saving(),
+        );
+    }
+}
+
+fn render_schedule_editor(
+    f: &mut Frame,
+    app: &App,
+    context: ActionContext,
+    draft: &str,
+    error: Option<&str>,
+    saving: bool,
+) {
+    let (title, label) = match context {
+        ActionContext::ScheduleInterval => (" Edit interval ", "  Every (seconds): "),
+        _ => (" Rename schedule ", "  Name: "),
     };
     let screen = f.area();
     let width = usize::from(centered_rect(90, 0, screen).width.saturating_sub(2));
-    let saving = app.schedule_rename_is_saving();
     let cursor = if saving { "" } else { "▏" };
     let draft = clip_tail_cells(
-        &rename.draft,
-        width.saturating_sub(8 + usize::from(!saving)),
+        draft,
+        width.saturating_sub(label.len() + usize::from(!saving)),
     );
     let muted = Style::default().fg(colors::subtle());
     let mut lines = vec![Line::from(vec![
-        Span::styled("  Name: ", muted),
+        Span::styled(label, muted),
         Span::styled(
             format!("{draft}{cursor}"),
             Style::default().fg(colors::brand()),
@@ -2390,16 +2423,13 @@ pub(super) fn render_schedule_rename(f: &mut Frame, app: &App) {
     if saving {
         lines.push(Line::styled("  Saving…", muted));
     } else {
-        if let Some(error) = &rename.error {
+        if let Some(error) = error {
             lines.push(Line::styled(
                 format!("  {}", clip_cells(error, width.saturating_sub(2))),
                 Style::default().fg(colors::error()),
             ));
         }
-        let key = |action| {
-            app.keymap
-                .primary_hint(ActionContext::ScheduleRename, action)
-        };
+        let key = |action| app.keymap.primary_hint(context, action);
         lines.push(Line::styled(
             clip_cells(
                 &format!(
@@ -2420,7 +2450,7 @@ pub(super) fn render_schedule_rename(f: &mut Frame, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(colors::brand()))
-                .title(" Rename schedule "),
+                .title(title),
         ),
         area,
     );
@@ -4145,9 +4175,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             if cfg!(target_os = "macos") {
-                [5_741_994_946_620_296_138, 6_974_571_662_424_884_876]
+                [10_155_465_262_818_596_818, 1_561_752_803_135_469_316]
             } else {
-                [13_063_416_522_773_230_992, 2_008_128_776_819_391_150]
+                [8_527_637_959_075_279_648, 2_868_803_754_581_337_670]
             },
             "complete help-overlay buffer golden changed"
         );

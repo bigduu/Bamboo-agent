@@ -719,6 +719,39 @@ Execute a built-in tool without running the full agent loop.
 
 ---
 
+### Edit a Saved Interval Period
+
+```http
+PATCH /api/v1/schedules/{schedule_id}/interval
+Content-Type: application/json
+```
+
+```json
+{ "every_seconds": 900 }
+```
+
+The body accepts one positive whole-second period representable by the scheduler.
+A successful request returns HTTP 200 with the saved schedule, including its ID,
+Interval trigger, and `state.next_fire_at` when present. Repeating the saved period
+preserves the record and its timestamp. A changed period preserves the effective anchor
+and computes the next occurrence after both the current time and any occurrence
+already handled by the scheduler. The saved window, enabled state, run
+configuration, policies, and existing run records are preserved.
+
+Read the response's `error.code` for these refusals.
+
+| HTTP status | Code | Condition |
+| --- | --- | --- |
+| 400 | `invalid_schedule_interval` | Invalid request body or unrepresentable period |
+| 404 | `schedule_not_found` | The saved schedule is unavailable |
+| 409 | `schedule_trigger_changed` | The saved trigger is no longer Interval |
+| 409 | `schedule_no_future_occurrence` | The new period has no future occurrence within the saved window |
+
+Older Hosts may leave this route unavailable. Keep the pending edit and prompt
+for a Host upgrade in that case.
+
+---
+
 ### Health Check
 
 #### Health Check Endpoint

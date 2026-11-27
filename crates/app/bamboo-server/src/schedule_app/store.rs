@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use super::log_monitor::LogMonitor;
-use super::trigger_engine::{default_trigger_engine, TriggerEngine};
+use super::trigger_engine::{default_trigger_engine, interval_duration, TriggerEngine};
 use bamboo_domain::{
     MisFirePolicy, OverlapPolicy, ProjectId, ScheduleRunConfig, ScheduleRunRecord,
     ScheduleRunStatus, ScheduleSpec, ScheduleState, ScheduleTrigger, ScheduleWindow,
@@ -201,7 +201,7 @@ impl ScheduleEntry {
             .or_else(|| {
                 self.state
                     .next_fire_at
-                    .map(|next| next - Duration::seconds(every_seconds as i64))
+                    .and_then(|next| next.checked_sub_signed(interval_duration(every_seconds)?))
             })
             .or(Some(self.created_at))
     }
@@ -256,7 +256,7 @@ fn derive_legacy_anchor_at(raw: &ScheduleEntryCompat, every_seconds: u64) -> Opt
                 .as_ref()
                 .and_then(|state| state.next_fire_at)
                 .or(raw.next_run_at)
-                .map(|next| next - Duration::seconds(every_seconds as i64))
+                .and_then(|next| next.checked_sub_signed(interval_duration(every_seconds)?))
         })
 }
 
@@ -356,6 +356,10 @@ pub(crate) enum SchedulePatchRejection {
     NoFutureOccurrence,
     #[error("start_at must be earlier than end_at")]
     InvalidWindow,
+    #[error("interval must be a positive, representable number of seconds")]
+    InvalidInterval,
+    #[error("schedule no longer uses an interval trigger")]
+    TriggerChanged,
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -1251,6 +1255,61 @@ impl ScheduleStore {
         Ok(Some(candidate))
     }
 
+    pub(crate) async fn patch_interval_period(
+        &self,
+        id: &str,
+        every_seconds: u64,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        if interval_duration(every_seconds).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::InvalidInterval,
+            ));
+        }
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        let ScheduleTrigger::Interval {
+            every_seconds: previous,
+            ..
+        } = &existing.trigger
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::TriggerChanged,
+            ));
+        };
+        if every_seconds == *previous {
+            return Ok(Some(existing.clone()));
+        }
+
+        let now = Utc::now();
+        let mut candidate = existing.clone();
+        candidate.trigger =
+            ScheduleTrigger::legacy_interval(every_seconds, existing.derived_anchor_at());
+        // A clock change must not put the edited cadence back before a claimed fire.
+        let after = existing
+            .state
+            .last_scheduled_at
+            .map_or(now, |last| now.max(last));
+        candidate.state.next_fire_at = Some(compute_patch_next_run_at(
+            &candidate, existing, false, after,
+        )?);
+        candidate.updated_at = now;
+
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
+    }
+
     pub async fn delete_schedule(&self, id: &str) -> io::Result<bool> {
         self.delete_schedule_inner(id, None).await
     }
@@ -1793,6 +1852,15 @@ mod tests {
                     "created_at": now,
                     "updated_at": now,
                     "last_run_at": next_run_at
+                },
+                "legacy-3": {
+                    "id": "legacy-3",
+                    "name": "legacy with an unrepresentable period",
+                    "enabled": false,
+                    "interval_seconds": i64::MAX as u64,
+                    "created_at": now,
+                    "updated_at": now,
+                    "next_run_at": next_run_at
                 }
             }
         });
@@ -1820,6 +1888,44 @@ mod tests {
             Some(next_run_at)
         );
         assert_eq!(legacy_without_next.state.next_fire_at, Some(now));
+        let legacy_out_of_range = store.get_schedule("legacy-3").await.unwrap();
+        assert_eq!(legacy_out_of_range.derived_anchor_at(), Some(now));
+
+        let path = store.index_path();
+        let original = fs::read(path).await.unwrap();
+        let backup = dir.path().join("saved-schedules.json");
+        // Force the atomic replacement to fail after the candidate is prepared.
+        fs::rename(path, &backup).await.unwrap();
+        fs::create_dir(path).await.unwrap();
+        let error = store
+            .patch_interval_period("legacy-1", 2700)
+            .await
+            .unwrap_err();
+        assert!(error.raw_os_error().is_some(), "{error}");
+        assert_eq!(store.get_schedule("legacy-1").await, Some(schedule.clone()));
+        assert_eq!(fs::read(&backup).await.unwrap(), original);
+        fs::remove_dir(path).await.unwrap();
+        fs::rename(&backup, path).await.unwrap();
+
+        let edited = store
+            .patch_interval_period("legacy-1", 2700)
+            .await
+            .unwrap()
+            .unwrap();
+        let anchor = next_run_at - Duration::hours(1);
+        assert_eq!(
+            edited.trigger,
+            ScheduleTrigger::legacy_interval(2700, Some(anchor))
+        );
+        let next = edited.state.next_fire_at.unwrap();
+        assert!(next > edited.updated_at);
+        assert_eq!(next.signed_duration_since(anchor).num_seconds() % 2700, 0);
+        let reopened = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(reopened.get_schedule("legacy-1").await, Some(edited));
+        assert_eq!(
+            reopened.get_schedule("legacy-2").await,
+            Some(legacy_without_next)
+        );
     }
 
     #[tokio::test]
