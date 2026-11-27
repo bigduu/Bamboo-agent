@@ -28,6 +28,8 @@ pub use tracker::TitleGenerationTracker;
 use prompt::{ModelTitle, TitleContext};
 
 const TITLE_GEN_TIMEOUT_SECS: u64 = 30;
+// Providers can count hidden reasoning and the visible title in the same limit.
+const TITLE_GEN_MAX_OUTPUT_TOKENS: u32 = 4096;
 
 /// Result of an explicit title request. Only an updated result writes metadata
 /// and publishes `SessionTitleUpdated`.
@@ -298,7 +300,7 @@ async fn try_llm_title(
             provider.chat_stream_with_options(
                 &messages,
                 &[],
-                Some(128),
+                Some(TITLE_GEN_MAX_OUTPUT_TOKENS),
                 &model_name,
                 Some(&options),
             ),
