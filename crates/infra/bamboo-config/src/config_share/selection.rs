@@ -32,6 +32,7 @@ pub(super) fn scenario_refs(config: &Config) -> BTreeMap<ShareScenario, ShareMod
         (Search, defaults.search.as_ref()),
         (CodeReview, defaults.code_review.as_ref()),
         (SubAgent, defaults.sub_agent.as_ref()),
+        (WorkReview, defaults.work_review.as_ref()),
     ]
     .into_iter()
     .filter_map(|(scenario, reference)| reference.map(|r| (scenario, model_ref(config, r))))

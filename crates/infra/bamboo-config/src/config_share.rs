@@ -63,6 +63,7 @@ pub enum ShareScenario {
     Search,
     CodeReview,
     SubAgent,
+    WorkReview,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

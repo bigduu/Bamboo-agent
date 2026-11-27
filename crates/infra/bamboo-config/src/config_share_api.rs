@@ -753,6 +753,7 @@ fn merge_scenarios(current: &mut Config, plan: &ShareBundle) -> Result<(), Share
             ShareScenario::Search => &mut defaults.search,
             ShareScenario::CodeReview => &mut defaults.code_review,
             ShareScenario::SubAgent => &mut defaults.sub_agent,
+            ShareScenario::WorkReview => &mut defaults.work_review,
         };
         *slot = Some(model_ref(reference, slot.as_ref()));
     }

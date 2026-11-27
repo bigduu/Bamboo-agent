@@ -915,6 +915,19 @@ See `bamboo_config::patch::deep_merge_json`'s doc comment for the full
 semantics table and the precedence rules against masked-placeholder
 resolution.
 
+### Work review in Config Share
+
+Add `work_review` to `selection.scenarios` in
+`POST /api/v1/bamboo/config/share/export` to include the saved Work review
+model. Use the existing preview and apply steps to confirm the destination
+provider account. An explicit `reasoning_effort` of `"none"` is preserved.
+
+Bundles retain the `BAMBOO-SHARE:1:` format. A bundle containing `work_review`
+requires an updated reader. Earlier Bamboo readers reject that scenario.
+Bundles using the previous scenario set remain compatible with earlier
+readers. Importing a bundle that omits `work_review` preserves the destination's
+saved Work review model.
+
 ---
 
 ## Architecture
