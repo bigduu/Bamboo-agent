@@ -505,23 +505,46 @@ pub async fn merge_state(
                         continue;
                     }
                 };
-                let (main_checkout, entries) = match merge_state::list_metadata(&path, deadline) {
-                    Ok(metadata) => metadata,
-                    Err(_) => {
-                        repositories.push(ComputedRepository {
-                            path: label,
-                            base_ref: Some(base.label()),
-                            base_commit: Some(base.commit.clone()),
-                            error: Some("inventory_unavailable"),
-                            remote,
-                            entries: Vec::new(),
-                        });
-                        continue;
+                let (mut main_checkout, mut entries) =
+                    match merge_state::list_metadata(&path, deadline) {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            repositories.push(ComputedRepository {
+                                path: label,
+                                base_ref: Some(base.label()),
+                                base_commit: Some(base.commit.clone()),
+                                error: Some("inventory_unavailable"),
+                                remote,
+                                entries: Vec::new(),
+                            });
+                            continue;
+                        }
+                    };
+                // Git can report the common metadata directory as its main
+                // record. Use the same checkout binding proof as inventory.
+                if main_checkout.as_deref() == Some(common.as_path()) {
+                    main_checkout = None;
+                    if let Some(entry) = entries.first_mut().filter(|entry| !entry.bare) {
+                        let checkout = if std::time::Instant::now() < deadline {
+                            git::main_worktree_by(&path, &common, deadline)
+                        } else {
+                            Err(
+                                "Merge-state budget exhausted; the main checkout was not verified"
+                                    .into(),
+                            )
+                        };
+                        match checkout {
+                            Ok(checkout) => {
+                                entry.path.clone_from(&checkout);
+                                main_checkout = Some(checkout);
+                            }
+                            Err(error) => {
+                                diagnostics.push((path.clone(), error));
+                                entries.remove(0);
+                            }
+                        }
                     }
-                };
-                // Separate Git directories can appear as the first native
-                // record. Such a record names metadata rather than a checkout.
-                let main_checkout = main_checkout.filter(|checkout| checkout != &common);
+                }
                 let entries = entries
                     .into_iter()
                     .filter(|entry| entry.path.to_str().is_some())
