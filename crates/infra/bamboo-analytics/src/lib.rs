@@ -713,6 +713,19 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
 
+    #[test]
+    fn json_extension_is_linked_into_the_engine() {
+        let conn = Connection::open_in_memory().unwrap();
+        let install_mode: String = conn
+            .query_row(
+                "SELECT install_mode FROM duckdb_extensions() WHERE extension_name = 'json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(install_mode, "STATICALLY_LINKED");
+    }
+
     fn write_fixture(home: &Path) {
         let sdir = home.join("sessions").join("s1");
         std::fs::create_dir_all(&sdir).unwrap();
