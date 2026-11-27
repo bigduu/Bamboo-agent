@@ -10,7 +10,7 @@ use bamboo_agent_core::tools::{
     ToolCall, ToolExecutionContext, ToolExecutionSessionFlags, ToolExecutor, ToolOutcome,
     ToolResult, ToolSchema,
 };
-use bamboo_agent_core::{AgentError, AgentEvent, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_domain::{
     AgentHookPoint, AgentRuntimeState, EffectiveCallableSet, HookPayload, HookResult,
     HookToolOutcome, SessionCallerReference, SESSION_COORDINATION_TOOL_NAME,
@@ -1570,7 +1570,7 @@ async fn apply_completed_tool_execution_outcome(
     let tool_name_for_meta = ctx.tool_call.function.name.clone();
     let tool_call_id_for_meta = ctx.tool_call.id.clone();
     let tool_duration_ms = outcome.tool_duration.as_millis() as u64;
-    let is_success = outcome.result.as_ref().is_ok_and(|result| result.success);
+    let dispatch_success = outcome.result.as_ref().is_ok_and(|result| result.success);
 
     let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name_for_meta)
         == bamboo_tools::orchestrator::ToolMutability::Mutating;
@@ -1689,20 +1689,19 @@ async fn apply_completed_tool_execution_outcome(
     // Find the last tool-result message matching this tool_call_id and
     // attach execution metadata so it is persisted in session.json and
     // available when the frontend reloads the session later.
-    let metadata_value = serde_json::json!({
-        "elapsed_ms": tool_duration_ms,
-        "is_mutating": is_mutating,
-        "auto_approved": !is_mutating,
-        "tool_name": tool_name_for_meta,
-        "success": is_success,
-    });
-    if let Some(msg) = ctx
-        .session
-        .messages
-        .iter_mut()
-        .rev()
-        .find(|m| m.tool_call_id.as_deref() == Some(&tool_call_id_for_meta))
+    if let Some(msg) =
+        ctx.session.messages.iter_mut().rev().find(|m| {
+            m.role == Role::Tool && m.tool_call_id.as_deref() == Some(&tool_call_id_for_meta)
+        })
     {
+        // Postprocessing can replace the dispatched result before this message is recorded.
+        let metadata_value = serde_json::json!({
+            "elapsed_ms": tool_duration_ms,
+            "is_mutating": is_mutating,
+            "auto_approved": !is_mutating,
+            "tool_name": tool_name_for_meta,
+            "success": msg.tool_success.unwrap_or(dispatch_success),
+        });
         let metadata = msg.metadata.get_or_insert_with(|| serde_json::json!({}));
         if let Some(object) = metadata.as_object_mut() {
             object.extend(
@@ -3941,6 +3940,245 @@ mod hook_tests {
             None,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn ticket_task_lifecycle_metadata_tracks_final_ticket_result() {
+        use bamboo_agent_core::{Message, Role, Storage, Tool, ToolCtx};
+        use bamboo_tickets::{Command, CommandSource, RequestKind, RequestStatus};
+
+        use crate::ticket_worker_plan::tests::Fixture;
+        use crate::ticket_worker_plan::TICKET_QUESTION_YIELD_KEY;
+
+        const CHILD: &str = "BAMBOO_TICKET_TOOL_RESULT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            // The normal soft-failure collector uses the process Bamboo data dir.
+            let dir = tempfile::tempdir().unwrap();
+            let (_, module) = module_path!().split_once("::").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(format!(
+                    "{module}::ticket_task_lifecycle_metadata_tracks_final_ticket_result"
+                ))
+                .env(CHILD, "1")
+                .env("BAMBOO_DATA_DIR", dir.path())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed;"),
+                "isolated Ticket result test failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let args = serde_json::json!({
+            "tasks": [{"id":"own", "content":"Check the saved output", "status":"blocked"}],
+            "question": {"prompt":"Which output should be kept?"}
+        });
+        let calls = [("stale-question", false), ("fresh-question", true)];
+        let mut fixture = Fixture::new();
+        let plan = fixture.plan();
+        plan.bind_session(&mut fixture.session).unwrap();
+        fixture
+            .session
+            .add_message(Message::user("Check the saved output"));
+        let host = fixture.session.clone();
+        let stale = fixture.freeze_question_before_unrelated_draft(plan, calls[0].0, &args);
+        let original_seq = fixture.service.published().unwrap().1.seq;
+        let mut config = AgentLoopConfig::default();
+        config.bind_ticket_worker_plan(Arc::new(stale));
+        let tools: Arc<dyn ToolExecutor> = Arc::new(
+            bamboo_tools::BuiltinToolExecutorBuilder::new()
+                .with_tool(bamboo_tools::TaskTool::new())
+                .unwrap()
+                .build(),
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut results = Vec::new();
+        let mut observed_completions = Vec::new();
+        let mut verified_question = None;
+        let completed_task = |result| ToolExecutionOutcome {
+            output_cap: None,
+            portable_tool: Some(PortableToolExecution {
+                name: "Task".into(),
+                input: args.clone(),
+            }),
+            permission_replay_origin: None,
+            result: Ok(result),
+            needs_human: None,
+            post_tool_hook_eligible: true,
+            managed_running_violation: false,
+            tool_duration: std::time::Duration::ZERO,
+        };
+
+        for (call_id, success) in calls {
+            if success {
+                let plan = fixture.plan();
+                plan.bind_session(&mut fixture.session).unwrap();
+                config.bind_ticket_worker_plan(Arc::new(plan));
+            }
+            let call = ToolCall {
+                id: call_id.into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "Task".into(),
+                    arguments: args.to_string(),
+                },
+            };
+            fixture
+                .session
+                .add_message(Message::assistant("", Some(vec![call.clone()])));
+            let ToolOutcome::Completed(initial) = bamboo_tools::TaskTool::new()
+                .invoke(args.clone(), ToolCtx::none(call_id))
+                .await
+                .unwrap()
+            else {
+                panic!("built-in Task must accept both inputs before Ticket processing");
+            };
+            assert!(initial.success);
+            let should_yield = apply_test_outcome(
+                &config,
+                &tools,
+                &call,
+                &mut fixture.session,
+                &event_tx,
+                completed_task(initial),
+            )
+            .await
+            .unwrap();
+            assert_eq!(should_yield, success);
+            let completions: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok())
+                .filter(|event| matches!(event, AgentEvent::ToolComplete { .. }))
+                .collect();
+            let [AgentEvent::ToolComplete {
+                tool_call_id: completed_id,
+                result,
+            }] = completions.as_slice()
+            else {
+                panic!("expected exactly one completion for {call_id}");
+            };
+            assert_eq!(completed_id, call_id);
+            assert_eq!(result.success, success);
+
+            let (_, snapshot) = fixture.service.published().unwrap();
+            let assignment = &snapshot.assignments[&fixture.assignment];
+            let operation_id = format!("worker-plan/{}/{call_id}", assignment.dispatch_key);
+            if success {
+                assert_eq!(snapshot.seq, original_seq + 1);
+                assert_eq!(snapshot.requests.len(), 1);
+                let request_id = assignment.awaiting_request.as_ref().unwrap();
+                let request = &snapshot.requests[request_id];
+                assert_eq!(request.status, RequestStatus::Open);
+                assert_eq!(request.kind, RequestKind::Question);
+                assert_eq!(
+                    request.assignment_id.as_deref(),
+                    Some(fixture.assignment.as_str())
+                );
+                assert_eq!(request.prompt, args["question"]["prompt"].as_str().unwrap());
+                let body: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                assert_eq!(body["status"], "waiting_for_answer");
+                assert_eq!(body["request"]["id"].as_str(), Some(request_id.as_str()));
+                let receipt = &snapshot.receipts[&operation_id];
+                let command: Command = serde_json::from_str(&receipt.canonical_request).unwrap();
+                assert_eq!(command.operation_id, operation_id);
+                let Some(CommandSource::WorkerTask { arguments }) = command.source else {
+                    panic!("expected committed Task arguments in the fresh receipt");
+                };
+                assert_eq!(arguments, args);
+                verified_question = Some((arguments, request.clone()));
+            } else {
+                assert_eq!(result.result, "revision_conflict");
+                assert_eq!(snapshot.seq, original_seq);
+                assert!(snapshot.requests.is_empty());
+                assert!(assignment.awaiting_request.is_none());
+                assert!(!snapshot.receipts.contains_key(&operation_id));
+                assert!(!fixture
+                    .session
+                    .metadata
+                    .contains_key(TICKET_QUESTION_YIELD_KEY));
+            }
+            results.push((call_id, result.clone()));
+            observed_completions.extend(completions);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = bamboo_storage::SessionStoreV2::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        storage.save_session(&fixture.session).await.unwrap();
+        let stored = storage
+            .load_session(&fixture.session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut flags = Vec::new();
+        for (call_id, result) in results {
+            let messages: Vec<_> = stored
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == Role::Tool && message.tool_call_id.as_deref() == Some(call_id)
+                })
+                .collect();
+            let [message] = messages.as_slice() else {
+                panic!("expected exactly one stored Tool message for {call_id}");
+            };
+            assert_eq!(message.content, result.result);
+            assert_eq!(message.tool_success, Some(result.success));
+            let metadata_success = message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("success"))
+                .and_then(serde_json::Value::as_bool);
+            flags.push((call_id, message.tool_success, metadata_success));
+        }
+        assert_eq!(
+            flags,
+            [
+                ("stale-question", Some(false), Some(false)),
+                ("fresh-question", Some(true), Some(true)),
+            ],
+            "stored Tool success and lifecycle metadata must agree for both results"
+        );
+        let (committed_arguments, question) = verified_question.unwrap();
+        crate::external_agents::actor_adapter::assert_ticket_question_history_checkpoint(
+            host,
+            &stored.messages,
+            &observed_completions,
+            calls[1].0,
+            committed_arguments,
+            question,
+        )
+        .await;
+
+        let ordinary_call = ToolCall {
+            id: "plain-failure".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Task".into(),
+                arguments: args.to_string(),
+            },
+        };
+        let mut ordinary = Session::new("ordinary-tool-result", "fixture-model");
+        ordinary.add_message(Message::assistant("", Some(vec![ordinary_call.clone()])));
+        let should_yield = apply_test_outcome(
+            &AgentLoopConfig::default(),
+            &tools,
+            &ordinary_call,
+            &mut ordinary,
+            &event_tx,
+            completed_task(ToolResult::text(false, "ordinary task failure")),
+        )
+        .await
+        .unwrap();
+        assert!(!should_yield);
+        let message = ordinary.messages.last().unwrap();
+        assert_eq!(message.role, Role::Tool);
+        assert_eq!(message.tool_call_id.as_deref(), Some("plain-failure"));
+        assert_eq!(message.tool_success, Some(false));
+        assert_eq!(message.metadata.as_ref().unwrap()["success"], false);
     }
 
     #[tokio::test]
