@@ -61,6 +61,235 @@ fn returned_message_ids(result: &Value) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn read_slice_reconstructs_large_multibyte_text_without_replaying_private_parts() {
+    use bamboo_domain::{ImageUrlRef, MessagePart};
+    use sha2::{Digest, Sha256};
+
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let mut session = Session::new("slice-text-session", "test-model");
+    let legacy = "Original heading 🪭";
+    let multipart = "你好, é 🙂\n".repeat(4_000);
+    let mut message = archived(identified(
+        Message::user_with_parts(
+            legacy,
+            vec![
+                MessagePart::Text {
+                    text: legacy.into(),
+                },
+                MessagePart::Text {
+                    text: multipart.clone(),
+                },
+                MessagePart::ImageUrl {
+                    image_url: ImageUrlRef {
+                        url: "https://example.com/PRIVATE-IMAGE.png".into(),
+                        detail: None,
+                    },
+                },
+                MessagePart::Text {
+                    text: "Final paragraph".into(),
+                },
+            ],
+        ),
+        "large-user-text",
+    ));
+    message.reasoning = Some("PRIVATE-REASONING".into());
+    session.add_message(message);
+    session.add_message(identified(
+        Message::assistant("Short answer", None),
+        "answer",
+    ));
+    let mut multipart_only = Message::user("");
+    multipart_only.content_parts = Some(vec![MessagePart::Text {
+        text: "Only text part".into(),
+    }]);
+    session.add_message(identified(multipart_only, "parts-only"));
+    store.save_session(&session).await.unwrap();
+    let before = store.load_session(&session.id).await.unwrap().unwrap();
+
+    let tool = SessionInspectorTool::current(store.clone(), store.clone());
+    let expected = format!("{legacy}\n\n{multipart}\n\nFinal paragraph");
+    let expected_digest = hex::encode(Sha256::digest(expected.as_bytes()));
+    let total_chars = expected.chars().count();
+    assert!(total_chars > 20_000);
+    let mut reconstructed = String::new();
+    let mut offset = 0;
+    loop {
+        let page = completed(tool.invoke(
+            json!({"action":"read_slice","message_id":"large-user-text","offset":offset,"max_chars":7001}),
+            context(&session.id, "direct-slice"),
+        ).await.unwrap());
+        assert_eq!(page["available"], true);
+        assert_eq!(page["archived"], true);
+        assert_eq!(page["offset"], offset);
+        assert_eq!(page["total_chars"], total_chars);
+        assert_eq!(page["content_sha256"], expected_digest);
+        let content = page["content"].as_str().unwrap();
+        assert_eq!(content.chars().count(), 7001.min(total_chars - offset));
+        assert!(!page.to_string().contains("PRIVATE-"));
+        reconstructed.push_str(content);
+        let Some(next) = page["next_offset"].as_u64() else {
+            break;
+        };
+        assert_eq!(next as usize, offset + 7001);
+        offset = next as usize;
+    }
+    assert_eq!(reconstructed, expected);
+
+    let default = completed(
+        tool.invoke(
+            json!({"action":"read_slice","message_id":"large-user-text"}),
+            context(&session.id, "direct-slice"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(default["next_offset"], 2_000);
+    assert_eq!(default["content"].as_str().unwrap().chars().count(), 2_000);
+
+    for (message_id, content) in [("answer", "Short answer"), ("parts-only", "Only text part")] {
+        let page = completed(
+            tool.invoke(
+                json!({"action":"read_slice","message_id":message_id}),
+                context(&session.id, "direct-slice"),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(page["content"], content);
+        assert_eq!(page["offset"], 0);
+        assert_eq!(page["next_offset"], Value::Null);
+    }
+    let eof = completed(
+        tool.invoke(
+            json!({"action":"read_slice","message_id":"large-user-text","offset":total_chars}),
+            context(&session.id, "direct-slice"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(eof["content"], "");
+    assert_eq!(eof["next_offset"], Value::Null);
+    let too_far = tool
+        .invoke(
+            json!({"action":"read_slice","message_id":"large-user-text","offset":total_chars+1}),
+            context(&session.id, "direct-slice"),
+        )
+        .await;
+    assert!(matches!(too_far, Err(ToolError::InvalidArguments(_))));
+    let persisted = store.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(persisted.messages).unwrap(),
+        serde_json::to_value(before.messages).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn read_slice_rejects_scope_overrides_and_excluded_history_records() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let mut foreign = Session::new("slice-foreign-session", "test-model");
+    foreign.add_message(identified(Message::user("FOREIGN"), "foreign-message"));
+    store.save_session(&foreign).await.unwrap();
+
+    let mut session = Session::new("slice-scope-session", "test-model");
+    session.add_message(identified(Message::system("HOST-ONLY"), "system-message"));
+    session.add_message(identified(Message::user("Old request"), "old-request"));
+    let mut hidden = identified(Message::user("INTERNAL RUNTIME"), "runtime-resume");
+    hidden.metadata = Some(json!({"runtime_kind":"retry_resume"}));
+    session.add_message(hidden);
+    session.add_message(identified(
+        Message::tool_result("no-such-call", "ORPHANED"),
+        "orphan-result",
+    ));
+    let generated_call = call(
+        "old-slice",
+        "session_history_current",
+        json!({"action":"read_slice","message_id":"old-request"}),
+    );
+    session.add_message(identified(
+        Message::assistant("", Some(vec![generated_call])),
+        "generated-call",
+    ));
+    session.add_message(identified(
+        Message::tool_result("old-slice", "GENERATED"),
+        "generated-result",
+    ));
+    session.add_message(identified(
+        Message::user("CURRENT-REQUEST"),
+        "current-request",
+    ));
+    session.add_message(Message::assistant(
+        "",
+        Some(vec![call(
+            "this-slice",
+            "session_history_current",
+            json!({"action":"read_slice","message_id":"old-request"}),
+        )]),
+    ));
+    session.add_message(identified(
+        Message::assistant("AFTER-READ-BOUNDARY", None),
+        "later-message",
+    ));
+    store.save_session(&session).await.unwrap();
+
+    let tool = SessionInspectorTool::current(store.clone(), store.clone());
+    let unavailable = json!({"contract_version":1,"action":"read_slice","available":false,"unavailable_reason":"message_unavailable"});
+    for message_id in [
+        "unknown",
+        "foreign-message",
+        "system-message",
+        "runtime-resume",
+        "orphan-result",
+        "generated-call",
+        "generated-result",
+        "current-request",
+        "later-message",
+    ] {
+        let page = completed(
+            tool.invoke(
+                json!({"action":"read_slice","message_id":message_id}),
+                context(&session.id, "this-slice"),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(page, unavailable, "{message_id}");
+    }
+    for arguments in [
+        json!({"action":"read_slice","message_id":"foreign-message","session_id":foreign.id}),
+        json!({"action":"read_slice","message_id":"old-request","path":"session.json"}),
+        json!({"action":"read_slice","message_id":"old-request","max_chars":0}),
+        json!({"action":"read_slice","message_id":"old-request","max_chars":20001}),
+    ] {
+        let result = tool
+            .invoke(arguments, context(&session.id, "this-slice"))
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+    for legacy_tool in [
+        SessionInspectorTool::self_only(store.clone(), store.clone()),
+        SessionInspectorTool::host_routed(store.clone(), store.clone()),
+    ] {
+        let result = legacy_tool
+            .invoke(
+                json!({"action":"read_slice","message_id":"old-request"}),
+                context(&session.id, "this-slice"),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+}
+
+#[tokio::test]
 async fn read_around_returns_complete_anchor_chain_and_chronological_neighbors_without_mutation() {
     let home = tempfile::tempdir().unwrap();
     let store = Arc::new(

@@ -53,6 +53,15 @@ pub(super) enum SessionInspectorArgs {
         max_chars: Option<usize>,
     },
 
+    /// Read bounded text from one eligible message in the caller Session.
+    ReadSlice {
+        message_id: String,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        max_chars: Option<usize>,
+    },
+
     /// Materialize a bounded, immutable observation of this root or its tree.
     ExportContext { session_id: String },
 

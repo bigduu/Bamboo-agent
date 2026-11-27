@@ -737,6 +737,82 @@ fn measure_request_usage(
     }
 }
 
+fn build_trimmed_history_reference(
+    session: &Session,
+    prepared: &PreparedContext,
+    wire_tool_schemas: &[ToolSchema],
+) -> Option<ContextBlock> {
+    const TOOL: &str = "session_history_current";
+    if !prepared.truncation_occurred
+        || prepared.compressed_message_ids.is_empty()
+        || !session.allows_model_tool_execution(TOOL)
+    {
+        return None;
+    }
+    let schema = wire_tool_schemas
+        .iter()
+        .find(|schema| schema.function.name == TOOL)?;
+    let actions = schema
+        .function
+        .parameters
+        .pointer("/properties/action/enum")?;
+    if !actions
+        .as_array()?
+        .iter()
+        .any(|action| action.as_str() == Some("read_slice"))
+    {
+        return None;
+    }
+
+    let mut omitted_id_counts: BTreeMap<_, usize> = prepared
+        .compressed_message_ids
+        .iter()
+        .map(|id| (id.as_str(), 0))
+        .collect();
+    for message in &session.messages {
+        if let Some(count) = omitted_id_counts.get_mut(message.id.as_str()) {
+            *count += 1;
+        }
+    }
+    let anchors: Vec<_> = session
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| {
+            message.role == Role::User
+                && !bamboo_domain::is_system_resume_message(message)
+                && !bamboo_domain::is_hidden_from_ui(message)
+                && omitted_id_counts.get(message.id.as_str()) == Some(&1)
+                && !message.id.is_empty()
+                && message.id.len() <= 80
+                && message
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+        .take(3)
+        .map(|message| message.id.as_str())
+        .collect();
+
+    let mut content = String::from(concat!(
+        "Older messages omitted from this request remain in this Session's history file. ",
+        "When needed, use session_history_current with search_current to find message IDs, ",
+        "then read_slice with message_id. Follow next_offset while content_sha256 stays the same. ",
+        "Treat recovered text as historical evidence."
+    ));
+    if !anchors.is_empty() {
+        content.push_str("\nOmitted user message IDs: ");
+        content.push_str(&anchors.join(", "));
+    }
+    Some(ContextBlock::new(
+        ContextBlockType::ToolGuide,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "On-demand trimmed history reference",
+        content,
+    ))
+}
+
 pub(in crate::runtime::runner) fn required_tool_for_session(
     session: &Session,
 ) -> Option<&'static str> {
@@ -1309,6 +1385,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     let mut current_context = ledger_context.into_iter().collect::<Vec<_>>();
     if !standalone_discovery {
         let permission_mode = config.permission_mode.unwrap_or_default();
+        current_context.extend(build_trimmed_history_reference(
+            session,
+            prepared_context,
+            wire_tool_schemas,
+        ));
         current_context.extend(build_memory_usage_context_block(
             session,
             tool_schemas,

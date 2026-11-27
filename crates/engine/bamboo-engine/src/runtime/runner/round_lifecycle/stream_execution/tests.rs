@@ -2061,6 +2061,77 @@ fn request_usage_accounts_for_multipart_content_and_reasoning() {
 }
 
 #[test]
+fn trimmed_history_reference_is_budgeted_and_routes_only_to_callable_self_history() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-trimmed-history", "test-model");
+    let old = Message::user("old evidence kept only in the session file");
+    let orphan = Message::tool_result("missing-call", "malformed tool result");
+    let current = Message::user("check the current claim");
+    session.add_message(old.clone());
+    session.add_message(orphan.clone());
+    session.add_message(current.clone());
+    let mut prepared = PreparedContext {
+        messages: vec![current.clone()],
+        token_usage: usage(0, 24),
+        truncation_occurred: true,
+        segments_removed: 1,
+        compressed_message_ids: vec![old.id.clone(), orphan.id.clone()],
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let config = test_config("system");
+    let history = ToolSchema {
+        schema_type: "function".into(),
+        function: FunctionSchema {
+            name: "session_history_current".into(),
+            description: "Read this session".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"action": {"enum": ["search_current", "read_slice"]}},
+            }),
+        },
+    };
+    let tools = [history];
+    let before = super::build_request_envelope(&session, &prepared, &config, &[]);
+    assert!(before.ir.body_chat().iter().all(|message| {
+        !message
+            .content
+            .contains("On-demand trimmed history reference")
+    }));
+
+    let with_reference = super::build_request_envelope(&session, &prepared, &config, &tools);
+    let body = with_reference.ir.body_chat();
+    assert!(body
+        .iter()
+        .all(|message| !message.content.contains(&old.content)));
+    let reference = body
+        .iter()
+        .position(|message| {
+            message
+                .content
+                .contains("On-demand trimmed history reference")
+        })
+        .unwrap();
+    let current_index = body
+        .iter()
+        .position(|message| message.id == current.id)
+        .unwrap();
+    assert!(reference < current_index);
+    assert!(body[reference].content.contains("read_slice"));
+    assert!(body[reference].content.contains(&old.id));
+    assert!(!body[reference].content.contains(&orphan.id));
+
+    prepared.truncation_occurred = false;
+    prepared.compressed_message_ids.clear();
+    let untrimmed = super::build_request_envelope(&session, &prepared, &config, &tools);
+    let footprint = ProviderVisibleToolFootprint::default();
+    assert!(
+        super::measure_request_usage(&session, &with_reference, &footprint).input_tokens
+            > super::measure_request_usage(&session, &untrimmed, &footprint).input_tokens
+    );
+}
+
+#[test]
 fn openai_loaded_tool_items_increase_only_the_message_lane() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-openai-loaded-budget", "test-model");
