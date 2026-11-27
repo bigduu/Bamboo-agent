@@ -252,7 +252,11 @@ mod tests {
 
     #[cfg(test)]
     mod http_tests {
-        use actix_web::{http::StatusCode, test, web, App};
+        use actix_web::{
+            dev::{Service, ServiceResponse},
+            http::StatusCode,
+            test, web, App,
+        };
         use serde_json::Value;
         use tempfile::tempdir;
 
@@ -264,6 +268,78 @@ mod tests {
             ScheduleTrigger,
         };
         use crate::AppState;
+
+        async fn assert_name_only_patch_is_persisted(
+            app: &impl Service<
+                actix_http::Request,
+                Response = ServiceResponse,
+                Error = actix_web::Error,
+            >,
+            store: &ScheduleStore,
+            schedule_id: &str,
+            name: &str,
+        ) {
+            let previous = store.get_schedule(schedule_id).await.unwrap();
+            assert_ne!(previous.name, name);
+            let records = store.list_run_records_for_schedule(schedule_id).await;
+            let mut expected = serde_json::to_value(ScheduleView::from(previous)).unwrap();
+            let uri = format!("/api/v1/schedules/{schedule_id}");
+            let response = test::call_service(
+                app,
+                test::TestRequest::patch()
+                    .uri(&uri)
+                    .set_json(serde_json::json!({ "name": format!("  {name}\t") }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let renamed: Value = test::read_body_json(response).await;
+            assert!(renamed["updated_at"].is_string());
+            expected["name"] = serde_json::json!(name);
+            expected["updated_at"] = renamed["updated_at"].clone();
+            assert_eq!(renamed, expected);
+            let persisted = tokio::fs::read(store.index_path()).await.unwrap();
+
+            let repeated = test::call_service(
+                app,
+                test::TestRequest::patch()
+                    .uri(&uri)
+                    .set_json(serde_json::json!({ "name": name }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(repeated.status(), StatusCode::OK);
+            let repeated: Value = test::read_body_json(repeated).await;
+            assert_eq!(repeated, renamed);
+
+            let listed: Value = test::call_and_read_body_json(
+                app,
+                test::TestRequest::get()
+                    .uri("/api/v1/schedules")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(listed["schedules"][0], renamed);
+            assert_eq!(
+                store.list_run_records_for_schedule(schedule_id).await,
+                records
+            );
+            let home = store.index_path().parent().unwrap().to_path_buf();
+            let reopened = ScheduleStore::new(home).await.unwrap();
+            let entry = reopened.get_schedule(schedule_id).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(ScheduleView::from(entry)).unwrap(),
+                renamed
+            );
+            assert_eq!(
+                reopened.list_run_records_for_schedule(schedule_id).await,
+                records
+            );
+            assert_eq!(
+                tokio::fs::read(store.index_path()).await.unwrap(),
+                persisted
+            );
+        }
 
         #[actix_web::test]
         async fn patch_schedule_disables_and_resumes_an_upcoming_schedule() {
@@ -409,6 +485,8 @@ mod tests {
                 tokio::fs::read(store.index_path()).await.unwrap(),
                 persisted
             );
+            assert_name_only_patch_is_persisted(&app, store, &schedule_id, "Archived cadence")
+                .await;
         }
 
         #[actix_web::test]
@@ -423,7 +501,12 @@ mod tests {
                     "Once schedule".into(),
                     ScheduleTrigger::Once { at },
                     true,
-                    ScheduleRunConfig::default(),
+                    ScheduleRunConfig {
+                        task_message: Some("Review the saved report".into()),
+                        model: Some("saved-model".into()),
+                        enhance_prompt: Some("Retain original evidence".into()),
+                        ..Default::default()
+                    },
                 )
                 .await
                 .unwrap();
@@ -492,6 +575,8 @@ mod tests {
                 tokio::fs::read(store.index_path()).await.unwrap(),
                 persisted
             );
+            assert_name_only_patch_is_persisted(&app, store, &schedule.id, "Archived one-shot")
+                .await;
         }
 
         #[actix_web::test]
