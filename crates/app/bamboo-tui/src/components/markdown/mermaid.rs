@@ -25,24 +25,24 @@ impl Unavailable {
 /// Preview one path in its declared direction. The source picker can still
 /// access the original fence.
 pub(super) fn render(source: &str, width: usize) -> Result<Vec<Line<'static>>, Unavailable> {
-    let (direction, labels) = parse_path(source).ok_or(Unavailable::Unsupported)?;
-    let labels: Vec<_> = labels
+    let (direction, nodes) = parse_path(source).ok_or(Unavailable::Unsupported)?;
+    let nodes: Vec<_> = nodes
         .into_iter()
-        .map(|label| (label, grapheme_cell_width(label)))
+        .map(|node| (node, grapheme_cell_width(node.label)))
         .collect();
     let border = Style::default().fg(colors::code_border());
     match direction {
-        Direction::TopDown => render_vertical(labels, width, border),
-        Direction::LeftToRight => render_horizontal(labels, width, border),
+        Direction::TopDown => render_vertical(nodes, width, border),
+        Direction::LeftToRight => render_horizontal(nodes, width, border),
     }
 }
 
 fn render_vertical(
-    labels: Vec<(&str, usize)>,
+    nodes: Vec<(NodeDisplay<'_>, usize)>,
     width: usize,
     border: Style,
 ) -> Result<Vec<Line<'static>>, Unavailable> {
-    let label_width = labels.iter().map(|(_, cells)| *cells).max().unwrap_or(0);
+    let label_width = nodes.iter().map(|(_, cells)| *cells).max().unwrap_or(0);
     if label_width + 4 > width {
         return Err(Unavailable::TooWide);
     }
@@ -51,22 +51,23 @@ fn render_vertical(
     let rule_left = "─".repeat(center - 1);
     let rule_right = "─".repeat(label_width + 2 - center);
     let arrow = format!("{}↓", " ".repeat(center));
-    let mut rows = Vec::with_capacity(labels.len() * 4 - 1);
-    let last_index = labels.len() - 1;
-    for (index, (label, cells)) in labels.into_iter().enumerate() {
+    let mut rows = Vec::with_capacity(nodes.len() * 4 - 1);
+    let last_index = nodes.len() - 1;
+    for (index, (node, cells)) in nodes.into_iter().enumerate() {
+        let [top_left, top_right, bottom_left, bottom_right] = node.shape.corners();
         let top_center = if index == 0 { '─' } else { '┴' };
         let bottom_center = if index == last_index { '─' } else { '┬' };
         rows.push(Line::styled(
-            format!("┌{rule_left}{top_center}{rule_right}┐"),
+            format!("{top_left}{rule_left}{top_center}{rule_right}{top_right}"),
             border,
         ));
         rows.push(Line::from(vec![
             Span::styled("│ ", border),
-            Span::raw(label.to_owned()),
+            Span::raw(node.label.to_owned()),
             Span::styled(format!("{} │", " ".repeat(label_width - cells)), border),
         ]));
         rows.push(Line::styled(
-            format!("└{rule_left}{bottom_center}{rule_right}┘"),
+            format!("{bottom_left}{rule_left}{bottom_center}{rule_right}{bottom_right}"),
             border,
         ));
         if index != last_index {
@@ -77,14 +78,14 @@ fn render_vertical(
 }
 
 fn render_horizontal(
-    labels: Vec<(&str, usize)>,
+    nodes: Vec<(NodeDisplay<'_>, usize)>,
     width: usize,
     border: Style,
 ) -> Result<Vec<Line<'static>>, Unavailable> {
     let arrow = "──→";
     let gap_width = grapheme_cell_width(arrow);
-    let box_widths: usize = labels.iter().map(|(_, cells)| cells + 4).sum();
-    if box_widths + gap_width * (labels.len() - 1) > width {
+    let box_widths: usize = nodes.iter().map(|(_, cells)| cells + 4).sum();
+    if box_widths + gap_width * (nodes.len() - 1) > width {
         return Err(Unavailable::TooWide);
     }
 
@@ -92,20 +93,21 @@ fn render_horizontal(
     let mut top = String::new();
     let mut middle = Vec::new();
     let mut bottom = String::new();
-    let last_index = labels.len() - 1;
-    for (index, (label, cells)) in labels.into_iter().enumerate() {
+    let last_index = nodes.len() - 1;
+    for (index, (node, cells)) in nodes.into_iter().enumerate() {
+        let [top_left, top_right, bottom_left, bottom_right] = node.shape.corners();
         let rule = "─".repeat(cells + 2);
-        top.push('┌');
+        top.push(top_left);
         top.push_str(&rule);
-        top.push('┐');
-        bottom.push('└');
+        top.push(top_right);
+        bottom.push(bottom_left);
         bottom.push_str(&rule);
-        bottom.push('┘');
+        bottom.push(bottom_right);
 
         let left_side = if index == 0 { "│ " } else { "┤ " };
         let right_side = if index == last_index { " │" } else { " ├" };
         middle.push(Span::styled(left_side, border));
-        middle.push(Span::raw(label.to_owned()));
+        middle.push(Span::raw(node.label.to_owned()));
         middle.push(Span::styled(right_side, border));
         if index != last_index {
             top.push_str(&gap);
@@ -126,10 +128,31 @@ enum Direction {
     LeftToRight,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeShape {
+    Rectangle,
+    Rounded,
+}
+
+impl NodeShape {
+    fn corners(self) -> [char; 4] {
+        match self {
+            Self::Rectangle => ['┌', '┐', '└', '┘'],
+            Self::Rounded => ['╭', '╮', '╰', '╯'],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NodeDisplay<'a> {
+    label: &'a str,
+    shape: NodeShape,
+}
+
 #[derive(Clone, Copy)]
 struct NodeRef<'a> {
     id: &'a str,
-    label: Option<&'a str>,
+    display: Option<NodeDisplay<'a>>,
 }
 
 struct Node<'a> {
@@ -138,7 +161,7 @@ struct Node<'a> {
     next: Option<usize>,
 }
 
-fn parse_path(source: &str) -> Option<(Direction, Vec<&str>)> {
+fn parse_path(source: &str) -> Option<(Direction, Vec<NodeDisplay<'_>>)> {
     if source.len() > MAX_SOURCE_BYTES {
         return None;
     }
@@ -184,13 +207,16 @@ fn parse_path(source: &str) -> Option<(Direction, Vec<&str>)> {
     if roots.next().is_some() {
         return None;
     }
-    let mut labels = Vec::with_capacity(nodes.len());
+    let mut path = Vec::with_capacity(nodes.len());
     for _ in 0..nodes.len() {
         let node = &nodes[index];
-        labels.push(node.reference.label.unwrap_or(node.reference.id));
+        path.push(node.reference.display.unwrap_or(NodeDisplay {
+            label: node.reference.id,
+            shape: NodeShape::Rectangle,
+        }));
         match node.next {
             Some(next) => index = next,
-            None => return (labels.len() == nodes.len()).then_some((direction, labels)),
+            None => return (path.len() == nodes.len()).then_some((direction, path)),
         }
     }
     None
@@ -201,12 +227,12 @@ fn register<'a>(nodes: &mut Vec<Node<'a>>, reference: NodeRef<'a>) -> Option<usi
         .iter()
         .position(|node| node.reference.id == reference.id)
     {
-        if let Some(label) = reference.label {
-            let saved = &mut nodes[index].reference.label;
-            if saved.is_some_and(|saved| saved != label) {
+        if let Some(display) = reference.display {
+            let saved = &mut nodes[index].reference.display;
+            if saved.is_some_and(|saved| saved != display) {
                 return None;
             }
-            *saved = Some(label);
+            *saved = Some(display);
         }
         return Some(index);
     }
@@ -249,23 +275,31 @@ fn parse_node(input: &str) -> Option<(NodeRef<'_>, &str)> {
     ) {
         return None;
     }
-    let Some(body) = rest.strip_prefix('[') else {
-        return Some((NodeRef { id, label: None }, rest.trim_ascii_start()));
+    let (shape, closer, body) = match rest.as_bytes().first() {
+        Some(b'[') => (NodeShape::Rectangle, ']', &rest[1..]),
+        // Mermaid reserves "(-" for ellipses.
+        Some(b'(') if !rest.starts_with("(-") => (NodeShape::Rounded, ')', &rest[1..]),
+        _ => return Some((NodeRef { id, display: None }, rest.trim_ascii_start())),
     };
 
-    let (label, rest) = body.split_once(']')?;
-    let label = if let Some(quoted) = label.strip_prefix('"') {
-        quoted.strip_suffix('"')?
+    let (label, rest) = if let Some(quoted) = body.strip_prefix('"') {
+        let (label, rest) = quoted.split_once('"')?;
+        (label, rest.strip_prefix(closer)?)
     } else {
-        if label.trim().starts_with(['/', '|']) || label.contains(['(', ')', '{', '}']) {
+        let (label, rest) = body.split_once(closer)?;
+        let unsupported_shape_text = match shape {
+            NodeShape::Rectangle => label.trim_start().starts_with(['/', '|']),
+            NodeShape::Rounded => label.contains('|'),
+        };
+        if unsupported_shape_text || label.contains(['(', ')', '{', '}']) {
             return None;
         }
-        label
+        (label, rest)
     };
     let label = label.trim();
     if label.is_empty()
         || label.chars().any(char::is_control)
-        || label.contains(['[', '"', '<', '>', '`', '\\', '#'])
+        || label.contains(['[', ']', '"', '<', '>', '`', '\\', '#'])
         || grapheme_cell_width(label) == 0
     {
         return None;
@@ -273,7 +307,7 @@ fn parse_node(input: &str) -> Option<(NodeRef<'_>, &str)> {
     Some((
         NodeRef {
             id,
-            label: Some(label),
+            display: Some(NodeDisplay { label, shape }),
         },
         rest.trim_ascii_start(),
     ))
@@ -292,13 +326,11 @@ mod tests {
             "  Plan[计划 🧭]-->Validate\r\n",
             "  Validate[Verify]\r\n",
         );
-        assert_eq!(
-            parse_path(source).unwrap(),
-            (
-                Direction::TopDown,
-                vec!["计划 🧭", "Verify", "Deploy (done) & verify"]
-            )
-        );
+        let (direction, nodes) = parse_path(source).unwrap();
+        assert_eq!(direction, Direction::TopDown);
+        assert!(nodes.iter().all(|node| node.shape == NodeShape::Rectangle));
+        let labels: Vec<_> = nodes.iter().map(|node| node.label).collect();
+        assert_eq!(labels, ["计划 🧭", "Verify", "Deploy (done) & verify"]);
     }
 
     #[test]
@@ -312,9 +344,18 @@ mod tests {
             "A --> B\nC",
             "A --> A",
             "A --> B\nA[different]\nA[conflicting]",
+            "A --> B\nA(Same)\nA[Same]",
+            "A --> B\nA[Same]\nA(Same)",
+            "A --> B\nA(different)\nA(conflicting)",
             "A[Plan] -->|Yes| B",
             "A[Plan] --> B --> C",
             "A[(Disk)] --> B",
+            "A((Circle)) --> B",
+            "A([Stadium]) --> B",
+            "A(-Ellipse-) --> B",
+            "A(One | Two) --> B",
+            "A(\"Missing quote) --> B",
+            "A( ) --> B",
             "A[/Data/] --> B",
             "A[|width:wide|Start] --> B",
             "A[\"Missing quote] --> B",
@@ -393,10 +434,6 @@ mod tests {
             "  A --> B\r\n",
             "  A[检查 👩‍💻]\r\n",
         );
-        assert_eq!(
-            parse_path(source),
-            Some((Direction::LeftToRight, vec!["检查 👩‍💻", "Done"]))
-        );
         let rows = render(source, 22).unwrap();
         assert_eq!(
             rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -408,5 +445,52 @@ mod tests {
         );
         assert!(rows.iter().all(|row| row.width() == 22));
         assert_eq!(render(source, 21), Err(Unavailable::TooWide));
+    }
+
+    #[test]
+    fn vertical_round_nodes_preserve_mixed_shape_and_bare_reference_layout() {
+        let source = concat!(
+            "graph TD\n",
+            "B[Review]\n",
+            "A(检查 👩‍💻) --> B\n",
+            "B --> C\n",
+            "A(\"检查 👩‍💻\")\n",
+        );
+        let rows = render(source, 11).unwrap();
+        assert_eq!(
+            rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            [
+                "╭─────────╮",
+                "│ 检查 👩‍💻 │",
+                "╰────┬────╯",
+                "     ↓",
+                "┌────┴────┐",
+                "│ Review  │",
+                "└────┬────┘",
+                "     ↓",
+                "┌────┴────┐",
+                "│ C       │",
+                "└─────────┘",
+            ]
+        );
+        assert_eq!(render(source, 10), Err(Unavailable::TooWide));
+    }
+
+    #[test]
+    fn horizontal_round_node_accepts_quoted_parentheses_and_fits_by_cells() {
+        let source = "flowchart LR\nB[Done]\nA --> B\nA(\"Plan (ok)\")";
+        let rows = render(source, 24).unwrap();
+        assert_eq!(
+            rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            [
+                "╭───────────╮   ┌──────┐",
+                "│ Plan (ok) ├──→┤ Done │",
+                "╰───────────╯   └──────┘",
+            ]
+        );
+        assert!(rows.iter().all(|row| row.width() == 24));
+        assert_eq!(render(source, 23), Err(Unavailable::TooWide));
+        assert!(render("graph LR\nA(\"- note -\") --> B(Task-)", 60).is_ok());
+        assert!(render("graph LR\nA(\"One | Two\") --> B(/review)", 60).is_ok());
     }
 }
