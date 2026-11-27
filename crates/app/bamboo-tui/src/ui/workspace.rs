@@ -572,6 +572,7 @@ impl Workspace {
             alt: event.modifiers.contains(KeyModifiers::ALT),
             shift: event.modifiers.contains(KeyModifiers::SHIFT),
             cmd: event.modifiers.contains(KeyModifiers::SUPER),
+            ..Modifiers::default()
         };
         matches!(self.view.handle(Input::Mouse(input)), Handled::Yes)
     }
