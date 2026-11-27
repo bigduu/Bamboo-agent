@@ -50,6 +50,7 @@ use bamboo_llm::{
 use bamboo_tools::exposure::activated_discoverable_tools;
 use sha2::{Digest, Sha256};
 
+use super::context_preparation::ProviderPreparedTokenCounter;
 use super::{
     request_tool_policy, request_tool_schemas_for_loading_mode, select_request_tool_schemas,
     PromptMemoryExposureFrame, RoundRecoveryPolicy, RoundToolDispatch,
@@ -654,6 +655,7 @@ fn measure_request_usage(
     tool_footprint: &ProviderVisibleToolFootprint,
 ) -> ProjectedRequestUsage {
     let counter = TiktokenTokenCounter::default();
+    let message_counter = ProviderPreparedTokenCounter(&counter);
     let messages = envelope.ir.flatten();
     let history_boundary_event_ids = session
         .model_context_state
@@ -670,9 +672,9 @@ fn measure_request_usage(
         .iter()
         .filter(|message| history_boundary_event_ids.contains(message.id.as_str()))
         .fold(0u32, |total, message| {
-            total.saturating_add(counter.count_message(message))
+            total.saturating_add(message_counter.count_message(message))
         });
-    let mut message_input_tokens = counter.count_messages(&messages);
+    let mut message_input_tokens = message_counter.count_messages(&messages);
     let mut replaced_anchors = HashSet::new();
     for group in &envelope.ir.provider_transcript_groups {
         if replaced_anchors.insert(group.anchor_message_id()) {
@@ -681,7 +683,7 @@ fn measure_request_usage(
                 .find(|message| message.id == group.anchor_message_id())
             {
                 message_input_tokens =
-                    message_input_tokens.saturating_sub(counter.count_message(anchor));
+                    message_input_tokens.saturating_sub(message_counter.count_message(anchor));
             }
         }
         let payloads = group
@@ -884,12 +886,14 @@ pub(super) async fn project_request_usage(
             wire_schemas.as_ref(),
             loading_mode,
         );
+    let counter = TiktokenTokenCounter::default();
+    let message_counter = ProviderPreparedTokenCounter(&counter);
     let prepared_message_input_tokens = if discovery_history.is_empty() {
-        TiktokenTokenCounter::default().count_messages(&prepared_context.messages)
+        message_counter.count_messages(&prepared_context.messages)
     } else {
         let mut projected = prepared_context.messages.clone();
         project_discovery_history(&mut projected, &discovery_history);
-        TiktokenTokenCounter::default().count_messages(&projected)
+        message_counter.count_messages(&projected)
     };
     let envelope = build_request_envelope_reconciled_for_loading_mode(
         &mut shadow,

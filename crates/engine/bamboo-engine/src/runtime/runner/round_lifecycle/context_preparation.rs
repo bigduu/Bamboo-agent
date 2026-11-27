@@ -819,6 +819,26 @@ fn all_active_prepared_context(
     }
 }
 
+/// Counts the fields a provider may lower from a prepared message. Use this
+/// for request projection and refitting in the same units as the dispatch guard.
+pub(super) struct ProviderPreparedTokenCounter<'a>(pub(super) &'a dyn TokenCounter);
+
+impl TokenCounter for ProviderPreparedTokenCounter<'_> {
+    fn count_message(&self, message: &Message) -> u32 {
+        provider_prepared_message_tokens(message, self.0)
+    }
+
+    fn count_messages(&self, messages: &[Message]) -> u32 {
+        messages.iter().fold(0u32, |total, message| {
+            total.saturating_add(self.count_message(message))
+        })
+    }
+
+    fn count_text(&self, text: &str) -> u32 {
+        self.0.count_text(text)
+    }
+}
+
 fn provider_prepared_message_tokens(message: &Message, counter: &dyn TokenCounter) -> u32 {
     let mut tokens = counter.count_message(message);
     if let Some(reasoning) = message.reasoning.as_deref() {
@@ -828,12 +848,17 @@ fn provider_prepared_message_tokens(message: &Message, counter: &dyn TokenCounte
         tokens = tokens.saturating_add(counter.count_text(signature));
     }
     if let Some(parts) = message.content_parts.as_deref() {
+        // Chat stores the user text in both the legacy field and its first
+        // multipart text block. Charge that mirror once and any extra parts
+        // separately. Tool results can send the legacy field and all parts.
+        let mut mirrored_user_text =
+            (message.role == Role::User).then_some(message.content.as_str());
         for part in parts {
             match part {
+                MessagePart::Text { text } if mirrored_user_text == Some(text.as_str()) => {
+                    mirrored_user_text = None;
+                }
                 MessagePart::Text { text } => {
-                    // Some provider adapters prefer content parts over the
-                    // legacy text field. Counting both is deliberately
-                    // conservative when a caller populated both views.
                     tokens = tokens.saturating_add(counter.count_text(text));
                 }
                 MessagePart::ImageUrl { image_url } => {
@@ -1017,16 +1042,11 @@ async fn retrieval_window_preflight(
         llm,
     )
     .await?;
-    let extra_tokens = prepared.messages.iter().fold(0u32, |total, message| {
-        let estimated = provider_prepared_message_tokens(message, counter);
-        total.saturating_add(estimated.saturating_sub(counter.count_message(message)))
-    });
     let late_bound_tool_tokens =
         late_bound_tool_schema_reserve(session, tool_schemas, &projected, counter)?;
     Ok(RetrievalWindowPreflight {
         active_tokens: projected
             .input_tokens
-            .saturating_add(extra_tokens)
             .saturating_add(late_bound_tool_tokens),
     })
 }
@@ -1126,7 +1146,6 @@ async fn build_retrieval_window_accounting_frame(
         )));
     }
 
-    let locally_counted_prepared_tokens = counter.count_messages(&prepared.messages);
     let current_late_bound_tool_tokens =
         late_bound_tool_schema_reserve(session, tool_schemas, &current_projected, counter)?;
     let post_boundary_late_bound_tool_tokens = late_bound_tool_schema_reserve(
@@ -1145,7 +1164,7 @@ async fn build_retrieval_window_accounting_frame(
         current_projected_tokens.saturating_sub(post_boundary_projected_tokens);
     let fixed_without_boundary = post_boundary_projected
         .input_tokens
-        .saturating_sub(locally_counted_prepared_tokens)
+        .saturating_sub(post_boundary_projected.prepared_message_input_tokens)
         .saturating_add(post_boundary_late_bound_tool_tokens);
     // The block is persisted through the model-context ledger, whose snapshot
     // envelope is larger than the block's direct runtime-context rendering.
@@ -1499,20 +1518,15 @@ async fn maybe_prepare_retrieval_window_context(
         .await?;
         let late_bound_tool_tokens =
             late_bound_tool_schema_reserve(&staged, tool_schemas, &projected, &counter)?;
-        let retained_supplemental_tokens = retained.messages.iter().fold(0u32, |total, message| {
-            let estimated = provider_prepared_message_tokens(message, &counter);
-            total.saturating_add(estimated.saturating_sub(counter.count_message(message)))
-        });
         let projected_input_tokens = projected
             .input_tokens
-            .saturating_add(late_bound_tool_tokens)
-            .saturating_add(retained_supplemental_tokens);
+            .saturating_add(late_bound_tool_tokens);
         if projected_input_tokens > plan.target_tokens
             || projected_input_tokens > budget.max_request_input_tokens()
             || projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
         {
             return Err(AgentError::Budget(format!(
-                "retrieval-window estimated retained request exceeds its committed limits: input_tokens={projected_input_tokens}, target_tokens={}, input_limit={}, late_bound_tool_tokens={late_bound_tool_tokens}, supplemental_message_tokens={retained_supplemental_tokens}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+                "retrieval-window estimated retained request exceeds its committed limits: input_tokens={projected_input_tokens}, target_tokens={}, input_limit={}, late_bound_tool_tokens={late_bound_tool_tokens}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
                 plan.target_tokens,
                 budget.max_request_input_tokens(),
                 projected.ledger_rendered_bytes,
@@ -1661,7 +1675,7 @@ async fn summary_boundary_fixed_tokens(
         .saturating_sub(projected.history_boundary_input_tokens);
     Ok(projected
         .input_tokens
-        .saturating_sub(counter.count_messages(&prepared.messages))
+        .saturating_sub(projected.prepared_message_input_tokens)
         .saturating_add(late_bound)
         .saturating_add(boundary_reserve))
 }
@@ -1713,13 +1727,7 @@ async fn projected_summary_request_tokens(
         .token_usage
         .total_tokens
         .saturating_add(native_delta);
-    Ok((
-        projected
-            .input_tokens
-            .saturating_add(late_bound)
-            .saturating_add(native_delta),
-        prepared,
-    ))
+    Ok((projected.input_tokens.saturating_add(late_bound), prepared))
 }
 
 fn summary_prepared_provider_state(session: &Session) -> Result<serde_json::Value, AgentError> {
@@ -3478,11 +3486,34 @@ pub(super) async fn prepare_round_context(
         &mut prepared_context.messages,
     );
 
+    let latest_user_id = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == Role::User
+                && !message.compressed
+                && !bamboo_domain::is_system_resume_message(message)
+        })
+        .map(|message| message.id.as_str());
+    let refit_counter = ProviderPreparedTokenCounter(&counter);
     loop {
         // Failed compaction never authorizes dropping messages from this
         // request. Check both the initial fit and every exact provider refit.
         if automatic_summary_was_empty && prepared_context.truncation_occurred {
             return Err(AgentError::EmptyContextSummary);
+        }
+        if prepared_context.truncation_occurred
+            && latest_user_id.is_some_and(|id| {
+                !prepared_context
+                    .messages
+                    .iter()
+                    .any(|message| message.id == id)
+            })
+        {
+            return Err(AgentError::Budget(
+                "the latest user message does not fit in the model input budget".into(),
+            ));
         }
         // Reconciliation may append snapshots that did not exist when the
         // durable ledger was measured above, especially after retention or
@@ -3552,7 +3583,7 @@ pub(super) async fn prepare_round_context(
             session,
             prepared_context,
             &budget,
-            &counter,
+            &refit_counter,
             refit_fixed_tokens,
         )
         .map_err(|error| {
