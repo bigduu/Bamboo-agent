@@ -9,9 +9,8 @@ license = "MIT"
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
-# Bundled DuckDB: links the native engine (tens of MB). Isolated in this crate
-# so only callers that want analytics pay for it; the engine/server do not.
-duckdb = { version = "1", features = ["bundled"] }
+# Bundle the native engine and JSON extension in this crate for offline reports.
+duckdb = { version = "1", features = ["bundled", "json"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde_json = { workspace = true }
 
