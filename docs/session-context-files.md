@@ -36,11 +36,31 @@ path can be supplied. Existing Root history actions retain their existing
 behavior under the legacy `session_history` identity. Base and Child surfaces
 keep that legacy name for compatibility, with only `search_current`,
 `read_current`, and `read_around`. Every surface also exposes the distinct
-always-resident `session_history_current` identity with exactly that same
-self-only schema. Its scope comes from trusted `ToolCtx`; it accepts no Session
-ID or authority override, and Root's broad `session_history` overlay never
-widens it. Base and Child still cannot list, read, search, or export another
-Session.
+always-resident `session_history_current` identity. Its scope comes from
+trusted `ToolCtx`. It accepts no Session ID or authority override. Root's
+broad `session_history` overlay does not widen this tool.
+
+When the request window drops older messages, Bamboo references the original
+Session history file through this tool. Use `search_current` to locate a message
+ID, then `read_slice` to read long text in pages:
+
+```json
+{"action":"read_slice","message_id":"<message ID>","offset":0,"max_chars":2000}
+```
+
+Offsets count Unicode scalar values. Follow `next_offset` while
+`content_sha256` stays the same. Start again at offset 0 if the digest changes.
+The tool reads eligible text from the canonical Session history. It preserves
+the existing exclusions for System messages, the current user request,
+generated history reads, and incomplete tool chains. Internal runtime
+messages are also excluded. Multipart user text is
+included with the mirrored legacy text counted once. Image bytes and model
+reasoning stay outside these text pages. A page that exceeds the tool output
+budget returns a failure. Retry it at the same offset with a smaller
+`max_chars`.
+
+Base and Child can read their own history. Reads of another Session are subject
+to the owning tool's broader authority rules.
 
 The primary model prompt also receives one typed, Session-stable identity block
 containing the current Session ID. It is placed after the cross-Session stable

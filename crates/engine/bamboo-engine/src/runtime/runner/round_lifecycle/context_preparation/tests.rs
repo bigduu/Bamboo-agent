@@ -320,7 +320,8 @@ use super::{
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
 use bamboo_agent_core::{
-    AgentEvent, AgentHook, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
+    AgentError, AgentEvent, AgentHook, CompressionTriggerType, Message, Role, Session,
+    TokenBudgetUsage,
 };
 use bamboo_compression::{
     build_retrieval_window_candidate_plan_with_token_accounting,
@@ -2330,6 +2331,101 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
         "refit must bring the transformed message vector itself back under the limit"
     );
     assert!(projected.input_tokens <= prepared.budget.max_request_input_tokens());
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn request_budget_refits_native_images_without_dropping_the_latest_user_message() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let llm = noop_llm();
+    let mut config = AgentLoopConfig {
+        system_prompt: Some("system".into()),
+        ..Default::default()
+    };
+    config.context_management.strategy = ContextManagementStrategy::MessageSummary;
+
+    let image = bamboo_domain::MessagePart::ImageUrl {
+        image_url: bamboo_domain::ImageUrlRef {
+            url: "https://example.com/screenshot.png".into(),
+            detail: None,
+        },
+    };
+    let latest = Message::user("Describe what to do next.");
+    let mut session = Session::new("native-image-budget", "test-model");
+    session.add_message(Message::system("system"));
+    session.add_message(latest.clone());
+    let input_limit = projected_fixture_input_tokens(&session, &config, &[]).await + 512;
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        input_limit + 256,
+        256,
+        BudgetStrategy::default(),
+        0,
+    ));
+
+    let call = Message::assistant(
+        "",
+        Some(vec![ToolCall {
+            id: "image-tool".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "screenshot".into(),
+                arguments: "{}".into(),
+            },
+        }]),
+    );
+    let mut result = Message::tool_result("image-tool", "Screenshot taken.");
+    result.content_parts = Some(vec![image.clone()]);
+    let (call_id, result_id) = (call.id.clone(), result.id.clone());
+    session.messages.insert(1, call);
+    session.messages.insert(2, result);
+    // Keep durable compaction unavailable so the transient request fitter must
+    // handle the limit, as it would for a session with older malformed history.
+    session
+        .messages
+        .insert(3, Message::tool_result("orphan", "Old result."));
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "native-image-budget",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .expect("the request fits after omitting the older image tool batch");
+    assert!(prepared.prepared_context.truncation_occurred);
+    let messages = &prepared.prepared_context.messages;
+    assert!(messages.iter().any(|message| message.id == latest.id));
+    assert!(!messages
+        .iter()
+        .any(|message| message.id == call_id || message.id == result_id));
+    assert!(session.messages.iter().any(|message| {
+        message.id == result_id && !message.compressed && message.content_parts.is_some()
+    }));
+
+    session.messages.last_mut().unwrap().content_parts = Some(vec![image]);
+    let mut resume = Message::user("Resume the interrupted response.");
+    resume.metadata = Some(serde_json::json!({ "runtime_kind": "retry_resume" }));
+    session.add_message(resume);
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "native-image-budget",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .err()
+    .expect("an oversized current message must not be silently omitted");
+    assert!(matches!(error, AgentError::Budget(reason)
+        if reason.contains("latest user message does not fit")));
+    assert!(session.messages.iter().any(|message| {
+        message.id == latest.id && !message.compressed && message.content_parts.is_some()
+    }));
 }
 
 #[allow(clippy::await_holding_lock)]
