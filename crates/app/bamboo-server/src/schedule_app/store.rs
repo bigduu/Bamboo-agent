@@ -1188,9 +1188,14 @@ impl ScheduleStore {
             return Ok(None);
         }
 
-        let enabled_only =
-            enabled.is_some() && name.is_none() && run_config.is_none() && definition.is_empty();
-        if enabled_only && enabled == Some(existing.enabled) {
+        let changes_run_definition = run_config.is_some() || !definition.is_empty();
+        let name_only = name.as_deref().is_some_and(|name| !name.trim().is_empty())
+            && enabled.is_none()
+            && !changes_run_definition;
+        let enabled_only = enabled.is_some() && name.is_none() && !changes_run_definition;
+        if (name_only && name.as_deref() == Some(existing.name.as_str()))
+            || (enabled_only && enabled == Some(existing.enabled))
+        {
             return Ok(Some(existing.clone()));
         }
 
@@ -1200,11 +1205,10 @@ impl ScheduleStore {
         if let Some(enabled) = enabled {
             candidate.enabled = enabled;
         }
-        if !enabled_only {
-            if let Some(name) = name {
-                candidate.name = name;
-            }
-
+        if let Some(name) = name {
+            candidate.name = name;
+        }
+        if !name_only && !enabled_only {
             candidate.trigger = normalize_trigger_for_storage(
                 definition
                     .trigger
@@ -1231,7 +1235,7 @@ impl ScheduleStore {
                 candidate.run_config = run_config;
             }
         }
-        if !enabled_only || candidate.enabled {
+        if !name_only && (!enabled_only || candidate.enabled) {
             candidate.state.next_fire_at = Some(compute_patch_next_run_at(
                 &candidate,
                 existing,
@@ -1884,7 +1888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patch_schedule_with_definition_updates_interval_trigger_metadata() {
+    async fn mixed_patch_updates_schedule_name_and_interval_trigger_metadata() {
         let dir = tempdir().unwrap();
         let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
 
@@ -1904,7 +1908,7 @@ mod tests {
         let patched = store
             .patch_schedule_with_definition(
                 &created.id,
-                None,
+                Some("renamed interval".into()),
                 None,
                 None,
                 ScheduleDefinitionChanges {
@@ -1922,6 +1926,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        assert_eq!(patched.name, "renamed interval");
         assert!(matches!(
             patched.trigger,
             ScheduleTrigger::Interval {
@@ -1932,6 +1937,65 @@ mod tests {
         assert_eq!(patched.timezone.as_deref(), Some("UTC"));
         assert_eq!(patched.misfire_policy, MisFirePolicy::CatchUpAll);
         assert_eq!(patched.overlap_policy, OverlapPolicy::Skip);
+    }
+
+    #[tokio::test]
+    async fn rename_preserves_due_schedule_and_can_retry_after_failed_save() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let due_at = Utc::now() - Duration::minutes(30);
+        let id = store
+            .create_schedule(
+                "recurring task".into(),
+                ScheduleTrigger::legacy_interval(3600, Some(due_at)),
+                true,
+                ScheduleRunConfig::default(),
+            )
+            .await
+            .unwrap()
+            .id;
+        let due = store
+            .update_index(|index| {
+                let entry = index.schedules.get_mut(&id).unwrap();
+                entry.created_at = due_at;
+                entry.updated_at = due_at;
+                entry.state.next_fire_at = Some(due_at);
+                Ok(entry.clone())
+            })
+            .await
+            .unwrap();
+        let index_path = store.index_path();
+        let saved = fs::read(index_path).await.unwrap();
+        let index_updated_at = store.index.read().await.updated_at;
+        let backup = dir.path().join("saved-schedules.json");
+        let new_name = "renamed recurring task";
+        let rename = || store.patch_schedule(&id, Some(new_name.into()), None, None, None);
+
+        // The staged publication cannot replace an existing directory.
+        fs::rename(index_path, &backup).await.unwrap();
+        fs::create_dir(index_path).await.unwrap();
+        let error = rename().await.unwrap_err();
+        assert!(error.raw_os_error().is_some(), "{error}");
+        assert_eq!(store.get_schedule(&id).await, Some(due.clone()));
+        assert_eq!(store.index.read().await.updated_at, index_updated_at);
+        assert_eq!(fs::read(&backup).await.unwrap(), saved);
+
+        fs::remove_dir(index_path).await.unwrap();
+        fs::rename(&backup, index_path).await.unwrap();
+        let renamed = rename().await.unwrap().unwrap();
+        assert_ne!(renamed.updated_at, due.updated_at);
+        let expected = ScheduleEntry {
+            name: new_name.into(),
+            updated_at: renamed.updated_at,
+            ..due
+        };
+        assert_eq!(renamed, expected);
+
+        let published = fs::read(index_path).await.unwrap();
+        let reopened = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(reopened.get_schedule(&id).await, Some(expected.clone()));
+        assert_eq!(rename().await.unwrap(), Some(expected));
+        assert_eq!(fs::read(index_path).await.unwrap(), published);
     }
 
     fn assert_patch_rejection(error: io::Error, expected: SchedulePatchRejection) {
