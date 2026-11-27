@@ -1259,31 +1259,66 @@ mod tests {
     #[test]
     fn concurrent_creates_have_one_no_replace_winner() {
         let root = tempfile::tempdir().unwrap();
-        let barrier = Arc::new(Barrier::new(3));
-        let workers = (0..2)
-            .map(|_| {
-                let root = root.path().to_path_buf();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
+        let path = root.path();
+        let payloads = ["first", "second"].map(|draft| {
+            let mut skill = skill(ID);
+            skill.extend_from_slice(format!("Notes from the {draft} draft.\n").as_bytes());
+            let mut workflow: serde_json::Value =
+                serde_json::from_slice(&definition(ID, 1)).unwrap();
+            workflow["steps"][0]["args"] = serde_json::json!({"path": format!("{draft}.md")});
+            (skill, serde_json::to_vec(&workflow).unwrap())
+        });
+        let barrier = Barrier::new(3);
+        let results = std::thread::scope(|scope| {
+            let workers = payloads.each_ref().map(|(skill, workflow)| {
+                let barrier = &barrier;
+                scope.spawn(move || {
                     barrier.wait();
-                    create_definition(&root, ID, &skill(ID), &definition(ID, 1))
+                    create_definition(path, ID, skill, workflow)
                 })
-            })
-            .collect::<Vec<_>>();
-        barrier.wait();
-        let results = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+            });
+            barrier.wait();
+            workers.map(|worker| worker.join().unwrap())
+        });
+        let outcomes = || {
+            results
+                .each_ref()
+                .map(|result| result.as_ref().map(|s| s.revision))
+        };
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "create results (revision or error) {:?}",
+            outcomes()
+        );
         assert_eq!(
             results
                 .iter()
-                .filter(|result| matches!(result, Err(DefinitionPublicationError::Conflict(_))))
+                .filter(|result| matches!(
+                    result,
+                    Err(DefinitionPublicationError::Conflict(
+                        "Workflow already exists"
+                    ))
+                ))
                 .count(),
-            1
+            1,
+            "create results (revision or error) {:?}",
+            outcomes()
         );
-        assert_eq!(read_definition(root.path(), ID).unwrap().revision, 1);
+        let (index, winner) = results
+            .iter()
+            .enumerate()
+            .find_map(|(index, result)| result.as_ref().ok().map(|snapshot| (index, snapshot)))
+            .expect("one winning create");
+        let (skill, workflow) = &payloads[index];
+        assert_eq!(winner.revision, 1);
+        assert!(&winner.skill_bytes == skill, "winning Skill bytes differ");
+        assert!(&winner.bytes == workflow, "winning Workflow bytes differ");
+        let saved = read_definition(path, ID).unwrap();
+        assert!(
+            &saved == winner,
+            "saved bundle differs from winning snapshot"
+        );
     }
 
     #[test]

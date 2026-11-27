@@ -363,13 +363,27 @@ pub(super) fn open_transaction_parent(
     Ok(transaction)
 }
 
+fn open_clone_transaction_lock(
+    mut open: impl FnMut(&CapOpenOptions) -> std::io::Result<CapFile>,
+) -> std::io::Result<CapFile> {
+    let mut options = CapOpenOptions::new();
+    options.read(true).write(true).create(true);
+    match open(&options) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A concurrent first open of the lock can return ENOENT on macOS.
+            // Reopen the entry installed by the other writer without creating it.
+            options.create(false);
+            open(&options)
+        }
+        result => result,
+    }
+}
+
 pub(super) fn lock_clone_transactions(
     transaction_parent: &CapDir,
 ) -> Result<std::fs::File, ClonePublicationError> {
     let name = Path::new(CLONE_TRANSACTION_LOCK);
-    let mut options = CapOpenOptions::new();
-    options.read(true).write(true).create(true);
-    let lock = transaction_parent.open_with(name, &options)?;
+    let lock = open_clone_transaction_lock(|options| transaction_parent.open_with(name, options))?;
     let metadata = lock.metadata()?;
     if !metadata.is_file() || !cap_regular_file_has_single_link(&metadata) {
         return Err(ClonePublicationError::Conflict(
@@ -1866,6 +1880,7 @@ fn publish_builtin_clone_with_fault(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_skills::clone_publication::std_file_identity;
     use bamboo_skills::store::builtin::{builtin_clone_files, load_builtin_skill_bundles};
 
     fn review_files() -> BTreeMap<String, BuiltinSkillFile> {
@@ -1910,6 +1925,45 @@ mod tests {
     fn current_marker(root: &Path) -> ClonePublicationMarker {
         let journal = marker_journal(root, "skills/.review.clone-v1.json");
         journal.current().cloned().expect("current marker")
+    }
+
+    #[test]
+    fn lock_open_recovers_not_found_when_the_other_writer_created_it() {
+        let root = tempfile::tempdir().unwrap();
+        let publication = open_publication_root(root.path()).unwrap();
+        let transaction = open_transaction_parent(&publication).unwrap();
+        let mut peer_lock = None;
+        let reopened = open_clone_transaction_lock(|options| {
+            if peer_lock.is_none() {
+                peer_lock = Some(lock_clone_transactions(&transaction).expect("peer lock"));
+                return Err(std::io::ErrorKind::NotFound.into());
+            }
+            transaction.open_with(CLONE_TRANSACTION_LOCK, options)
+        })
+        .expect("open the peer's existing lock");
+        let peer_identity = std_file_identity(peer_lock.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            cap_node_identity(&reopened.metadata().unwrap()),
+            peer_identity
+        );
+    }
+
+    #[test]
+    fn lock_open_not_found_stays_an_error_when_no_writer_created_it() {
+        let root = tempfile::tempdir().unwrap();
+        let publication = open_publication_root(root.path()).unwrap();
+        let transaction = open_transaction_parent(&publication).unwrap();
+        let mut first_open = true;
+        let result = open_clone_transaction_lock(|options| {
+            if std::mem::take(&mut first_open) {
+                return Err(std::io::ErrorKind::NotFound.into());
+            }
+            transaction.open_with(CLONE_TRANSACTION_LOCK, options)
+        });
+        assert!(result.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
+        assert!(transaction
+            .symlink_metadata(CLONE_TRANSACTION_LOCK)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
     }
 
     #[test]
