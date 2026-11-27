@@ -358,14 +358,20 @@ pub(crate) enum SchedulePatchRejection {
     InvalidWindow,
     #[error("interval must be a positive, representable number of seconds")]
     InvalidInterval,
-    #[error("daily time must be a valid hour, minute and second")]
-    InvalidDailyTime,
+    #[error("schedule time must be a valid hour, minute and second")]
+    InvalidClockTime,
     #[error("schedule no longer uses the requested trigger")]
     TriggerChanged,
     #[error("task message is required")]
     InvalidPrompt,
     #[error("schedule no longer has an editable task prompt")]
     PromptChanged,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ScheduleClockKind {
+    Daily,
+    Weekly,
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -1316,9 +1322,10 @@ impl ScheduleStore {
         Ok(Some(candidate))
     }
 
-    pub(crate) async fn patch_daily_time(
+    pub(crate) async fn patch_calendar_time(
         &self,
         id: &str,
+        kind: ScheduleClockKind,
         hour: u8,
         minute: u8,
         second: u8,
@@ -1326,7 +1333,7 @@ impl ScheduleStore {
         if NaiveTime::from_hms_opt(hour.into(), minute.into(), second.into()).is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                SchedulePatchRejection::InvalidDailyTime,
+                SchedulePatchRejection::InvalidClockTime,
             ));
         }
         let _guard = self.write_lock.lock().await;
@@ -1338,18 +1345,32 @@ impl ScheduleStore {
         else {
             return Ok(None);
         };
-        if !matches!(existing.trigger, ScheduleTrigger::Daily { .. })
-            || existing.run_config.workflow_target.is_some()
-        {
-            return Err(io::Error::new(
+        let trigger_changed = || {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
                 SchedulePatchRejection::TriggerChanged,
-            ));
+            )
+        };
+        if existing.run_config.workflow_target.is_some() {
+            return Err(trigger_changed());
         }
-        let trigger = ScheduleTrigger::Daily {
-            hour,
-            minute,
-            second,
+        let trigger = match (&existing.trigger, kind) {
+            (ScheduleTrigger::Daily { .. }, ScheduleClockKind::Daily) => ScheduleTrigger::Daily {
+                hour,
+                minute,
+                second,
+            },
+            (ScheduleTrigger::Weekly { weekdays, .. }, ScheduleClockKind::Weekly)
+                if !weekdays.is_empty() =>
+            {
+                ScheduleTrigger::Weekly {
+                    weekdays: weekdays.clone(),
+                    hour,
+                    minute,
+                    second,
+                }
+            }
+            _ => return Err(trigger_changed()),
         };
         if existing.trigger == trigger {
             return Ok(Some(existing.clone()));
@@ -1378,7 +1399,7 @@ impl ScheduleStore {
         };
         let timezone = existing.timezone.as_deref();
         if let Some(timezone) = timezone {
-            // Daily recurrence assumes the lower bound has a representable
+            // Calendar recurrence assumes the lower bound has a representable
             // date in the chosen zone.
             let zone = timezone
                 .parse::<chrono_tz::Tz>()

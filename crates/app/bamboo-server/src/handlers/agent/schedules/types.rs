@@ -115,10 +115,12 @@ pub enum SetScheduleIntervalRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
-pub enum SetScheduleDailyTimeRequest {
+pub enum SetScheduleClockTimeRequest {
     // This struct variant requires named JSON fields.
     Clock { hour: u8, minute: u8, second: u8 },
 }
+
+pub type SetScheduleDailyTimeRequest = SetScheduleClockTimeRequest;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]

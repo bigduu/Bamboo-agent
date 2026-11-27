@@ -1,7 +1,7 @@
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::api::types::{
-    CreateScheduleRequest, ScheduleDailyTime, ScheduleRunConfigReq, ScheduleTriggerReq,
+    CreateScheduleRequest, ScheduleClockTime, ScheduleRunConfigReq, ScheduleTriggerReq,
     ScheduleWeekdayReq,
 };
 
@@ -246,12 +246,12 @@ fn shifted_index(index: usize, direction: isize, len: usize) -> usize {
 }
 
 fn parse_clock(timing: &str) -> Result<(u8, u8, u8), &'static str> {
-    parse_daily_clock(timing)
+    parse_schedule_clock(timing)
         .map(|time| (time.hour, time.minute, time.second))
         .ok_or("Enter a UTC time in HH:MM or HH:MM:SS format")
 }
 
-pub(crate) fn parse_daily_clock(input: &str) -> Option<ScheduleDailyTime> {
+pub(crate) fn parse_schedule_clock(input: &str) -> Option<ScheduleClockTime> {
     let component = |part: &str| {
         if part.len() != 2 || !part.bytes().all(|b| b.is_ascii_digit()) {
             return None;
@@ -265,7 +265,7 @@ pub(crate) fn parse_daily_clock(input: &str) -> Option<ScheduleDailyTime> {
     if parts.next().is_some() {
         return None;
     }
-    ScheduleDailyTime::new(hour, minute, second)
+    ScheduleClockTime::new(hour, minute, second)
 }
 
 fn parse_days<T>(
@@ -320,10 +320,13 @@ mod tests {
 
     #[test]
     fn daily_clock_parses_wall_time_and_preserves_creation_validation() {
-        assert_eq!(parse_daily_clock("08:15"), ScheduleDailyTime::new(8, 15, 0));
         assert_eq!(
-            parse_daily_clock(" 23:59:59 "),
-            ScheduleDailyTime::new(23, 59, 59)
+            parse_schedule_clock("08:15"),
+            ScheduleClockTime::new(8, 15, 0)
+        );
+        assert_eq!(
+            parse_schedule_clock(" 23:59:59 "),
+            ScheduleClockTime::new(23, 59, 59)
         );
         for invalid in [
             "",
@@ -335,7 +338,7 @@ mod tests {
             "08:15:00:00",
             "08:15Z",
         ] {
-            assert_eq!(parse_daily_clock(invalid), None, "{invalid:?}");
+            assert_eq!(parse_schedule_clock(invalid), None, "{invalid:?}");
         }
         assert_eq!(
             parse_clock("24:00"),
