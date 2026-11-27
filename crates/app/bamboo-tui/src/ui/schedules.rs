@@ -141,11 +141,16 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled("Cadence  ", Style::default().fg(colors::brand())),
                 Span::raw(clip_schedule_text(text, width.saturating_sub(9))),
             ];
-            if schedule.interval_seconds.is_some() {
-                let key = app
-                    .keymap
-                    .primary_hint(ActionContext::Schedules, ActionId::EditScheduleInterval);
-                let hint = format!(" · {key} edit interval");
+            let edit = if schedule.interval_seconds.is_some() {
+                Some((ActionId::EditScheduleInterval, "edit interval"))
+            } else if schedule.daily_time.is_some() {
+                Some((ActionId::EditScheduleDailyTime, "edit daily time"))
+            } else {
+                None
+            };
+            if let Some((action, label)) = edit {
+                let key = app.keymap.primary_hint(ActionContext::Schedules, action);
+                let hint = format!(" · {key} {label}");
                 let remaining = width.saturating_sub(9 + display_width(text));
                 spans.push(Span::styled(
                     clip_schedule_text(&hint, remaining),
@@ -533,6 +538,8 @@ mod tests {
             next_run: None,
             cadence_detail: None,
             interval_seconds: None,
+            daily_time: None,
+            timezone: None,
         }
     }
 

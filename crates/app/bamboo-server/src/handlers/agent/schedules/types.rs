@@ -115,6 +115,13 @@ pub enum SetScheduleIntervalRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
+pub enum SetScheduleDailyTimeRequest {
+    // This struct variant requires named JSON fields.
+    Clock { hour: u8, minute: u8, second: u8 },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum SetSchedulePromptRequest {
     // This struct variant requires named JSON fields.
     Prompt { task_message: String },

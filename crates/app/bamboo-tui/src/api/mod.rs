@@ -1332,6 +1332,108 @@ impl BambooClient {
         Ok(schedule)
     }
 
+    pub(crate) async fn update_schedule_daily_time(
+        &self,
+        schedule_id: &str,
+        time: ScheduleDailyTime,
+    ) -> Result<Schedule> {
+        use reqwest::StatusCode;
+
+        const INVALID_TIME: &str = "Enter a Daily time in HH:MM or HH:MM:SS format";
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        anyhow::ensure!(
+            ScheduleDailyTime::new(time.hour, time.minute, time.second).is_some(),
+            "{INVALID_TIME}"
+        );
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "daily-time"]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not contact the Host to update Daily time"))?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&time)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update Daily time")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update Daily time")
+                }
+            })?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let code = match status {
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                    schedule_response_code(response).await
+                }
+                _ => None,
+            };
+            let message = match (status, code.as_deref()) {
+                (StatusCode::BAD_REQUEST, Some("invalid_schedule_daily_time")) => INVALID_TIME,
+                (StatusCode::CONFLICT, Some("schedule_trigger_changed")) => {
+                    "Schedule is no longer a Daily schedule"
+                }
+                (StatusCode::CONFLICT, Some("schedule_no_future_occurrence")) => {
+                    "Schedule has no future occurrence"
+                }
+                (StatusCode::NOT_FOUND, Some("schedule_not_found")) => "Schedule no longer exists",
+                (StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED, _) => {
+                    "Editing Daily time requires a newer Host"
+                }
+                _ => anyhow::bail!("Could not update Daily time (HTTP {})", status.as_u16()),
+            };
+            anyhow::bail!("{message}");
+        }
+
+        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                ScheduleBodyError::TooLarge => {
+                    anyhow::anyhow!("Daily time response is too large (2 MiB limit)")
+                }
+                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for the Daily time response")
+                }
+                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid Daily time response"),
+            })?;
+        let receipt: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Daily time response"))?;
+        // Save acknowledgements carry the state and run configuration. Keep
+        // their presence check separate from compatibility decoding of lists.
+        anyhow::ensure!(
+            receipt
+                .get("state")
+                .is_some_and(serde_json::Value::is_object)
+                && receipt
+                    .get("run_config")
+                    .is_some_and(serde_json::Value::is_object),
+            "Invalid Daily time response"
+        );
+        let view: ScheduleView = serde_json::from_value(receipt)
+            .map_err(|_| anyhow::anyhow!("Invalid Daily time response"))?;
+        // Canonical mutation replies include seconds. Older list rows may omit them.
+        let exact_time = <ScheduleDailyTime as serde::Deserialize>::deserialize(&view.trigger).ok()
+            == Some(time);
+        let schedule = Schedule::from_view(view);
+        anyhow::ensure!(
+            schedule.id == schedule_id && schedule.daily_time == Some(time) && exact_time,
+            "Daily time response does not match the request"
+        );
+        Ok(schedule)
+    }
+
     pub(crate) async fn set_schedule_prompt(
         &self,
         schedule_id: &str,
@@ -2345,6 +2447,188 @@ mod tests {
             .unwrap();
             assert_eq!(result.unwrap_err().to_string(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_daily_time_sends_only_clock_and_projects_confirmed_timezone() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Morning review",
+            "enabled": false,
+            "trigger": {"type":"daily","hour":8,"minute":15,"second":0},
+            "timezone": "Asia/Shanghai",
+            "state": {"next_fire_at":"2030-02-13T00:15:00Z"},
+            "run_config": {"task_message":"Review progress"},
+        });
+        let schedule = schedule_daily_time_reply("200 OK", "", &body.to_string())
+            .await
+            .unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(schedule.daily_time, ScheduleDailyTime::new(8, 15, 0));
+        assert_eq!(schedule.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(schedule.enabled, Some(false));
+        assert_eq!(
+            schedule.cadence_detail.as_deref(),
+            Some("Daily 08:15 Asia/Shanghai")
+        );
+        assert_eq!(
+            schedule.next_run.unwrap().to_rfc3339(),
+            "2030-02-13T00:15:00+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schedule_daily_time_rejects_mismatched_or_incomplete_receipts() {
+        let daily = serde_json::json!({"type":"daily","hour":8,"minute":15,"second":0});
+        for (id, trigger) in [
+            ("other-schedule", daily.clone()),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"daily","hour":8,"minute":15,"second":1}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"daily","hour":8,"minute":15}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"weekly","weekdays":["mon"],"hour":8,"minute":15,"second":0}),
+            ),
+        ] {
+            let body =
+                serde_json::json!({"id": id, "trigger": trigger, "state": {}, "run_config": {}});
+            assert_eq!(
+                schedule_daily_time_reply("200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Daily time response does not match the request"
+            );
+        }
+        for body in [
+            serde_json::json!({"id": TOGGLE_SCHEDULE_ID, "trigger": daily}),
+            serde_json::json!({"id": TOGGLE_SCHEDULE_ID, "trigger": daily, "run_config": {}}),
+            serde_json::json!({"id": TOGGLE_SCHEDULE_ID, "trigger": daily, "state": {}}),
+        ] {
+            assert_eq!(
+                schedule_daily_time_reply("200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid Daily time response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_daily_time_sanitizes_refusals_and_never_falls_back() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                Some("invalid_schedule_daily_time"),
+                "Enter a Daily time in HH:MM or HH:MM:SS format",
+            ),
+            (
+                "409 Conflict",
+                Some("schedule_trigger_changed"),
+                "Schedule is no longer a Daily schedule",
+            ),
+            (
+                "409 Conflict",
+                Some("schedule_no_future_occurrence"),
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                Some("schedule_not_found"),
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                None,
+                "Editing Daily time requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                None,
+                "Editing Daily time requires a newer Host",
+            ),
+            (
+                "503 Service Unavailable",
+                Some("schedule_trigger_changed"),
+                "Could not update Daily time (HTTP 503)",
+            ),
+        ] {
+            let body = code.map_or_else(
+                || "RAW_DETAILS".to_owned(),
+                |code| {
+                    serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}}).to_string()
+                },
+            );
+            assert_eq!(
+                schedule_daily_time_reply(status, "", &body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert_eq!(
+            schedule_daily_time_reply(
+                "307 Temporary Redirect",
+                "Location: /api/v1/schedules/schedule-17\r\n",
+                "",
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "Could not update Daily time (HTTP 307)"
+        );
+    }
+
+    async fn schedule_daily_time_reply(status: &str, extra: &str, body: &str) -> Result<Schedule> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some(
+                    "PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/daily-time HTTP/1.1"
+                )
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({"hour":8,"minute":15,"second":0})
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            if status.starts_with("404") || status.starts_with("405") || status.starts_with("307") {
+                assert!(timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err());
+            }
+        };
+        let time = ScheduleDailyTime::new(8, 15, 0).unwrap();
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.update_schedule_daily_time(TOGGLE_SCHEDULE_ID, time),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
     }
 
     #[tokio::test]

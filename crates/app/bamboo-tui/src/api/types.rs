@@ -823,7 +823,7 @@ pub struct ToolInfo {
 /// Flat, display-oriented schedule used by the Schedules tab. Built from the
 /// server's richer `ScheduleView` via [`Schedule::from_view`] — the server has
 /// no flat `cron`/`prompt` fields, so we project its `trigger`/`state` into the
-/// fields the list renders and the period the Interval editor can edit.
+/// fields the list and schedule editors use.
 #[derive(Debug, Clone)]
 pub struct Schedule {
     pub id: String,
@@ -831,6 +831,8 @@ pub struct Schedule {
     pub cron: Option<String>,
     pub cadence_detail: Option<String>,
     pub interval_seconds: Option<u64>,
+    pub daily_time: Option<ScheduleDailyTime>,
+    pub timezone: Option<String>,
     pub enabled: Option<bool>,
     pub prompt: Option<String>,
     pub last_run: Option<DateTime<Utc>>,
@@ -848,7 +850,21 @@ impl Schedule {
             } else {
                 None
             };
-        let prompt = if v.run_config.workflow_target.is_none() {
+        let ordinary = v.run_config.workflow_target.is_none();
+        let daily_time =
+            if ordinary && v.trigger.get("type").and_then(|tag| tag.as_str()) == Some("daily") {
+                match ScheduleTriggerReq::deserialize(&v.trigger).ok() {
+                    Some(ScheduleTriggerReq::Daily {
+                        hour,
+                        minute,
+                        second,
+                    }) => ScheduleDailyTime::new(hour, minute, second),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        let prompt = if ordinary {
             v.run_config.task_message
         } else {
             None
@@ -857,6 +873,8 @@ impl Schedule {
             cron: Some(trigger_display(&v.trigger)),
             cadence_detail: Some(trigger_cadence(v.trigger, v.timezone.as_deref())),
             interval_seconds,
+            daily_time,
+            timezone: v.timezone,
             name: Some(v.name),
             enabled: Some(v.enabled),
             prompt,
@@ -864,6 +882,24 @@ impl Schedule {
             next_run: v.state.next_fire_at,
             id: v.id,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScheduleDailyTime {
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+impl ScheduleDailyTime {
+    pub(crate) fn new(hour: u8, minute: u8, second: u8) -> Option<Self> {
+        NaiveTime::from_hms_opt(hour.into(), minute.into(), second.into())?;
+        Some(Self {
+            hour,
+            minute,
+            second,
+        })
     }
 }
 
@@ -1371,6 +1407,58 @@ mod tests {
             let view: ScheduleView = serde_json::from_value(body).unwrap();
             assert_eq!(Schedule::from_view(view).interval_seconds, expected);
         }
+    }
+
+    #[test]
+    fn schedule_projection_exposes_valid_daily_clocks_and_saved_timezones() {
+        let project = |trigger, timezone, run_config| {
+            let view: ScheduleView = serde_json::from_value(serde_json::json!({
+                "id": "schedule-17",
+                "trigger": trigger,
+                "timezone": timezone,
+                "run_config": run_config,
+            }))
+            .unwrap();
+            Schedule::from_view(view)
+        };
+        let saved = project(
+            serde_json::json!({"type":"daily","hour":8,"minute":42,"second":31}),
+            Some("Asia/Shanghai"),
+            serde_json::json!({}),
+        );
+        assert_eq!(saved.daily_time, ScheduleDailyTime::new(8, 42, 31));
+        assert_eq!(saved.timezone.as_deref(), Some("Asia/Shanghai"));
+        let legacy = project(
+            serde_json::json!({"type":"daily","hour":8,"minute":42}),
+            None,
+            serde_json::json!({}),
+        );
+        assert_eq!(legacy.daily_time, ScheduleDailyTime::new(8, 42, 0));
+        assert_eq!(legacy.timezone, None);
+        assert_eq!(legacy.cadence_detail.as_deref(), Some("Daily 08:42 UTC"));
+
+        for trigger in [
+            serde_json::json!({"type":"daily","hour":24,"minute":0}),
+            serde_json::json!({"type":"daily","hour":8,"minute":60}),
+            serde_json::json!({"type":"daily","hour":8,"minute":0,"second":60}),
+            serde_json::json!({"type":"daily","hour":8,"minute":0,"second":null}),
+            serde_json::json!({"type":"daily","hour":8}),
+            serde_json::json!({"type":"future","hour":8,"minute":0}),
+        ] {
+            assert_eq!(
+                project(trigger, None, serde_json::json!({})).daily_time,
+                None
+            );
+        }
+        assert_eq!(
+            project(
+                serde_json::json!({"type":"daily","hour":8,"minute":0}),
+                None,
+                serde_json::json!({"workflow_target":{"workflow_id":"example"}}),
+            )
+            .daily_time,
+            None
+        );
     }
 
     #[test]

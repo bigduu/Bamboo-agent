@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveTime, Offset, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
@@ -358,7 +358,9 @@ pub(crate) enum SchedulePatchRejection {
     InvalidWindow,
     #[error("interval must be a positive, representable number of seconds")]
     InvalidInterval,
-    #[error("schedule no longer uses an interval trigger")]
+    #[error("daily time must be a valid hour, minute and second")]
+    InvalidDailyTime,
+    #[error("schedule no longer uses the requested trigger")]
     TriggerChanged,
     #[error("task message is required")]
     InvalidPrompt,
@@ -1305,6 +1307,96 @@ impl ScheduleStore {
         candidate.state.next_fire_at = Some(compute_patch_next_run_at(
             &candidate, existing, false, after,
         )?);
+        candidate.updated_at = now;
+
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
+    }
+
+    pub(crate) async fn patch_daily_time(
+        &self,
+        id: &str,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        if NaiveTime::from_hms_opt(hour.into(), minute.into(), second.into()).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::InvalidDailyTime,
+            ));
+        }
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        if !matches!(existing.trigger, ScheduleTrigger::Daily { .. })
+            || existing.run_config.workflow_target.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::TriggerChanged,
+            ));
+        }
+        let trigger = ScheduleTrigger::Daily {
+            hour,
+            minute,
+            second,
+        };
+        if existing.trigger == trigger {
+            return Ok(Some(existing.clone()));
+        }
+
+        let now = Utc::now();
+        let after = existing
+            .state
+            .last_scheduled_at
+            .map_or(now, |last| now.max(last));
+        // Searching immediately before the inclusive opening lets the engine
+        // return a real clock occurrence instead of clipping to the opening.
+        let after = existing
+            .start_at
+            .and_then(|start| start.checked_sub_signed(Duration::nanoseconds(1)))
+            .map_or(after, |start| after.max(start));
+        let window = ScheduleWindow {
+            start_at: None,
+            end_at: existing.end_at,
+        };
+        let no_future_occurrence = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::NoFutureOccurrence,
+            )
+        };
+        let timezone = existing.timezone.as_deref();
+        if let Some(timezone) = timezone {
+            // Daily recurrence assumes the lower bound has a representable
+            // date in the chosen zone.
+            let zone = timezone
+                .parse::<chrono_tz::Tz>()
+                .map_err(|_| no_future_occurrence())?;
+            let offset = after.with_timezone(&zone).offset().fix();
+            after
+                .naive_utc()
+                .checked_add_offset(offset)
+                .ok_or_else(no_future_occurrence)?;
+        }
+        let next_fire_at = default_trigger_engine()
+            .next_after(&trigger, timezone, after, &window)
+            .ok()
+            .flatten()
+            .ok_or_else(no_future_occurrence)?;
+        let mut candidate = existing.clone();
+        candidate.trigger = trigger;
+        candidate.state.next_fire_at = Some(next_fire_at);
         candidate.updated_at = now;
 
         let mut next = index.clone();

@@ -60,7 +60,7 @@ pub enum AppEvent {
         schedule_id: String,
         result: Loaded<String>,
     },
-    ScheduleIntervalFinished {
+    ScheduleCadenceFinished {
         generation: u64,
         schedule_id: String,
         result: Loaded<Schedule>,
