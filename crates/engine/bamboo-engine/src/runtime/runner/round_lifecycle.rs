@@ -733,7 +733,23 @@ pub(crate) async fn execute_llm_round(
             .all(|item| !item.kind().is_discovery());
     let output_limit_recovery = completion
         .output_limit_recovery()
-        .filter(|_| response_rejected && (can_resume_truncated_messages || reasoning_only));
+        .filter(|_| response_rejected && (can_resume_truncated_messages || reasoning_only))
+        .or_else(|| {
+            if output_limited
+                && stream_output
+                    .provider_transcript_items
+                    .iter()
+                    .all(|item| !item.kind().is_discovery())
+                && stream_output.tool_calls.iter().any(|call| {
+                    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                        .is_err_and(|error| error.is_eof())
+                })
+            {
+                completion.truncated_responses_client_tool_retry()
+            } else {
+                None
+            }
+        });
 
     tracing::debug!(
         "[{}] LLM response completed in {}ms, answer_chars={}, reasoning_chars={}, estimated_tokens={}, canonical_tokens={}",

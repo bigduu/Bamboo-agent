@@ -4522,8 +4522,9 @@ async fn run_pipeline_inner(
                             break;
                         }
                     }
-                    if let Some(recovery) = next.filter(|_| {
-                        !reasoning_repeated && reasoning_only
+                    if let Some(recovery) = next.filter(|candidate| {
+                        !reasoning_repeated
+                            && (reasoning_only || candidate.is_truncated_client_tool_retry())
                             && attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
                     }) {
                         let next_cost = previous_prompt_tokens.saturating_add(recovery.output_limit());
@@ -4531,7 +4532,11 @@ async fn run_pipeline_inner(
                             && check_run_budget_exceeded(&spent, &config.run_budget).is_none()
                         {
                             output_limit_recovery = Some(recovery);
-                            tracing::info!(convergence = recovery.is_convergence(), "Retrying an output-limited reasoning-only response");
+                            tracing::info!(
+                                convergence = recovery.is_convergence(),
+                                truncated_client_tool = recovery.is_truncated_client_tool_retry(),
+                                "Retrying an output-limited response"
+                            );
                             continue;
                         }
                     }
@@ -11682,7 +11687,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/responses"))
-            .and(body_partial_json(json!({"reasoning":{"effort":"max"}})))
+            .and(body_partial_json(json!({"reasoning":{"effort":"low"}})))
             .respond_with(mock_completion_sse(&[
                 json!({"type":"response.output_text.delta","item_id":"msg_partial","delta":"Partial answer"}),
                 json!({"type":"response.incomplete",
@@ -11704,7 +11709,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = canonical_usage_pipeline_config();
         config.app_data_dir = Some(dir.path().into());
-        config.reasoning_effort = Some(ReasoningEffort::Max);
+        // At low effort the truncated call has no lower-effort retry.
+        config.reasoning_effort = Some(ReasoningEffort::Low);
         let mut session = Session::new("responses-truncated", "model");
         session.add_message(Message::user("Answer the original request."));
         session
