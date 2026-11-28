@@ -46,6 +46,7 @@ const CAPABILITIES: &[&str] = &[
     "http.session_message_fork.v1",
     "sessions.manual_categories.v1",
     "sessions.create_category.v1",
+    "projects.session_category_suggestion.v1",
 ];
 
 const SUBPROTOCOLS: &[BootstrapSubprotocol] = &[
@@ -205,6 +206,7 @@ mod tests {
                     "http.session_message_fork.v1",
                     "sessions.manual_categories.v1",
                     "sessions.create_category.v1",
+                    "projects.session_category_suggestion.v1",
                 ],
                 "auth": {
                     "policy": "open",
