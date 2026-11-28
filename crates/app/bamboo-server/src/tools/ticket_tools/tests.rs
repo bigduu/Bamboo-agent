@@ -754,12 +754,14 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
             .collect::<std::collections::BTreeSet<_>>()
     };
     let expected_names = std::collections::BTreeSet::from([
+        "project_manager_work".to_string(),
         "work_overview".to_string(),
         "work_search".to_string(),
         "work_inspect".to_string(),
         "work_changes".to_string(),
         "work_update".to_string(),
         "work_dispatch".to_string(),
+        "work_project_manager".to_string(),
         #[cfg(unix)]
         "work_review".to_string(),
     ]);
@@ -819,7 +821,10 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
     assert!(ok);
     assert_eq!(result["data"]["work_count"], 0);
     let before = app.service().unwrap().published().unwrap().0;
-    for &name in NAMES {
+    for &name in NAMES
+        .iter()
+        .chain(["project_manager_work", "work_project_manager"].iter())
+    {
         for caller in [None, Some(&ordinary)] {
             let (ok, denied) = execute_overlay(tools.as_ref(), name, caller).await;
             assert!(!ok, "unauthorized initialized {name} succeeded");

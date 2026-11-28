@@ -1,5 +1,6 @@
 use actix_web::{web, HttpRequest, HttpResponse, Result};
 
+use crate::app_state::ticket_application::project_manager::manager_matches;
 use crate::app_state::AppState;
 use bamboo_engine::model_config_helper::normalize_gold_config_json;
 use bamboo_engine::session_app::metadata::{MetadataError, SessionMetadataService};
@@ -411,6 +412,31 @@ pub async fn patch_session(
             Some(None) => None,
             None => current_project.clone(),
         };
+        let membership_changed = match target.as_ref() {
+            Some(target) => current_project.as_ref() != Some(target),
+            None => current_raw.is_some(),
+        };
+        if let Some(current_project) = current_project.as_ref().filter(|_| membership_changed) {
+            match state.project_store.get(current_project) {
+                Ok(project) if manager_matches(&project, &session) => {
+                    return Ok(HttpResponse::Conflict().json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": "project_manager_membership_fixed",
+                            "message": "A Project Manager must stay in its Project"
+                        },
+                        "session_id": session_id,
+                        "project_id": current_project,
+                    })));
+                }
+                Ok(_) | Err(bamboo_projects::ProjectStoreError::NotFound(_)) => {}
+                Err(error) => {
+                    return Err(crate::error::json_internal_server_error(format!(
+                        "Failed to validate current Project: {error}"
+                    )));
+                }
+            }
+        }
 
         let current_workspace = session.workspace_path_meta();
         let current_workspace_source = session
@@ -492,10 +518,6 @@ pub async fn patch_session(
         let final_workspace_display = final_workspace
             .as_deref()
             .map(bamboo_config::paths::path_to_display_string);
-        let membership_changed = match target.as_ref() {
-            Some(target) => current_project.as_ref() != Some(target),
-            None => current_raw.is_some(),
-        };
         let workspace_changed = req.workspace_path.is_some()
             && (current_workspace.as_deref() != final_workspace_display.as_deref()
                 || (target.is_some()

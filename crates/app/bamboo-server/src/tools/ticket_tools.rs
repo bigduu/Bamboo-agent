@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::{Arc, Weak};
 
+mod project_work;
 mod schema;
 pub mod semantic_schema;
 #[cfg(test)]
@@ -51,7 +52,7 @@ pub fn overlay(
             }),
         ));
     }
-    base
+    project_work::overlay(base, &app)
 }
 
 pub struct TicketTool {

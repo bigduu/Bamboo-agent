@@ -76,6 +76,7 @@ pub(crate) mod codex_handoff;
 mod initialization;
 mod managed_work;
 mod memory_sources;
+pub(crate) mod project_manager;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod patrol_adapter;
 pub use patrol_adapter::{

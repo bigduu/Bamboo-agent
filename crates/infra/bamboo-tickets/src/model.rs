@@ -289,6 +289,8 @@ pub struct ManagedWorkRoot {
     pub model: bamboo_domain::ProviderModelRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_mode: Option<bamboo_domain::RootThinkingMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
 }
 
 impl ManagedWorkRoot {

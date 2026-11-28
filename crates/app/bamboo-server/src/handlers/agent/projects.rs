@@ -192,7 +192,7 @@ fn clear_removed_sidebar_assignments(
 
 fn apply_sidebar_snapshot(
     project: &mut ProjectManifest,
-    requested: Option<&ProjectSidebarSnapshotRequest>,
+    requested: Option<ProjectSidebar>,
     importing: bool,
     valid_roots: &BTreeMap<String, Option<String>>,
 ) -> bamboo_projects::ProjectStoreResult<()> {
@@ -202,10 +202,8 @@ fn apply_sidebar_snapshot(
         ));
     }
     let previous = project.sidebar.as_ref();
-    let Some(mut sidebar) = requested
-        .map(|snapshot| snapshot.to_sidebar(previous))
-        .or_else(|| previous.cloned())
-    else {
+    let replacing = requested.is_some();
+    let Some(mut sidebar) = requested.or_else(|| previous.cloned()) else {
         return Ok(());
     };
     let mut available = sidebar
@@ -229,7 +227,7 @@ fn apply_sidebar_snapshot(
         sidebar
             .session_sections
             .retain(|id, _| valid_roots.contains_key(id));
-    } else if requested.is_some() {
+    } else if replacing {
         for (id, target) in &sidebar.session_sections {
             let old = previous.and_then(|previous| previous.session_sections.get(id));
             // Existing entries may outlive a deleted/reassigned root. Preserve
@@ -270,6 +268,57 @@ fn apply_sidebar_snapshot(
     }
     project.sidebar = Some(sidebar);
     Ok(())
+}
+
+pub(crate) fn assign_managed_section(
+    projects: &bamboo_projects::ProjectStore,
+    project_id: &ProjectId,
+    root: &bamboo_domain::Session,
+    section_id: &str,
+) -> Result<Option<u64>, ProjectStoreError> {
+    if root.kind != SessionKind::Root
+        || root.project_id_meta().as_deref() != Some(project_id.as_str())
+    {
+        return Err(ProjectStoreError::Validation(
+            "Section requires a Root in this Project".into(),
+        ));
+    }
+    let roots = BTreeMap::from([(root.id.clone(), Some(root.root_mode_birth_token()))]);
+    let mut retried = false;
+    loop {
+        let project = projects.get(project_id)?;
+        if project.status != ProjectStatus::Active {
+            return Err(ProjectStoreError::Validation("Project is archived".into()));
+        }
+        let Some(mut sidebar) = project.sidebar else {
+            return Err(ProjectStoreError::Validation(
+                "Selected Project Section is unavailable".into(),
+            ));
+        };
+        // Preserve a move already recorded by the user for this Session.
+        if sidebar.session_sections.contains_key(&root.id) {
+            return Ok(None);
+        }
+        if !sidebar
+            .sections
+            .iter()
+            .any(|section| section.id == section_id)
+        {
+            return Err(ProjectStoreError::Validation(
+                "Selected Project Section is unavailable".into(),
+            ));
+        }
+        sidebar
+            .session_sections
+            .insert(root.id.clone(), Some(section_id.into()));
+        match projects.update(project_id, project.revision, |manifest| {
+            apply_sidebar_snapshot(manifest, Some(sidebar), false, &roots)
+        }) {
+            Ok(saved) => return Ok(Some(saved.revision)),
+            Err(ProjectStoreError::Conflict { .. }) if !retried => retried = true,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -732,7 +781,8 @@ pub async fn patch_project(
         if let Some(new_chat_worktree) = request.new_chat_worktree {
             project.new_chat_worktree = new_chat_worktree;
         }
-        apply_sidebar_snapshot(project, requested_sidebar, importing, &valid_roots)?;
+        let sidebar = requested_sidebar.map(|request| request.to_sidebar(project.sidebar.as_ref()));
+        apply_sidebar_snapshot(project, sidebar, importing, &valid_roots)?;
         Ok(())
     };
     let result = if let Some(project_path) = request.project_path.as_deref() {

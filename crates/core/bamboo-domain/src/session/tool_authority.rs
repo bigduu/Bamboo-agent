@@ -82,7 +82,7 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
 /// These are delegation or bounded business views, never raw workspace/file,
 /// process, Skill, Workflow or external-provider execution. Concrete Session
 /// ports still require their live Host instance proof; names grant nothing.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 16] = [
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 17] = [
     "SubAgent",
     "spawn_session",
     "Task",
@@ -99,7 +99,12 @@ pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 16] = [
     "work_update",
     "work_dispatch",
     "work_review",
+    "work_project_manager",
 ];
+
+/// This marker only controls schema exposure. The server separately checks the
+/// manager's canonical Project binding and exact Session lifetime.
+pub const PROJECT_MANAGER_SESSION_HINT: &str = "runtime.project_manager_session";
 
 /// Server Work operations are exposed only to the trusted Supervisor.
 pub fn supervisor_work_tool(execution_name: &str) -> bool {
@@ -202,6 +207,18 @@ impl Session {
 
     /// Defense in depth at both catalog projection and final dispatch.
     pub fn allows_model_tool_execution(&self, execution_name: &str) -> bool {
+        let project_manager = self.kind == super::SessionKind::Root
+            && self.metadata.get(PROJECT_MANAGER_SESSION_HINT) == Some(&self.id)
+            && self.project_id_meta().is_some();
+        if project_manager {
+            return matches!(
+                execution_name,
+                "project_manager_work" | "session_history_current"
+            );
+        }
+        if execution_name == "project_manager_work" {
+            return false;
+        }
         let supervisor = self.supervisor_incarnation_id().is_some();
         if supervisor_work_tool(execution_name) || execution_name == "supervisor_log_monitor" {
             return supervisor;

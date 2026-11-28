@@ -590,6 +590,38 @@ impl SupervisedRootCreator {
                 true,
             ));
         }
+        if let Some(section_id) = managed
+            .and_then(|creation| creation.spec.managed_root.as_ref())
+            .and_then(|target| target.section_id.as_deref())
+        {
+            let project_id = request.project_id.as_ref().expect("managed Work Project");
+            match crate::handlers::agent::projects::assign_managed_section(
+                &self.projects,
+                project_id,
+                &candidate,
+                section_id,
+            ) {
+                Ok(Some(revision)) => {
+                    self.account.record(
+                        None,
+                        &bamboo_agent_core::AgentEvent::ProjectUpdated {
+                            project_id: project_id.to_string(),
+                            revision,
+                        },
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Ok(blocked(
+                        operation_id,
+                        Some(&id),
+                        "section",
+                        "project_section_pending",
+                        error,
+                    ))
+                }
+            }
+        }
         // Repair only rebuildable projections, then merge through the existing
         // no-regression repository. Never replace an active cache snapshot.
         if let Err(error) = self.publish_created(&id).await {
