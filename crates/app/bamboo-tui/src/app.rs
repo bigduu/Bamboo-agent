@@ -24866,7 +24866,7 @@ mod question_tests {
         assert!(!initially.contains("Checking loop status"));
         app.handle_key(key(KeyCode::Char('l'))).await.unwrap();
         let mut first = expect_selected_loop_get(&listener, "project%2Freview").await;
-        for width in [60, 120] {
+        for width in [60, 80, 120] {
             assert!(render(&app, width).contains("Checking loop status…"));
         }
         for kind in [
@@ -24885,14 +24885,15 @@ mod question_tests {
         respond_test_http(
             &mut first,
             "application/json",
-            r#"{"session_id":"project/review","loop":{"state":"scheduled","next_fire_at":"2030-01-02T12:34:56Z","prompt":"fixture prompt stays hidden"}}"#,
+            r#"{"session_id":"project/review","loop":{"state":"scheduled","next_fire_at":"2030-01-02T12:34:56Z","mode":"fixed","interval_seconds":90,"iteration":12,"prompt":"fixture prompt stays hidden"}}"#,
         )
         .await;
         finish_selected_loop_get(&mut app, &mut rx).await;
-        for width in [60, 120] {
+        for width in [60, 80, 120] {
             let frame = render(&app, width);
             for text in [
                 "Selected · Loop scheduled · next 2030-01-02 12:34:56 UTC",
+                "Fixed · every 90s · Iteration 12",
                 "Deployment review",
                 "Build check",
                 "Enter open · d delete · r refresh · l loop status",
@@ -24927,6 +24928,36 @@ mod question_tests {
         let mut second = expect_selected_loop_get(&listener, "build").await;
         respond_test_http(
             &mut second,
+            "application/json",
+            r#"{"session_id":"build","loop":{"state":"scheduled","next_fire_at":"2030-02-03T04:05:06Z","mode":"adaptive","interval_seconds":1200,"iteration":2,"next_wakeup_reason":"fixture reason stays hidden"}}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        for width in [60, 80, 120] {
+            let frame = render(&app, width);
+            assert!(frame.contains("Loop scheduled · next 2030-02-03 04:05:06 UTC"));
+            assert!(frame.contains("Adaptive · Iteration 2"), "{frame}");
+            assert!(!frame.contains("every") && !frame.contains("fixture reason stays hidden"));
+            assert!(!frame.contains("Iteration 12"));
+        }
+
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        let mut legacy = expect_selected_loop_get(&listener, "build").await;
+        respond_test_http(
+            &mut legacy,
+            "application/json",
+            r#"{"session_id":"build","loop":{"state":"paused","next_fire_at":null}}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        let frame = render(&app, 60);
+        assert!(frame.contains("Selected · Loop paused"));
+        assert!(!frame.contains("Adaptive") && !frame.contains("Iteration"));
+
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        let mut absent = expect_selected_loop_get(&listener, "build").await;
+        respond_test_http(
+            &mut absent,
             "application/json",
             r#"{"session_id":"build","loop":null}"#,
         )
@@ -25004,7 +25035,7 @@ mod question_tests {
         respond_test_http(
             &mut stale,
             "application/json",
-            r#"{"session_id":"first","loop":null}"#,
+            r#"{"session_id":"first","loop":{"state":"scheduled","mode":"fixed","interval_seconds":3600,"iteration":999}}"#,
         )
         .await;
         finish_selected_loop_get(&mut app, &mut rx).await;
@@ -25015,7 +25046,7 @@ mod question_tests {
         respond_test_http(
             &mut fresh,
             "application/json",
-            r#"{"session_id":"first","loop":{"state":"paused","next_fire_at":null}}"#,
+            r#"{"session_id":"first","loop":{"state":"paused","next_fire_at":null,"mode":"adaptive","iteration":3}}"#,
         )
         .await;
         finish_selected_loop_get(&mut app, &mut rx).await;
@@ -25026,6 +25057,8 @@ mod question_tests {
             SessionListLoopStatus::Available(Some(SessionLoopPreview {
                 state: crate::api::SessionLoopPreviewState::Paused,
                 next_fire_at: None,
+                mode: Some(crate::api::SessionLoopPreviewMode::Adaptive),
+                iteration: Some(3),
             }))
         ));
 
