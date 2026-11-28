@@ -1981,18 +1981,21 @@ pub(crate) enum ScheduleCadenceKind {
     Interval,
     Clock(ScheduleClockKind),
     OnceAt,
+    CronExpression,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ScheduleCadenceValue {
     Interval(u64),
     Clock(ScheduleClockKind, ScheduleClockTime),
     OnceAt(DateTime<Utc>),
+    CronExpression(String),
 }
 
 const INTERVAL_INPUT_ERROR: &str = "Enter a positive whole number of seconds";
 const INTERVAL_TOO_LARGE: &str = "Interval is too large";
 const SCHEDULE_CLOCK_INPUT_ERROR: &str = "Enter a time in HH:MM or HH:MM:SS format";
+const SCHEDULE_CRON_INPUT_ERROR: &str = "Enter a Cron expression";
 
 pub(crate) struct ScheduleCadenceEdit {
     schedule_id: String,
@@ -2022,6 +2025,14 @@ impl ScheduleCadenceEdit {
             ScheduleCadenceKind::OnceAt => {
                 parse_schedule_once_at(&self.draft, Utc::now()).map(ScheduleCadenceValue::OnceAt)
             }
+            ScheduleCadenceKind::CronExpression => {
+                let expression = self.draft.trim();
+                if expression.is_empty() {
+                    Err(SCHEDULE_CRON_INPUT_ERROR)
+                } else {
+                    Ok(ScheduleCadenceValue::CronExpression(expression.to_owned()))
+                }
+            }
         }
     }
 
@@ -2029,32 +2040,42 @@ impl ScheduleCadenceEdit {
         let (allowed, limit, invalid, overflow) = match self.kind {
             ScheduleCadenceKind::Interval => (
                 character.is_ascii_digit(),
-                20,
+                Some(20),
                 INTERVAL_INPUT_ERROR,
                 INTERVAL_TOO_LARGE,
             ),
             ScheduleCadenceKind::Clock(_) => (
                 character.is_ascii_digit() || character == ':',
-                8,
+                Some(8),
                 SCHEDULE_CLOCK_INPUT_ERROR,
                 SCHEDULE_CLOCK_INPUT_ERROR,
             ),
             ScheduleCadenceKind::OnceAt => (
                 character.is_ascii_digit() || "-+:TtZz. ".contains(character),
-                64,
+                Some(64),
                 SCHEDULE_ONCE_AT_INPUT_ERROR,
                 "Once timestamp is too long",
+            ),
+            ScheduleCadenceKind::CronExpression => (
+                valid_cron_editor_character(character),
+                None,
+                SCHEDULE_CRON_INPUT_ERROR,
+                SCHEDULE_CRON_INPUT_ERROR,
             ),
         };
         if !allowed {
             self.error = Some(invalid.into());
-        } else if self.draft.len() >= limit {
+        } else if limit.is_some_and(|limit| self.draft.len() >= limit) {
             self.error = Some(overflow.into());
         } else {
             self.draft.push(character);
             self.error = None;
         }
     }
+}
+
+fn valid_cron_editor_character(character: char) -> bool {
+    !character.is_control() || matches!(character, '\t' | '\r' | '\n')
 }
 
 struct PendingSchedulePrompt {
@@ -6336,8 +6357,7 @@ impl App {
             self.refresh_transient_status(Instant::now());
             self.poll_sse();
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
-            // Other editors continue receiving the terminal's ordinary text input.
-            let wants_paste = self.chat_composer_focused();
+            let wants_paste = self.wants_bracketed_paste();
             if wants_paste != bracketed_paste {
                 let result = if wants_paste {
                     crossterm::execute!(terminal.backend_mut(), EnableBracketedPaste)
@@ -6922,6 +6942,8 @@ impl App {
                             editor.error = None;
                         }
                     }
+                } else if self.cron_editor_focused() {
+                    self.paste_cron_expression(&text);
                 } else if self.chat_composer_focused() {
                     self.pending_key_sequence = None;
                     self.insert_composer_text(&text);
@@ -10311,6 +10333,17 @@ impl App {
 
     fn chat_composer_focused(&self) -> bool {
         self.active_action_contexts()[0] == ActionContext::Chat
+    }
+
+    fn cron_editor_focused(&self) -> bool {
+        self.schedule_cadence
+            .as_ref()
+            .is_some_and(|editor| matches!(editor.kind, ScheduleCadenceKind::CronExpression))
+            && self.active_action_contexts()[0] == ActionContext::ScheduleInterval
+    }
+
+    fn wants_bracketed_paste(&self) -> bool {
+        self.chat_composer_focused() || self.cron_editor_focused()
     }
 
     pub(crate) fn workspace_context_id(&self) -> u64 {
@@ -15367,6 +15400,9 @@ impl App {
             Some(ActionId::EditScheduleOnceTime) => {
                 self.open_schedule_cadence(ScheduleCadenceKind::OnceAt)
             }
+            Some(ActionId::EditScheduleCronExpression) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::CronExpression)
+            }
             Some(ActionId::EditSchedulePrompt) => self.open_schedule_prompt(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
@@ -15574,6 +15610,13 @@ impl App {
                 };
                 (draft, None, None)
             }
+            ScheduleCadenceKind::CronExpression => {
+                let Some(expression) = &schedule.cron_expression else {
+                    return;
+                };
+                let timezone = schedule.timezone.as_deref().unwrap_or("UTC").to_owned();
+                (expression.clone(), Some(timezone), None)
+            }
             ScheduleCadenceKind::Clock(kind) => {
                 let Some(ScheduleClockTime {
                     hour,
@@ -15632,6 +15675,21 @@ impl App {
             .is_some_and(|edit| edit.schedule_id == schedule_id)
     }
 
+    fn paste_cron_expression(&mut self, text: &str) {
+        if self.schedule_cadence_is_saving() {
+            return;
+        }
+        self.pending_key_sequence = None;
+        if let Some(editor) = self.schedule_cadence.as_mut() {
+            if text.chars().all(valid_cron_editor_character) {
+                editor.draft.push_str(text);
+                editor.error = None;
+            } else {
+                editor.error = Some(SCHEDULE_CRON_INPUT_ERROR.into());
+            }
+        }
+    }
+
     fn handle_schedule_cadence_key(&mut self, key: KeyEvent) {
         // Share the existing cadence editor's input and remappable save keys.
         let action = self.resolve_context_action(ActionContext::ScheduleInterval, key);
@@ -15645,6 +15703,10 @@ impl App {
             Some(ActionId::Cancel) => self.schedule_cadence = None,
             Some(ActionId::Backspace) => {
                 edit.draft.pop();
+                edit.error = None;
+            }
+            Some(ActionId::ClearInput) => {
+                edit.draft.clear();
                 edit.error = None;
             }
             Some(ActionId::Activate) => {
@@ -15665,7 +15727,7 @@ impl App {
                 self.pending_schedule_cadence = Some(PendingScheduleCadence {
                     generation,
                     schedule_id: schedule_id.clone(),
-                    value,
+                    value: value.clone(),
                 });
                 edit.error = None;
 
@@ -15682,6 +15744,11 @@ impl App {
                         }
                         ScheduleCadenceValue::OnceAt(at) => {
                             client.update_schedule_once_at(&schedule_id, at).await
+                        }
+                        ScheduleCadenceValue::CronExpression(expression) => {
+                            client
+                                .update_schedule_cron_expression(&schedule_id, &expression)
+                                .await
                         }
                     };
                     let _ = tx.send(AppEvent::ScheduleCadenceFinished {
@@ -15729,12 +15796,19 @@ impl App {
             ScheduleCadenceValue::OnceAt(_) => {
                 ("Invalid Once time response", "Once schedule time saved")
             }
+            ScheduleCadenceValue::CronExpression(_) => (
+                "Invalid Cron expression response",
+                "Cron schedule expression saved",
+            ),
         };
-        let correct_value = |schedule: &Schedule| match pending.value {
-            ScheduleCadenceValue::Interval(seconds) => schedule.interval_seconds == Some(seconds),
-            ScheduleCadenceValue::Clock(kind, time) => schedule.clock_time(kind) == Some(time),
+        let correct_value = |schedule: &Schedule| match &pending.value {
+            ScheduleCadenceValue::Interval(seconds) => schedule.interval_seconds == Some(*seconds),
+            ScheduleCadenceValue::Clock(kind, time) => schedule.clock_time(*kind) == Some(*time),
             ScheduleCadenceValue::OnceAt(at) => {
-                schedule.once_at == Some(at) && schedule.next_run == Some(at)
+                schedule.once_at == Some(*at) && schedule.next_run == Some(*at)
+            }
+            ScheduleCadenceValue::CronExpression(expression) => {
+                schedule.cron_expression.as_deref().map(str::trim) == Some(expression.as_str())
             }
         };
         let result = result.and_then(|schedule| {
@@ -15748,10 +15822,13 @@ impl App {
             Ok(schedule) => {
                 if let Some(row) = self.schedules.schedules.iter_mut().find(|row| {
                     row.id == schedule_id
-                        && match pending.value {
+                        && match &pending.value {
                             ScheduleCadenceValue::Interval(_) => row.interval_seconds.is_some(),
-                            ScheduleCadenceValue::Clock(kind, _) => row.clock_time(kind).is_some(),
+                            ScheduleCadenceValue::Clock(kind, _) => row.clock_time(*kind).is_some(),
                             ScheduleCadenceValue::OnceAt(_) => row.once_at.is_some(),
+                            ScheduleCadenceValue::CronExpression(_) => {
+                                row.cron_expression.is_some()
+                            }
                         }
                 }) {
                     match pending.value {
@@ -15766,6 +15843,11 @@ impl App {
                         }
                         ScheduleCadenceValue::OnceAt(at) => {
                             row.once_at = Some(at);
+                            row.timezone = schedule.timezone;
+                        }
+                        ScheduleCadenceValue::CronExpression(_) => {
+                            row.cron = schedule.cron;
+                            row.cron_expression = schedule.cron_expression;
                             row.timezone = schedule.timezone;
                         }
                     }
@@ -23871,9 +23953,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    8_720_670_158_330_795_275
+                    14_204_012_440_519_388_443
                 } else {
-                    847_289_420_698_626_001
+                    1_476_286_688_018_062_438
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -26696,6 +26778,177 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn schedule_cron_expression_edits_only_ordinary_tasks_and_keeps_the_refused_draft() {
+        use tokio::io::AsyncWriteExt;
+
+        const ID: &str = "cron/review";
+        const SAVED: &str = "0\t15\n4 * * MON-FRI";
+        const ENTERED: &str = "7\t45\n9 * * MON-FRI";
+        const PREVIOUS_NEXT: &str = "2035-07-02T20:15:00Z";
+        const CONFIRMED_NEXT: &str = "2035-07-03T01:45:07Z";
+        let original = serde_json::json!({
+            "id": ID, "name": "Cron review", "enabled": false, "timezone": "Asia/Shanghai",
+            "trigger": {"type": "cron", "expr": SAVED},
+            "run_config": {"task_message": "Review the report"},
+            "state": {"next_fire_at": PREVIOUS_NEXT},
+        });
+        let mut workflow = original.clone();
+        workflow["id"] = serde_json::json!("workflow");
+        workflow["name"] = serde_json::json!("Managed review");
+        workflow["run_config"]["workflow_target"] = serde_json::json!({"workflow_id": "managed"});
+        let mut confirmed = original.clone();
+        confirmed["trigger"]["expr"] = serde_json::json!(ENTERED);
+        confirmed["state"]["next_fire_at"] = serde_json::json!(CONFIRMED_NEXT);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for refuse in [true, false] {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut connection).await;
+                let (head, body) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    head.lines().next(),
+                    Some("PATCH /api/v1/schedules/cron%2Freview/cron-expression HTTP/1.1")
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    serde_json::json!({"expr": ENTERED})
+                );
+                if refuse {
+                    connection
+                        .write_all(
+                            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    connection.shutdown().await.unwrap();
+                } else {
+                    respond_test_http(&mut connection, "application/json", &confirmed.to_string())
+                        .await;
+                }
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = [workflow, original]
+            .into_iter()
+            .map(|view| Schedule::from_view(serde_json::from_value(view).unwrap()))
+            .collect();
+        let shows_hint = |app: &App, phase: &str, hint: &str| {
+            schedule_editor_preview(app, "CRON", phase)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(hint)
+        };
+        assert!(!shows_hint(&app, "WORKFLOW", "x edit Cron expression"));
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert!(!app.wants_bracketed_paste());
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        assert!(shows_hint(&app, "READY", "x edit Cron expression"));
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        assert_eq!(app.schedule_cadence.as_ref().unwrap().draft, SAVED);
+        assert!(app.wants_bracketed_paste());
+        for width in [60, 120] {
+            let opened = schedule_editor_preview_at_width(&app, "CRON", "EDITING", width);
+            for expected in [
+                "Edit Cron expression",
+                "Expression 0 15 4 * * MON-FRI",
+                "Time zone  Asia/Shanghai",
+                "sec min hour day month weekday [year]",
+                "Enter save",
+                "Esc cancel",
+                "Ctrl+U clear",
+            ] {
+                assert!(opened.contains(expected), "{expected:?}\n{opened}");
+            }
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_cadence_is_saving());
+        assert_eq!(
+            app.schedule_cadence.as_ref().unwrap().error.as_deref(),
+            Some(SCHEDULE_CRON_INPUT_ERROR)
+        );
+        app.handle_key(key(KeyCode::Char('7'))).await.unwrap();
+        app.handle_event(AppEvent::Paste("\t45\n9 * * MON-FRI".into()))
+            .await
+            .unwrap();
+        assert_eq!(app.schedule_cadence.as_ref().unwrap().draft, ENTERED);
+        assert!(!app.schedule_cadence_is_saving());
+        for refuse in [true, false] {
+            app.handle_key(key(KeyCode::Enter)).await.unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(event, AppEvent::ScheduleCadenceFinished { .. }));
+            app.handle_event(event).await.unwrap();
+            if refuse {
+                let editor = app.schedule_cadence.as_ref().unwrap();
+                assert_eq!(editor.draft, ENTERED);
+                assert_eq!(
+                    editor.error.as_deref(),
+                    Some("Editing a Cron expression requires a newer Host")
+                );
+                assert_eq!(
+                    app.schedules.schedules[1].next_run,
+                    Some(PREVIOUS_NEXT.parse().unwrap())
+                );
+                let refused = schedule_editor_preview(&app, "CRON", "REFUSED");
+                assert!(refused.contains("Editing a Cron expression requires a newer Host"));
+                assert!(refused.contains("7 45 9 * * MON-FRI"));
+            }
+        }
+        assert!(app.schedule_cadence.is_none());
+        assert_eq!(app.status_message, "Cron schedule expression saved");
+        assert!(!app.wants_bracketed_paste());
+        assert!(app.schedules.schedules[0].cron_expression.is_none());
+        let row = &app.schedules.schedules[1];
+        assert_eq!(row.cron_expression.as_deref(), Some(ENTERED));
+        assert_eq!(row.next_run, Some(CONFIRMED_NEXT.parse().unwrap()));
+        assert_eq!(row.name.as_deref(), Some("Cron review"));
+        assert_eq!(row.enabled, Some(false));
+        assert_eq!(row.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(row.prompt.as_deref(), Some("Review the report"));
+        for width in [60, 120] {
+            let saved = schedule_editor_preview_at_width(&app, "CRON", "SAVED", width);
+            assert!(
+                saved.lines().any(|line| {
+                    line.contains("› Cron review") && line.contains("7 45 9 * * MON-FRI")
+                }),
+                "{saved}"
+            );
+        }
+
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[{"context":"schedules","action":"edit-schedule-cron-expression","keys":["F8"]}]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        assert!(shows_hint(&app, "REMAPPED", "F8 edit Cron expression"));
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        assert_eq!(app.schedule_cadence.as_ref().unwrap().draft, ENTERED);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn schedule_interval_updates_one_row_through_the_host_and_fences_catalogs() {
         use tokio::sync::oneshot;
 
@@ -27705,6 +27958,7 @@ mod question_tests {
                 id: id.to_owned(),
                 name: Some(format!("{id} schedule")),
                 cron: None,
+                cron_expression: None,
                 cadence_detail: None,
                 interval_seconds: None,
                 daily_time: None,
@@ -27802,6 +28056,7 @@ mod question_tests {
             id: "schedule".to_owned(),
             name: Some("Schedule".to_owned()),
             cron: None,
+            cron_expression: None,
             cadence_detail: None,
             interval_seconds: None,
             daily_time: None,
@@ -28347,6 +28602,7 @@ mod question_tests {
             id: format!("schedule-{index}"),
             name: Some(format!("计划 {index} 🧭")),
             cron: Some("0 * * * *".to_string()),
+            cron_expression: None,
             cadence_detail: None,
             interval_seconds: None,
             daily_time: None,

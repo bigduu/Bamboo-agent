@@ -829,6 +829,7 @@ pub struct Schedule {
     pub id: String,
     pub name: Option<String>,
     pub cron: Option<String>,
+    pub cron_expression: Option<String>,
     pub cadence_detail: Option<String>,
     pub interval_seconds: Option<u64>,
     pub daily_time: Option<ScheduleClockTime>,
@@ -854,6 +855,16 @@ impl Schedule {
                 None
             };
         let ordinary = v.run_config.workflow_target.is_none();
+        let cron_expression =
+            if ordinary && v.trigger.get("type").and_then(|tag| tag.as_str()) == Some("cron") {
+                v.trigger
+                    .get("expr")
+                    .and_then(|expr| expr.as_str())
+                    .filter(|expr| !expr.trim().is_empty())
+                    .map(str::to_owned)
+            } else {
+                None
+            };
         let once_at = v
             .state
             .next_fire_at
@@ -907,6 +918,7 @@ impl Schedule {
         };
         Self {
             cron: Some(trigger_display(&v.trigger)),
+            cron_expression,
             cadence_detail: Some(trigger_cadence(v.trigger, v.timezone.as_deref())),
             interval_seconds,
             daily_time,
@@ -1483,6 +1495,46 @@ pub struct SkillDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedule_projection_exposes_only_ordinary_saved_cron_expressions() {
+        let expression = " \t0  30 8 * * MON-FRI ";
+        let cron = serde_json::json!({"type":"cron","expr":expression});
+        let mut view = serde_json::json!({
+            "id": "cron-17",
+            "trigger": cron,
+            "timezone": "America/New_York",
+            "enabled": false,
+            "state": {"next_fire_at":"2030-04-01T12:30:00Z"},
+            "run_config": {"task_message":"Review results"},
+        });
+        let saved = Schedule::from_view(serde_json::from_value(view.clone()).unwrap());
+        assert_eq!(saved.cron_expression.as_deref(), Some(expression));
+        assert_eq!(saved.cron.as_deref(), Some(expression));
+        assert_eq!(saved.timezone.as_deref(), Some("America/New_York"));
+        assert_eq!(
+            saved.next_run,
+            Some("2030-04-01T12:30:00Z".parse().unwrap())
+        );
+        assert_eq!(saved.enabled, Some(false));
+
+        view["run_config"]["workflow_target"] = serde_json::json!({"workflow_id":"review"});
+        let workflow = Schedule::from_view(serde_json::from_value(view.clone()).unwrap());
+        assert_eq!(workflow.cron_expression, None);
+        assert_eq!(workflow.cron.as_deref(), Some(expression));
+
+        view["run_config"] = serde_json::json!({});
+        for trigger in [
+            serde_json::json!({"type":"future","expr":expression}),
+            serde_json::json!({"type":"cron","expr":" \t "}),
+            serde_json::json!({"type":"cron","expr":42}),
+            serde_json::json!({"type":"cron"}),
+        ] {
+            view["trigger"] = trigger;
+            let saved = Schedule::from_view(serde_json::from_value(view.clone()).unwrap());
+            assert_eq!(saved.cron_expression, None);
+        }
+    }
 
     #[test]
     fn schedule_projection_requires_an_ordinary_once_trigger_and_pending_state() {

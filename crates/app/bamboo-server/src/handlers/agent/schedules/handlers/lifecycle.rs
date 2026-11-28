@@ -7,8 +7,9 @@ use crate::schedule_app::{ScheduleRunJob, ScheduleRunStatus};
 
 use super::super::types::{
     CreateScheduleRequest, PatchScheduleRequest, RenameScheduleRequest, ScheduleRunRecordView,
-    ScheduleView, SetScheduleClockTimeRequest, SetScheduleDailyTimeRequest,
-    SetScheduleIntervalRequest, SetScheduleOnceAtRequest, SetSchedulePromptRequest,
+    ScheduleView, SetScheduleClockTimeRequest, SetScheduleCronExpressionRequest,
+    SetScheduleDailyTimeRequest, SetScheduleIntervalRequest, SetScheduleOnceAtRequest,
+    SetSchedulePromptRequest,
 };
 use super::super::validation::{
     resolve_create_schedule_definition, resolve_patch_schedule_definition,
@@ -201,6 +202,57 @@ pub async fn set_schedule_interval(
                 SchedulePatchRejection::NoFutureOccurrence | SchedulePatchRejection::InvalidWindow,
             ) => Ok(schedule_no_future_occurrence()),
             _ => Err(internal_server_error("change schedule interval", error)),
+        },
+    }
+}
+
+fn invalid_schedule_cron() -> HttpResponse {
+    crate::error::json_error_with_code(
+        StatusCode::BAD_REQUEST,
+        "Enter a valid Cron expression".into(),
+        Some("invalid_schedule_cron"),
+    )
+}
+
+/// `PATCH /api/v1/schedules/{schedule_id}/cron-expression`
+pub async fn set_schedule_cron_expression(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    req: Result<web::Json<SetScheduleCronExpressionRequest>>,
+) -> Result<HttpResponse> {
+    let SetScheduleCronExpressionRequest::Expression { expr } = match req {
+        Ok(req) => req.into_inner(),
+        Err(error) if error.as_response_error().status_code() == StatusCode::BAD_REQUEST => {
+            return Ok(invalid_schedule_cron());
+        }
+        Err(error) => return Err(error),
+    };
+    match state
+        .schedule_store
+        .patch_cron_expression(&path, expr)
+        .await
+    {
+        Ok(Some(schedule)) => Ok(HttpResponse::Ok().json(ScheduleView::from(schedule))),
+        Ok(None) => Ok(crate::error::json_error_with_code(
+            StatusCode::NOT_FOUND,
+            "Schedule not found".into(),
+            Some("schedule_not_found"),
+        )),
+        Err(error) => match error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<SchedulePatchRejection>())
+        {
+            Some(SchedulePatchRejection::InvalidCronExpression) => Ok(invalid_schedule_cron()),
+            Some(SchedulePatchRejection::TriggerChanged) => Ok(crate::error::json_error_with_code(
+                StatusCode::CONFLICT,
+                "Schedule no longer uses an editable Cron trigger".into(),
+                Some("schedule_trigger_changed"),
+            )),
+            Some(SchedulePatchRejection::NoFutureOccurrence) => Ok(schedule_no_future_occurrence()),
+            _ => Err(internal_server_error(
+                "change schedule Cron expression",
+                error,
+            )),
         },
     }
 }
@@ -1940,6 +1992,290 @@ mod tests {
             assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), saved);
             assert_eq!(store.get_schedule(&ended.id).await, Some(ended));
             assert_eq!(store.get_schedule(&bounded.id).await, Some(bounded));
+        }
+
+        async fn patch_cron_expression_request(
+            app: &impl Service<
+                actix_http::Request,
+                Response = ServiceResponse,
+                Error = actix_web::Error,
+            >,
+            schedule_id: &str,
+            body: &str,
+        ) -> (StatusCode, Value) {
+            let response = test::call_service(
+                app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/schedules/{schedule_id}/cron-expression"))
+                    .insert_header(("Content-Type", "application/json"))
+                    .set_payload(body.to_owned())
+                    .to_request(),
+            )
+            .await;
+            (response.status(), test::read_body_json(response).await)
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_cron_expression_respects_named_zone_window_and_admitted_runs() {
+            use chrono::Duration;
+
+            let temp_dir = tempdir().unwrap();
+            let home = temp_dir.path().to_path_buf();
+            bamboo_config::paths::init_bamboo_dir(home.clone());
+            let state = web::Data::new(AppState::new(home.clone()).await.unwrap());
+            let store = &state.schedule_store;
+            let start = (chrono::Utc::now() + Duration::days(3))
+                .date_naive()
+                .and_hms_opt(2, 0, 0)
+                .unwrap()
+                .and_utc();
+            let second_occurrence = start + Duration::days(1);
+            let end = second_occurrence + Duration::days(1) - Duration::minutes(15)
+                + Duration::seconds(7);
+            let config = ScheduleRunConfig {
+                task_message: Some("Review the saved report".into()),
+                system_prompt: Some("Keep the saved format".into()),
+                auto_execute: true,
+                ..Default::default()
+            };
+            let entry = store
+                .create_schedule_with_definition(
+                    "Cron report review".into(),
+                    true,
+                    config.clone(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(ScheduleTrigger::Cron {
+                            expr: "0 0 10 * * *".into(),
+                        }),
+                        timezone: Some("Asia/Shanghai".into()),
+                        start_at: Some(start),
+                        end_at: Some(end),
+                        misfire_policy: Some(MisFirePolicy::RunOnce),
+                        overlap_policy: Some(OverlapPolicy::Allow),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(entry.state.next_fire_at, Some(start));
+
+            let first = store.claim_due_runs(start).await.unwrap();
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].scheduled_for, start);
+            assert_eq!(first[0].run_config, config);
+            store
+                .mark_run_started(&entry.id, &first[0].run_id)
+                .await
+                .unwrap();
+            let second = store.claim_due_runs(second_occurrence).await.unwrap();
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0].scheduled_for, second_occurrence);
+            assert_eq!(second[0].run_config, config);
+
+            let before = store.get_schedule(&entry.id).await.unwrap();
+            assert_eq!(before.state.last_scheduled_at, Some(second_occurrence));
+            assert_eq!(before.state.running_run_count, 1);
+            assert_eq!(before.state.queued_run_count, 1);
+            assert_eq!(before.state.next_fire_at, None);
+            assert!(!before.enabled);
+            let records = store.list_run_records_for_schedule(&entry.id).await;
+            assert_eq!(records.len(), 2);
+            for (run_id, status) in [
+                (&first[0].run_id, ScheduleRunStatus::Running),
+                (&second[0].run_id, ScheduleRunStatus::Queued),
+            ] {
+                assert!(records
+                    .iter()
+                    .any(|record| { &record.run_id == run_id && record.status == status }));
+            }
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let before_edit = tokio::fs::read(store.index_path()).await.unwrap();
+            let (status, exhausted) =
+                patch_cron_expression_request(&app, &entry.id, r#"{"expr":"  0 0 10 * * *\t"}"#)
+                    .await;
+            assert_eq!(status, StatusCode::OK, "{exhausted}");
+            assert_eq!(
+                exhausted,
+                serde_json::to_value(ScheduleView::from(before.clone())).unwrap()
+            );
+            assert_eq!(
+                tokio::fs::read(store.index_path()).await.unwrap(),
+                before_edit
+            );
+
+            let expression = "7\t45\n9 * * *";
+            let payload = serde_json::json!({"expr":expression}).to_string();
+            let (status, view) = patch_cron_expression_request(&app, &entry.id, &payload).await;
+            assert_eq!(status, StatusCode::OK, "{view}");
+            let saved = store.get_schedule(&entry.id).await.unwrap();
+            let mut expected = before;
+            expected.trigger = ScheduleTrigger::Cron {
+                expr: expression.into(),
+            };
+            // 09:45:07 in Shanghai has passed on the last claim's date.
+            expected.state.next_fire_at = Some(end);
+            assert_ne!(saved.updated_at, expected.updated_at);
+            expected.updated_at = saved.updated_at;
+            assert_eq!(saved, expected);
+            assert_eq!(
+                view,
+                serde_json::to_value(ScheduleView::from(expected.clone())).unwrap()
+            );
+
+            let persisted = tokio::fs::read(store.index_path()).await.unwrap();
+            let padded = serde_json::json!({"expr":format!("  {expression}\t")}).to_string();
+            let (status, repeated) = patch_cron_expression_request(&app, &entry.id, &padded).await;
+            assert_eq!(status, StatusCode::OK, "{repeated}");
+            assert_eq!(repeated, view);
+            assert_eq!(
+                tokio::fs::read(store.index_path()).await.unwrap(),
+                persisted
+            );
+            assert_eq!(
+                store.list_run_records_for_schedule(&entry.id).await,
+                records
+            );
+
+            let reopened = ScheduleStore::new(home).await.unwrap();
+            assert_eq!(reopened.get_schedule(&entry.id).await, Some(expected));
+            assert_eq!(
+                reopened.list_run_records_for_schedule(&entry.id).await,
+                records
+            );
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_cron_expression_refuses_bad_input_and_ineligible_targets_without_writes(
+        ) {
+            use chrono::Duration;
+
+            let temp_dir = tempdir().unwrap();
+            let home = temp_dir.path().to_path_buf();
+            bamboo_config::paths::init_bamboo_dir(home.clone());
+            let state = web::Data::new(AppState::new(home.clone()).await.unwrap());
+            let store = &state.schedule_store;
+            let start = (chrono::Utc::now() + Duration::days(3))
+                .date_naive()
+                .and_hms_opt(2, 0, 0)
+                .unwrap()
+                .and_utc();
+            let trigger = ScheduleTrigger::Cron {
+                expr: "0 0 10 * * *".into(),
+            };
+            let bounded = store
+                .create_schedule_with_definition(
+                    "Bounded report".into(),
+                    false,
+                    Default::default(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(trigger.clone()),
+                        timezone: Some("Asia/Shanghai".into()),
+                        start_at: Some(start),
+                        end_at: Some(start + Duration::minutes(2)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let other = store
+                .create_schedule(
+                    "Other trigger".into(),
+                    ScheduleTrigger::Once { at: start },
+                    false,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            // The store can still load an old record with a Workflow on a Cron trigger.
+            let workflow = store
+                .create_schedule(
+                    "Incompatible legacy Workflow".into(),
+                    trigger,
+                    false,
+                    ScheduleRunConfig {
+                        workflow_target: Some(bamboo_domain::ScheduledWorkflowTarget {
+                            workflow_id: "fixture-workflow".into(),
+                            revision: 1,
+                            args: serde_json::json!({}),
+                        }),
+                        auto_execute: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(bounded.state.next_fire_at, Some(start));
+
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let persisted = tokio::fs::read(store.index_path()).await.unwrap();
+            for body in [
+                "{",
+                "[]",
+                r#"["0 0 10 * * *"]"#,
+                "{}",
+                r#"{"expr":42}"#,
+                r#"{"expr":"0 0 10 * * *","enabled":true}"#,
+                r#"{"expr":"0 0 10 * * *","expr":"0 30 10 * * *"}"#,
+                r#"{"expr":" \t "}"#,
+                r#"{"expr":"INVALID_PRIVATE_CRON_EXPRESSION"}"#,
+            ] {
+                let (status, reply) = patch_cron_expression_request(&app, &bounded.id, body).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body} {reply}");
+                assert_eq!(reply["error"]["type"], "api_error");
+                assert_eq!(reply["error"]["code"], "invalid_schedule_cron");
+                assert_eq!(reply["error"]["message"], "Enter a valid Cron expression");
+            }
+            let payload = r#"{"expr":"0 30 10 * * *"}"#;
+            for (id, expected_status, code) in [
+                (
+                    bounded.id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_no_future_occurrence",
+                ),
+                (
+                    other.id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_trigger_changed",
+                ),
+                (
+                    workflow.id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_trigger_changed",
+                ),
+                (
+                    "missing-schedule",
+                    StatusCode::NOT_FOUND,
+                    "schedule_not_found",
+                ),
+            ] {
+                let (status, reply) = patch_cron_expression_request(&app, id, payload).await;
+                assert_eq!(status, expected_status, "{id} {reply}");
+                assert_eq!(reply["error"]["type"], "api_error");
+                assert_eq!(reply["error"]["code"], code, "{reply}");
+            }
+            assert_eq!(
+                tokio::fs::read(store.index_path()).await.unwrap(),
+                persisted
+            );
+
+            let reopened = ScheduleStore::new(home).await.unwrap();
+            for entry in [bounded, other, workflow] {
+                assert_eq!(store.get_schedule(&entry.id).await.as_ref(), Some(&entry));
+                assert_eq!(
+                    reopened.get_schedule(&entry.id).await.as_ref(),
+                    Some(&entry)
+                );
+            }
         }
 
         async fn patch_once_at_request(
