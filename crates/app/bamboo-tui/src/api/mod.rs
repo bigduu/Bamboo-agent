@@ -1549,6 +1549,125 @@ impl BambooClient {
         Ok(schedule)
     }
 
+    pub(crate) async fn update_schedule_cron_expression(
+        &self,
+        schedule_id: &str,
+        expression: &str,
+    ) -> Result<Schedule> {
+        use reqwest::StatusCode;
+
+        #[derive(serde::Deserialize)]
+        struct CronExpressionReceipt {
+            trigger: ScheduleTriggerReq,
+            #[serde(flatten)]
+            view: ScheduleView,
+        }
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        let expression = expression.trim();
+        anyhow::ensure!(!expression.is_empty(), "Enter a valid Cron expression");
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "cron-expression"]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| {
+                anyhow::anyhow!("Could not contact the Host to update the Cron expression")
+            })?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "expr": expression }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update the Cron expression")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update the Cron expression")
+                }
+            })?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let code = match status {
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                    schedule_response_code(response).await
+                }
+                _ => None,
+            };
+            match (status, code.as_deref()) {
+                (StatusCode::BAD_REQUEST, Some("invalid_schedule_cron")) => {
+                    anyhow::bail!("Enter a valid Cron expression")
+                }
+                (StatusCode::CONFLICT, Some("schedule_trigger_changed")) => {
+                    anyhow::bail!("Schedule is no longer an editable Cron Task schedule")
+                }
+                (StatusCode::CONFLICT, Some("schedule_no_future_occurrence")) => {
+                    anyhow::bail!("Schedule has no future occurrence")
+                }
+                (StatusCode::NOT_FOUND, Some("schedule_not_found")) => {
+                    anyhow::bail!("Schedule no longer exists")
+                }
+                (StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED, _) => {
+                    anyhow::bail!("Editing a Cron expression requires a newer Host")
+                }
+                _ => anyhow::bail!(
+                    "Could not update the Cron expression (HTTP {})",
+                    status.as_u16()
+                ),
+            }
+        }
+
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::TooLarge => {
+                    anyhow::anyhow!("Cron expression response is too large (2 MiB limit)")
+                }
+                BoundedBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for the Cron expression response")
+                }
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid Cron expression response"),
+            })?;
+        let shape: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Cron expression response"))?;
+        // Keep list-row defaults separate from a receipt that will replace the
+        // row. An exhausted no-op can omit the next timestamp.
+        anyhow::ensure!(
+            shape.get("name").is_some_and(serde_json::Value::is_string)
+                && shape
+                    .get("enabled")
+                    .is_some_and(serde_json::Value::is_boolean)
+                && shape.get("state").is_some_and(serde_json::Value::is_object)
+                && shape
+                    .get("run_config")
+                    .is_some_and(serde_json::Value::is_object),
+            "Invalid Cron expression response"
+        );
+        // Decode the original bytes with a typed trigger so conflicting
+        // known keys cannot be collapsed by the object shape check.
+        let CronExpressionReceipt { trigger, mut view } = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Cron expression response"))?;
+        let ScheduleTriggerReq::Cron { expr } = trigger else {
+            anyhow::bail!("Cron expression response does not match the request");
+        };
+        anyhow::ensure!(
+            view.id == schedule_id
+                && view.run_config.workflow_target.is_none()
+                && expr.trim() == expression,
+            "Cron expression response does not match the request"
+        );
+        view.trigger = serde_json::json!({ "type": "cron", "expr": expr });
+        Ok(Schedule::from_view(view))
+    }
+
     pub(crate) async fn update_schedule_once_at(
         &self,
         schedule_id: &str,
@@ -3549,6 +3668,217 @@ mod tests {
         let (result, ()) = timeout(Duration::from_secs(5), async {
             tokio::join!(
                 client.update_schedule_once_at(TOGGLE_SCHEDULE_ID, at),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    const CRON_EXPRESSION: &str = "0  30 8 * * MON-FRI";
+
+    fn cron_expression_receipt() -> serde_json::Value {
+        serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Review results",
+            "enabled": false,
+            "trigger": {"type": "cron", "expr": CRON_EXPRESSION},
+            "timezone": "America/New_York",
+            "state": {"next_fire_at": "2030-04-01T12:30:00Z"},
+            "run_config": {"task_message": "Review results"},
+        })
+    }
+
+    #[tokio::test]
+    async fn update_schedule_cron_expression_sends_only_expr_and_keeps_canonical_state() {
+        let mut body = cron_expression_receipt();
+        let input = format!(" \t{CRON_EXPRESSION}\n");
+        let schedule = cron_expression_reply(&input, "200 OK", "", &body.to_string())
+            .await
+            .unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(schedule.name.as_deref(), Some("Review results"));
+        assert_eq!(schedule.cron.as_deref(), Some(CRON_EXPRESSION));
+        assert_eq!(schedule.cron_expression.as_deref(), Some(CRON_EXPRESSION));
+        assert_eq!(
+            schedule.next_run,
+            Some("2030-04-01T12:30:00Z".parse().unwrap())
+        );
+        assert_eq!(schedule.enabled, Some(false));
+        assert_eq!(schedule.timezone.as_deref(), Some("America/New_York"));
+        assert_eq!(schedule.prompt.as_deref(), Some("Review results"));
+
+        body["trigger"]["expr"] = serde_json::json!(input);
+        for state in [
+            serde_json::json!({}),
+            serde_json::json!({"next_fire_at":null}),
+        ] {
+            body["state"] = state;
+            let saved = cron_expression_reply(CRON_EXPRESSION, "200 OK", "", &body.to_string())
+                .await
+                .unwrap();
+            assert_eq!(
+                saved.cron_expression.as_deref(),
+                body["trigger"]["expr"].as_str()
+            );
+            assert_eq!(saved.next_run, None);
+            assert_eq!(saved.enabled, Some(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_cron_expression_rejects_mismatched_or_incomplete_receipts() {
+        let receipt = cron_expression_receipt();
+        for (path, value) in [
+            ("/id", serde_json::json!("different-id")),
+            (
+                "/trigger",
+                serde_json::json!({"type":"daily","hour":8,"minute":30,"second":0}),
+            ),
+            ("/trigger/expr", serde_json::json!("@daily")),
+            (
+                "/run_config",
+                serde_json::json!({"workflow_target":{"workflow_id":"review"}}),
+            ),
+        ] {
+            let mut body = receipt.clone();
+            *body.pointer_mut(path).unwrap() = value;
+            assert_eq!(
+                cron_expression_reply(CRON_EXPRESSION, "200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Cron expression response does not match the request"
+            );
+        }
+        for field in ["state", "run_config", "name", "enabled"] {
+            let mut body = receipt.clone();
+            body.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                cron_expression_reply(CRON_EXPRESSION, "200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid Cron expression response"
+            );
+        }
+        let body = receipt.to_string();
+        for conflicting in [
+            body.replacen(r#""id":"#, r#""id":"other","id":"#, 1),
+            body.replacen(r#""expr":"#, r#""expr":"@daily","expr":"#, 1),
+        ] {
+            assert_eq!(
+                cron_expression_reply(CRON_EXPRESSION, "200 OK", "", &conflicting)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid Cron expression response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_cron_expression_preserves_typed_refusals_and_never_falls_back() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                "invalid_schedule_cron",
+                "Enter a valid Cron expression",
+            ),
+            (
+                "409 Conflict",
+                "schedule_trigger_changed",
+                "Schedule is no longer an editable Cron Task schedule",
+            ),
+            (
+                "409 Conflict",
+                "schedule_no_future_occurrence",
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                "schedule_not_found",
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                "unknown_route",
+                "Editing a Cron expression requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                "method_not_allowed",
+                "Editing a Cron expression requires a newer Host",
+            ),
+            (
+                "503 Service Unavailable",
+                "internal_error",
+                "Could not update the Cron expression (HTTP 503)",
+            ),
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}});
+            assert_eq!(
+                cron_expression_reply(CRON_EXPRESSION, status, "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert_eq!(
+            cron_expression_reply(
+                CRON_EXPRESSION,
+                "307 Temporary Redirect",
+                "Location: /api/v1/schedules/other\r\n",
+                ""
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "Could not update the Cron expression (HTTP 307)"
+        );
+    }
+
+    async fn cron_expression_reply(
+        input: &str,
+        status: &str,
+        extra: &str,
+        body: &str,
+    ) -> Result<Schedule> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/cron-expression HTTP/1.1")
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({"expr": CRON_EXPRESSION})
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            if status.starts_with("404") || status.starts_with("405") || status.starts_with("307") {
+                assert!(timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err());
+            }
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.update_schedule_cron_expression(TOGGLE_SCHEDULE_ID, input),
                 serve
             )
         })

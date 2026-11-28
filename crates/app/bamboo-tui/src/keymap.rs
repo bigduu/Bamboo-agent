@@ -251,6 +251,7 @@ pub(crate) enum ActionId {
     EditScheduleWeeklyTime,
     EditScheduleMonthlyTime,
     EditScheduleOnceTime,
+    EditScheduleCronExpression,
     EditSchedulePrompt,
     SaveSchedulePrompt,
     OpenScheduleSessions,
@@ -995,13 +996,19 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
     spec!(
         ClearInput,
         "Clear input",
-        "Clear the focused search query",
+        "Clear the current input",
         false,
-        [SessionPickerBrowse, ModelPicker, CommandPalette],
+        [
+            SessionPickerBrowse,
+            ModelPicker,
+            CommandPalette,
+            ScheduleInterval
+        ],
         [
             (SessionPickerBrowse, "Ctrl+U"),
             (ModelPicker, "Ctrl+U"),
-            (CommandPalette, "Ctrl+U")
+            (CommandPalette, "Ctrl+U"),
+            (ScheduleInterval, "Ctrl+U")
         ]
     ),
     spec!(
@@ -1446,6 +1453,14 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [Schedules],
         [(Schedules, "o")]
+    ),
+    spec!(
+        EditScheduleCronExpression,
+        "Edit Cron schedule expression",
+        "Change the selected Cron Task schedule's saved expression",
+        false,
+        [Schedules],
+        [(Schedules, "x")]
     ),
     spec!(
         EditSchedulePrompt,

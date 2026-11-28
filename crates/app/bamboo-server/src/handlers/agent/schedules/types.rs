@@ -115,6 +115,13 @@ pub enum SetScheduleIntervalRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
+pub enum SetScheduleCronExpressionRequest {
+    // This struct variant requires named JSON fields.
+    Expression { expr: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum SetScheduleOnceAtRequest {
     // This struct variant requires named JSON fields.
     Instant { at: String },

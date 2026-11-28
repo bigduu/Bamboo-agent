@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use chrono::Utc;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -152,6 +154,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Some((ActionId::EditScheduleMonthlyTime, "edit monthly time"))
             } else if schedule.upcoming_once_at(Utc::now()).is_some() {
                 Some((ActionId::EditScheduleOnceTime, "edit once time"))
+            } else if schedule.cron_expression.is_some() {
+                Some((ActionId::EditScheduleCronExpression, "edit Cron expression"))
             } else {
                 None
             };
@@ -463,6 +467,14 @@ pub(super) fn clip_schedule_text(value: &str, width: usize) -> String {
     clip_cells(&text, width)
 }
 
+pub(super) fn cron_expression_line(expression: &str) -> Cow<'_, str> {
+    if expression.contains(char::is_control) {
+        Cow::Owned(expression.replace(char::is_control, " "))
+    } else {
+        Cow::Borrowed(expression)
+    }
+}
+
 fn schedule_row_line(
     schedule: &crate::api::types::Schedule,
     selected: bool,
@@ -487,7 +499,11 @@ fn schedule_row_line(
     };
     let marker = if selected { "›" } else { " " };
     let name = schedule.name.as_deref().unwrap_or(&schedule.id);
-    let cron = schedule.cron.as_deref().unwrap_or("-");
+    let cron = schedule
+        .cron_expression
+        .as_deref()
+        .map(cron_expression_line)
+        .unwrap_or_else(|| Cow::Borrowed(schedule.cron.as_deref().unwrap_or("-")));
 
     if width < 80 {
         // marker + two separators + status consume 16 cells; split the rest
@@ -501,7 +517,7 @@ fn schedule_row_line(
             Span::styled(" · ", row_style),
             Span::styled(truncate_cells(enabled, 8), status_style),
             Span::styled(" · ", row_style),
-            Span::styled(truncate_cells(cron, cron_width), row_style),
+            Span::styled(truncate_cells(&cron, cron_width), row_style),
         ])
     } else {
         let last_run = schedule
@@ -513,7 +529,7 @@ fn schedule_row_line(
             Span::styled(format!("{marker} "), row_style),
             Span::styled(truncate_cells(name, name_width), row_style),
             Span::styled("  ", row_style),
-            Span::styled(truncate_cells(cron, 18), row_style),
+            Span::styled(truncate_cells(&cron, 18), row_style),
             Span::styled("  ", row_style),
             Span::styled(truncate_cells(enabled, 8), status_style),
             Span::styled("  ", row_style),
@@ -539,6 +555,7 @@ mod tests {
             id: format!("schedule-{index}"),
             name: Some(format!("普通计划 {index}")),
             cron: Some("*/15 * * * *".to_string()),
+            cron_expression: None,
             enabled: Some(index.is_multiple_of(2)),
             prompt: None,
             last_run: None,

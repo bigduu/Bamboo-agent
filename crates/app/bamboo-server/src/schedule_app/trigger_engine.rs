@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use chrono::{
-    DateTime, Datelike, Days, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone,
-    Utc, Weekday,
+    DateTime, Datelike, Days, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset,
+    TimeZone, Utc, Weekday,
 };
 use chrono_tz::Tz;
 use cron::Schedule as CronSchedule;
@@ -413,6 +413,68 @@ fn apply_window(
         }
     }
     Some(candidate)
+}
+
+/// Find a real occurrence for an expression edit within the saved UTC bounds.
+pub(super) fn next_edited_cron_occurrence(
+    schedule: &CronSchedule,
+    timezone: Option<&str>,
+    after: DateTime<Utc>,
+    window: &ScheduleWindow,
+) -> Result<Option<DateTime<Utc>>, TriggerComputationError> {
+    let timezone = parse_timezone(timezone)?;
+    let Some(first_after) = DateTime::from_timestamp(after.timestamp() + 1, 0) else {
+        return Ok(None);
+    };
+    let lower = window
+        .start_at
+        .map_or(first_after, |start| start.max(first_after));
+    // The iterator adds one second to its seed and solves whole local seconds.
+    let Some(first) = DateTime::from_timestamp(
+        lower.timestamp() + i64::from(lower.timestamp_subsec_nanos() != 0),
+        0,
+    ) else {
+        return Ok(None);
+    };
+    let within_end = |candidate| window.end_at.is_none_or(|end| candidate <= end);
+    if !within_end(first) {
+        return Ok(None);
+    }
+
+    let checked_local = |instant: DateTime<Utc>| {
+        let offset = instant.with_timezone(&timezone).offset().fix();
+        instant.naive_utc().checked_add_offset(offset)
+    };
+    let search_from = |first_second: DateTime<Utc>| {
+        let seed = first_second.checked_sub_signed(Duration::seconds(1))?;
+        checked_local(seed)?;
+        checked_local(first_second)?;
+        let seed_local = seed.with_timezone(&timezone);
+        schedule
+            .after(&seed_local)
+            .map(|candidate| candidate.with_timezone(&Utc))
+            .find(|candidate| *candidate >= first)
+    };
+    let candidate = search_from(first);
+    if candidate == Some(first) {
+        return Ok(candidate);
+    }
+
+    let repeated = checked_local(first)
+        .and_then(|local| match timezone.from_local_datetime(&local) {
+            LocalResult::Ambiguous(early, late) if first == early.to_utc() => {
+                // A wall time earlier in this repeated hour can still occur after
+                // the absolute floor. Rewind just the offset change to find it.
+                first.checked_sub_signed(late.signed_duration_since(early))
+            }
+            _ => None,
+        })
+        .and_then(search_from);
+    Ok(candidate
+        .into_iter()
+        .chain(repeated)
+        .min()
+        .filter(|&next| within_end(next)))
 }
 
 impl TriggerEngine for CronBackedTriggerEngine {
@@ -841,6 +903,69 @@ mod tests {
                     .unwrap()
                     .with_timezone(&Utc)
             )
+        );
+    }
+
+    #[test]
+    fn edited_cron_uses_real_whole_second_window_boundaries() {
+        let utc = |value: &str| DateTime::parse_from_rfc3339(value).unwrap().to_utc();
+        let cron = "0 0 9 * * * *".parse().unwrap();
+        let first = utc("2027-04-04T01:00:00Z");
+        let after = utc("2027-04-04T00:59:59.5Z");
+        let find = |after, start_at, end_at| {
+            next_edited_cron_occurrence(
+                &cron,
+                Some("Asia/Shanghai"),
+                after,
+                &ScheduleWindow { start_at, end_at },
+            )
+            .unwrap()
+        };
+        assert_eq!(find(after, Some(first), Some(first)), Some(first));
+        assert_eq!(find(first, None, Some(first)), None);
+        assert_eq!(
+            find(
+                after,
+                Some(first + Duration::nanoseconds(1)),
+                Some(first + Duration::hours(1))
+            ),
+            None
+        );
+        assert_eq!(find(DateTime::<Utc>::MAX_UTC, None, None), None);
+        assert_eq!(find(after, Some(DateTime::<Utc>::MAX_UTC), None), None);
+    }
+
+    #[test]
+    fn edited_cron_picks_earliest_eligible_absolute_second_across_daylight_changes() {
+        let utc = |value: &str| DateTime::parse_from_rfc3339(value).unwrap().to_utc();
+        let early = utc("2027-11-07T05:30:00Z");
+        let late = utc("2027-11-07T06:30:00Z");
+        let cron = "0 30 1 * * * *".parse().unwrap();
+        let find = |cron, after, end_at| {
+            next_edited_cron_occurrence(
+                cron,
+                Some("America/New_York"),
+                after,
+                &ScheduleWindow {
+                    start_at: None,
+                    end_at: Some(end_at),
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(find(&cron, early - Duration::seconds(1), late), Some(early));
+        // After the first occurrence, the repeated wall minute is still upcoming.
+        assert_eq!(find(&cron, early, late), Some(late));
+        assert_eq!(find(&cron, early + Duration::minutes(15), late), Some(late));
+        // In the late half, the iterator can report the earlier stale instant first.
+        assert_eq!(find(&cron, late - Duration::minutes(15), late), Some(late));
+        assert_eq!(find(&cron, late, late), None);
+
+        let gap = "0 30 2 * * * *".parse().unwrap();
+        let after_gap = utc("2027-03-15T06:30:00Z");
+        assert_eq!(
+            find(&gap, utc("2027-03-14T06:00:00Z"), after_gap),
+            Some(after_gap)
         );
     }
 }

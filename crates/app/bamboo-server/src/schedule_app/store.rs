@@ -10,7 +10,9 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use super::log_monitor::LogMonitor;
-use super::trigger_engine::{default_trigger_engine, interval_duration, TriggerEngine};
+use super::trigger_engine::{
+    default_trigger_engine, interval_duration, next_edited_cron_occurrence, TriggerEngine,
+};
 use bamboo_domain::{
     MisFirePolicy, OverlapPolicy, ProjectId, ScheduleRunConfig, ScheduleRunRecord,
     ScheduleRunStatus, ScheduleSpec, ScheduleState, ScheduleTrigger, ScheduleWindow,
@@ -360,6 +362,8 @@ pub(crate) enum SchedulePatchRejection {
     InvalidWindow,
     #[error("interval must be a positive, representable number of seconds")]
     InvalidInterval,
+    #[error("schedule cron expression is invalid")]
+    InvalidCronExpression,
     #[error("schedule time must be a valid hour, minute and second")]
     InvalidClockTime,
     #[error("schedule no longer uses the requested trigger")]
@@ -1380,6 +1384,78 @@ impl ScheduleStore {
         candidate.trigger = trigger;
         candidate.state.next_fire_at = Some(at);
         candidate.updated_at = now;
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
+    }
+
+    pub(crate) async fn patch_cron_expression(
+        &self,
+        id: &str,
+        expression: String,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        let expression = expression.trim();
+        let invalid_expression = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::InvalidCronExpression,
+            )
+        };
+        if expression.is_empty() {
+            return Err(invalid_expression());
+        }
+
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        let old_expression = match &existing.trigger {
+            ScheduleTrigger::Cron { expr } if existing.run_config.workflow_target.is_none() => expr,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    SchedulePatchRejection::TriggerChanged,
+                ));
+            }
+        };
+        let cron = expression.parse().map_err(|_| invalid_expression())?;
+        if expression == old_expression.trim() {
+            return Ok(Some(existing.clone()));
+        }
+
+        let now = Utc::now();
+        let after = existing
+            .state
+            .last_scheduled_at
+            .map_or(now, |last| now.max(last));
+        let window = ScheduleWindow {
+            start_at: existing.start_at,
+            end_at: existing.end_at,
+        };
+        let next_fire_at =
+            next_edited_cron_occurrence(&cron, existing.timezone.as_deref(), after, &window)
+                .ok()
+                .flatten()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        SchedulePatchRejection::NoFutureOccurrence,
+                    )
+                })?;
+        let mut candidate = existing.clone();
+        candidate.trigger = ScheduleTrigger::Cron {
+            expr: expression.to_owned(),
+        };
+        candidate.state.next_fire_at = Some(next_fire_at);
+        candidate.updated_at = now;
+
         let mut next = index.clone();
         next.schedules.insert(id.to_owned(), candidate.clone());
         self.persist_updated_index(&mut next).await?;

@@ -17,6 +17,7 @@ use crate::app::{
 use crate::keymap::{ActionContext, ActionId};
 use crate::schedule_form::ScheduleField;
 use crate::theme::{self, colors};
+use crate::ui::schedules::cron_expression_line;
 use crate::ui::sessions::session_row_line_with_activity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2460,6 +2461,7 @@ fn render_schedule_editor(
             (" Edit monthly time ", "  Time: ")
         }
         Some(ScheduleCadenceKind::OnceAt) => (" Edit once time ", "  At: "),
+        Some(ScheduleCadenceKind::CronExpression) => (" Edit Cron expression ", "  Expression "),
         Some(ScheduleCadenceKind::Interval) => (" Edit interval ", "  Every (seconds): "),
         None => (" Rename schedule ", "  Name: "),
     };
@@ -2467,8 +2469,13 @@ fn render_schedule_editor(
     let inner_width = centered_rect(90, 0, screen).width.saturating_sub(2);
     let width = usize::from(inner_width);
     let cursor = if saving { "" } else { "▏" };
+    let draft = if matches!(kind, Some(ScheduleCadenceKind::CronExpression)) {
+        cron_expression_line(draft)
+    } else {
+        draft.into()
+    };
     let draft = clip_tail_cells(
-        draft,
+        &draft,
         width.saturating_sub(label.len() + usize::from(!saving)),
     );
     let muted = Style::default().fg(colors::subtle());
@@ -2482,6 +2489,12 @@ fn render_schedule_editor(
     if matches!(kind, Some(ScheduleCadenceKind::OnceAt)) {
         lines.push(Line::styled(
             "  Include Z or an offset such as +08:00.",
+            muted,
+        ));
+    }
+    if matches!(kind, Some(ScheduleCadenceKind::CronExpression)) {
+        lines.push(Line::styled(
+            "  sec min hour day month weekday [year]",
             muted,
         ));
     }
@@ -2516,17 +2529,15 @@ fn render_schedule_editor(
             ));
         }
         let key = |action| app.keymap.primary_hint(context, action);
-        lines.push(Line::styled(
-            clip_cells(
-                &format!(
-                    "  {} save · {} cancel",
-                    key(ActionId::Activate),
-                    key(ActionId::Cancel)
-                ),
-                width,
-            ),
-            muted,
-        ));
+        let mut footer = format!(
+            "  {} save · {} cancel",
+            key(ActionId::Activate),
+            key(ActionId::Cancel)
+        );
+        if matches!(kind, Some(ScheduleCadenceKind::CronExpression)) {
+            footer.push_str(&format!(" · {} clear", key(ActionId::ClearInput)));
+        }
+        lines.push(Line::styled(clip_cells(&footer, width), muted));
     }
 
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -4266,9 +4277,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             if cfg!(target_os = "macos") {
-                [2_228_013_176_627_879_010, 9_332_654_401_565_358_684]
+                [15_061_808_871_578_271_522, 3_516_938_374_668_320_756]
             } else {
-                [6_111_164_372_951_766_708, 9_737_054_689_930_209_762]
+                [4_785_597_945_545_668_380, 13_987_455_454_154_022_978]
             },
             "complete help-overlay buffer golden changed"
         );
