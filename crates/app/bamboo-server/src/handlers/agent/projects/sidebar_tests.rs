@@ -136,6 +136,7 @@ fn large_snapshot(sections: usize, assignments: usize) -> ProjectSidebar {
         .map(|index| ProjectSidebarSection {
             id: format!("section:{}", uuid::Uuid::from_u128(index as u128 + 1)),
             name: format!("Section {index}"),
+            description: None,
         })
         .collect::<Vec<_>>();
     let target = sections.first().map(|section| section.id.clone());
@@ -619,6 +620,90 @@ async fn sidebar_import_filters_confirmed_stale_assignments_and_cannot_overwrite
             .unwrap(),
         saved
     );
+}
+
+#[actix_web::test]
+async fn prompt_descriptions_follow_the_current_section_and_allow_clearing() {
+    use bamboo_engine::project_context::PROJECT_CONTEXT_RENDERED_KEY;
+
+    let (dir, state, _) = fixture().await;
+    let workspace = dir.path().join("prompt-workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let project = state
+        .project_store
+        .create_with_project_path(
+            "Prompt descriptions",
+            Some("Shared project briefing".into()),
+            workspace.to_string_lossy(),
+            Vec::new(),
+        )
+        .unwrap();
+    let mut root = save_root(&state, "brief-reader", Some(&project.id)).await;
+    let mut sidebar = snapshot(json!({"brief-reader": SECTION}));
+    sidebar["sections"][0]["description"] = json!("  First section briefing  ");
+    sidebar["sections"][1]["description"] = json!("Second section briefing");
+    for (revision, section, expected) in [
+        (1, json!(SECTION), Some("First section briefing")),
+        (2, json!(EMPTY_SECTION), Some("Second section briefing")),
+        (3, Value::Null, None),
+    ] {
+        sidebar["session_sections"]["brief-reader"] = section;
+        let mut request_sidebar = sidebar.clone();
+        if revision > 1 {
+            for section in request_sidebar["sections"].as_array_mut().unwrap() {
+                section.as_object_mut().unwrap().remove("description");
+            }
+        }
+        let response = patch(
+            &state,
+            &project.id,
+            Some(revision),
+            json!({"sidebar": request_sidebar}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body(response).await["sidebar"]["sections"][0]["description"],
+            "First section briefing"
+        );
+        state
+            .project_context_resolver
+            .refresh_session_prompt_read_only(&mut root)
+            .await
+            .unwrap();
+        let model_context = &root.metadata[PROJECT_CONTEXT_RENDERED_KEY];
+        assert!(model_context.contains("Project description: Shared project briefing"));
+        for description in ["First section briefing", "Second section briefing"] {
+            assert_eq!(
+                model_context.contains(description),
+                expected == Some(description)
+            );
+        }
+    }
+
+    assert_eq!(
+        patch(&state, &project.id, Some(4), json!({"description": null}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    sidebar["sections"][0]["description"] = Value::Null;
+    sidebar["sections"][1]["description"] = json!("  ");
+    sidebar["session_sections"]["brief-reader"] = json!(SECTION);
+    let response = patch(&state, &project.id, Some(5), json!({"sidebar": sidebar})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved = body(response).await;
+    assert!(saved["sidebar"]["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|section| section.get("description").is_none()));
+    state
+        .project_context_resolver
+        .refresh_session_prompt_read_only(&mut root)
+        .await
+        .unwrap();
+    assert!(!root.metadata[PROJECT_CONTEXT_RENDERED_KEY].contains("description:"));
 }
 
 #[actix_web::test]

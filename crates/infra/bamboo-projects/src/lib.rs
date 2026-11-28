@@ -2124,6 +2124,7 @@ mod tests {
             sections: vec![ProjectSidebarSection {
                 id: "section:2d567c47-a081-4a8d-9c9e-246bce470c9f".into(),
                 name: "Support".into(),
+                description: None,
             }],
             session_sections: BTreeMap::from([("root".into(), None)]),
             hidden_legacy: false,
@@ -2201,6 +2202,7 @@ mod tests {
             duplicate_name.sections.push(ProjectSidebarSection {
                 id: "section:28f595c0-21dc-4a86-8b83-5f8b258386fa".into(),
                 name: second.into(),
+                description: None,
             });
             invalid.push(duplicate_name);
         }

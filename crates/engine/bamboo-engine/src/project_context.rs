@@ -57,9 +57,16 @@ pub struct ProjectDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProjectContext {
     pub project: ProjectDescriptor,
+    pub descriptions: ProjectPromptDescriptions,
     pub workspace: Option<PathBuf>,
     pub workspace_source: WorkspaceSource,
     pub binding_status: WorkspaceBindingStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectPromptDescriptions {
+    pub project: Option<String>,
+    pub section: Option<bamboo_domain::ProjectSidebarSection>,
 }
 
 /// Current registry facts for a narrow Work workspace admission. These facts
@@ -185,6 +192,17 @@ pub trait ProjectContextSource: Send + Sync {
         &self,
         project_id: &ProjectId,
     ) -> Result<Option<ProjectDescriptor>, ProjectContextError>;
+
+    async fn find_session_project(
+        &self,
+        project_id: &ProjectId,
+        _session: &Session,
+    ) -> Result<Option<(ProjectDescriptor, ProjectPromptDescriptions)>, ProjectContextError> {
+        Ok(self
+            .find_project(project_id)
+            .await?
+            .map(|project| (project, ProjectPromptDescriptions::default())))
+    }
 
     async fn list_projects(&self) -> Result<Vec<ProjectDescriptor>, ProjectContextError> {
         Ok(Vec::new())
@@ -426,9 +444,9 @@ impl ProjectContextResolver {
                 return Ok(None);
             }
         };
-        let project = self
+        let (project, descriptions) = self
             .source
-            .find_project(&project_id)
+            .find_session_project(&project_id, session)
             .await?
             .ok_or_else(|| ProjectContextError::ProjectUnavailable {
                 project_id: project_id.clone(),
@@ -477,7 +495,7 @@ impl ProjectContextResolver {
             )
         };
 
-        self.resolve_assigned_project(project, workspace, workspace_source)
+        self.resolve_assigned_project(project, descriptions, workspace, workspace_source)
             .await
             .map(Some)
     }
@@ -535,6 +553,7 @@ impl ProjectContextResolver {
     async fn resolve_assigned_project(
         &self,
         project: ProjectDescriptor,
+        descriptions: ProjectPromptDescriptions,
         workspace: PathBuf,
         workspace_source: WorkspaceSource,
     ) -> Result<ResolvedProjectContext, ProjectContextError> {
@@ -566,6 +585,7 @@ impl ProjectContextResolver {
 
         Ok(ResolvedProjectContext {
             project,
+            descriptions,
             workspace: Some(workspace),
             workspace_source,
             binding_status,

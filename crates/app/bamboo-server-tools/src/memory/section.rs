@@ -1,5 +1,5 @@
 use bamboo_agent_core::tools::ToolCtx;
-use bamboo_domain::{ProjectId, ProjectStatus, Session, SessionKind};
+use bamboo_domain::{ProjectId, Session, SessionKind};
 use bamboo_engine::project_context::ProjectContextResolver;
 use bamboo_memory::memory_store::SectionId;
 
@@ -62,29 +62,9 @@ impl MemoryTool {
             .await
             .ok()?
             .ok()?;
-        if project.status != ProjectStatus::Active {
-            return None;
-        }
-        let sidebar = project.sidebar.as_ref()?;
-        let section_id = sidebar.session_sections.get(&root_id)?.as_deref()?;
-        // The legacy sidebar bucket has no stable Section record.
-        let section = sidebar
-            .sections
-            .iter()
-            .find(|section| section.id == section_id)?;
-        let birth_token = current.root_mode_birth_token();
-        let authorized = match project.sidebar_section_bindings.get(&root_id) {
-            Some(binding) => {
-                binding.section_id == section.id && binding.root_birth_token == birth_token
-            }
-            None => storage
-                .first_root_lifetime_matches(&root_id, &birth_token)
-                .await
-                .ok()?,
-        };
-        if !authorized {
-            return None;
-        }
+        let section = project
+            .resolve_root_section(&current, storage.as_ref())
+            .await?;
         SectionId::parse(section.id.as_str()).ok()
     }
 }

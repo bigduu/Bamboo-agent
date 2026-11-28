@@ -1721,6 +1721,7 @@ mod tests {
                     sections: vec![ProjectSidebarSection {
                         id: SECTION.into(),
                         name: "Inspect".into(),
+                        description: None,
                     }],
                     session_sections: [(session.id.clone(), Some(SECTION.into()))].into(),
                     hidden_legacy: false,
