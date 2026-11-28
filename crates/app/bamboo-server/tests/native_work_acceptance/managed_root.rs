@@ -787,3 +787,471 @@ async fn supervisor_cancels_managed_root_before_work_admission_and_releases_its_
     }
     state.shutdown().await;
 }
+
+// Use the same executor and verified caller envelope as a normal model turn.
+async fn project_tool(
+    state: &AppState,
+    caller: &Session,
+    name: &str,
+    args: Value,
+    success: bool,
+) -> Value {
+    let call = ToolCall {
+        id: format!("fixture-{name}"),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: name.into(),
+            arguments: args.to_string(),
+        },
+    };
+    let tools = state.tools_for(ToolSurface::Root);
+    let schemas = tools.list_tools();
+    let (tx, _rx) = mpsc::channel(16);
+    let ctx = ToolExecutionContext::for_dispatch(
+        &caller.id,
+        &caller.root_session_id,
+        &call.id,
+        &tx,
+        &schemas,
+        ToolExecutionSessionFlags::from_session(caller),
+        false,
+        None,
+        None,
+    );
+    let result = with_executing_session_caller(
+        Some(Arc::new(SessionCallerReference::from(caller))),
+        tools.execute_with_context_outcome(&call, ctx),
+    )
+    .await
+    .unwrap();
+    let ToolOutcome::Completed(result) = result else {
+        panic!("expected a tool result")
+    };
+    assert_eq!(result.success, success, "{}", result.result);
+    serde_json::from_str(&result.result).unwrap()
+}
+
+fn model_tool(request: native_work::ModelRequest, id: &str, name: &str, arguments: Value) {
+    assert!(
+        request.tools.iter().any(|tool| tool.function.name == name),
+        "model is missing {name}"
+    );
+    request
+        .reply
+        .send(LLMChunk::ToolCalls(vec![ToolCall {
+            id: id.into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.to_string(),
+            },
+        }]))
+        .unwrap();
+}
+
+async fn discover_project_tool(
+    requests: &mut mpsc::UnboundedReceiver<native_work::ModelRequest>,
+    request: native_work::ModelRequest,
+    name: &str,
+) -> native_work::ModelRequest {
+    if request.tools.iter().any(|tool| tool.function.name == name) {
+        return request;
+    }
+    model_tool(
+        request,
+        "discover-project-tool",
+        "discover_capabilities",
+        json!({"query": name}),
+    );
+    tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("follow-up model request after discovery")
+        .unwrap()
+}
+
+fn model_tool_result(request: &native_work::ModelRequest, id: &str) -> Value {
+    let result = request
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("missing model Tool result for {id}"));
+    assert_eq!(result.tool_success, Some(true), "{}", result.content);
+    serde_json::from_str(&result.content).unwrap()
+}
+
+#[actix_web::test]
+async fn existing_project_work_survives_restart_and_dispatches_into_section() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().canonicalize().unwrap();
+    let workspace = execution_workspace(&path);
+    let (send, mut requests) = mpsc::unbounded_channel();
+    let provider = Arc::new(LocalProvider {
+        requests: send,
+        calls: AtomicUsize::new(0),
+        max_requests: 8,
+    });
+    let section = format!("section:{}", uuid::Uuid::new_v4());
+    let (project_id, manager_id, work_id) = {
+        let state = web::Data::new(Box::pin(host(&path, provider.clone())).await);
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Project Manager acceptance",
+                Some("Project description fixture for the installation project".into()),
+                workspace.repo.clone(),
+                vec![WorkspaceBinding {
+                    path: workspace.worktree.clone(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .unwrap();
+        state
+            .project_store
+            .update(&project.id, project.revision, |project| {
+                project.sidebar = Some(bamboo_domain::ProjectSidebar {
+                    sections: vec![
+                        bamboo_domain::ProjectSidebarSection {
+                            id: format!("section:{}", uuid::Uuid::new_v4()),
+                            name: "Testing".into(),
+                            description: Some("Unrelated Section description fixture".into()),
+                        },
+                        bamboo_domain::ProjectSidebarSection {
+                            id: section.clone(),
+                            name: "Documentation".into(),
+                            description: Some("Documentation Section description fixture".into()),
+                        },
+                    ],
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .unwrap();
+        let (service, owner) = state
+            .tickets
+            .authority(Principal::User {
+                user_id: "host-owner".into(),
+            })
+            .await
+            .unwrap();
+        let command = service
+            .prepare_command(
+                &owner,
+                "manager-existing-work",
+                vec![
+                    Operation::Create {
+                        temp_id: "work".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: Contract {
+                            title: "Installation documentation".into(),
+                            objective: "Prepare an installation acceptance checklist.".into(),
+                            constraints: vec!["Cover a fresh installation on macOS ARM64.".into()],
+                            acceptance: vec!["List the proposed installation checks.".into()],
+                            allowed_tools: BTreeSet::from(["Task".into()]),
+                            user_acceptance_required: true,
+                        },
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::AssociateProject {
+                        ticket_id: "work".into(),
+                        project_id: project.id.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        let work_id = service.work_update(&owner, &command).unwrap().ids["work"].clone();
+        let mut ordinary = Session::new("ordinary-project-session", native_work::MODEL);
+        ordinary.set_project_id_meta(project.id.to_string());
+        state.storage.save_session(&ordinary).await.unwrap();
+        let ordinary = state
+            .storage
+            .load_session(&ordinary.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!ordinary.allows_model_tool_execution("project_manager_work"));
+        assert!(!ordinary.allows_model_tool_execution("work_project_manager"));
+        project_tool(
+            &state,
+            &ordinary,
+            "project_manager_work",
+            json!({"action":"list"}),
+            false,
+        )
+        .await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(bamboo_server::configure_routes),
+        )
+        .await;
+        let manager = owner_post!(
+            app,
+            &format!("/api/v1/projects/{}/manager", project.id),
+            &json!({}),
+            StatusCode::OK
+        );
+        let manager_id = manager["session_id"].as_str().unwrap().to_owned();
+        drop(app);
+        state.shutdown().await;
+        (project.id, manager_id, work_id)
+    };
+    let state = web::Data::new(Box::pin(host(&path, provider.clone())).await);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes),
+    )
+    .await;
+    let manager = owner_post!(
+        app,
+        &format!("/api/v1/projects/{project_id}/manager"),
+        &json!({}),
+        StatusCode::OK
+    );
+    assert_eq!(manager["session_id"], manager_id);
+    let manager = state
+        .storage
+        .load_session(&manager_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(manager.messages.iter().any(|message| message
+        .content
+        .contains("You are this Project's Project Manager")));
+    let view = project_tool(
+        &state,
+        &manager,
+        "project_manager_work",
+        json!({"action":"list"}),
+        true,
+    )
+    .await;
+    assert_eq!(view["board"]["data"]["rows"][0]["ticket"]["id"], work_id);
+    assert_eq!(view["sections"][1]["id"], section);
+    let start = json!({
+        "action": "start",
+        "operation_id": uuid::Uuid::new_v4(),
+        "work_id": work_id,
+        "section_id": section,
+    });
+    let mut outside = start.clone();
+    outside["work_id"] = json!("another-project-ticket");
+    project_tool(&state, &manager, "project_manager_work", outside, false).await;
+    let mut ungrouped = start.clone();
+    ungrouped["section_id"] = Value::Null;
+    let refused = project_tool(&state, &manager, "project_manager_work", ungrouped, false).await;
+    assert!(refused["error"]
+        .as_str()
+        .unwrap()
+        .contains("Project Section"));
+    owner_post!(
+        app,
+        "/api/v1/chat",
+        &json!({
+            "session_id": manager.id,
+            "message": format!("Start Work {work_id}. Choose an existing Section based on the card."),
+            "model": native_work::MODEL,
+        }),
+        StatusCode::CREATED
+    );
+    owner_post!(
+        app,
+        &format!("/api/v1/execute/{}", manager.id),
+        &json!({ "model": native_work::MODEL }),
+        StatusCode::ACCEPTED
+    );
+    let intake = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("Project Manager model request")
+        .unwrap();
+    assert!(intake.messages.iter().any(|message| message
+        .content
+        .contains("You are this Project's Project Manager")));
+    assert!(!intake
+        .tools
+        .iter()
+        .any(|tool| matches!(tool.function.name.as_str(), "Bash" | "work_dispatch")));
+    let intake = discover_project_tool(&mut requests, intake, "project_manager_work").await;
+    model_tool(
+        intake,
+        "inspect-project-ticket",
+        "project_manager_work",
+        json!({"action":"inspect", "work_id":work_id}),
+    );
+    let routing = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("Project Manager model request with the original Work")
+        .unwrap();
+    let details = model_tool_result(&routing, "inspect-project-ticket");
+    assert_eq!(details["ticket"]["id"], work_id);
+    assert_eq!(
+        details["ticket"]["contract"]["title"],
+        "Installation documentation"
+    );
+    assert!(details["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|choice| choice["id"] == section && choice["name"] == "Documentation"));
+    model_tool(
+        routing,
+        "start-project-ticket",
+        "project_manager_work",
+        start.clone(),
+    );
+    let first = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("first dispatch model request")
+        .unwrap();
+    let second = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("second dispatch model request")
+        .unwrap();
+    let (routed, worker) = if first
+        .messages
+        .iter()
+        .any(|message| message.tool_call_id.as_deref() == Some("start-project-ticket"))
+    {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let launch = model_tool_result(&routed, "start-project-ticket");
+    assert_eq!(launch["errors"], json!([]));
+    routed
+        .reply
+        .send(LLMChunk::Token("The original Work is dispatched.".into()))
+        .unwrap();
+    let manager = state
+        .storage
+        .load_session(&manager_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let replay = project_tool(&state, &manager, "project_manager_work", start, true).await;
+    assert_eq!(launch["receipt"], replay["receipt"]);
+    let assignment_id = launch["receipt"]["ids"]["assignment"].as_str().unwrap();
+    let (service, owner) = state
+        .tickets
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        worker
+            .tools
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Task"]
+    );
+    assert!(!worker.messages.iter().any(|message| message
+        .content
+        .contains("You are this Project's Project Manager")));
+    for expected in [
+        "Project description fixture for the installation project",
+        "Current Section: Documentation",
+        "Documentation Section description fixture",
+    ] {
+        assert!(
+            worker
+                .messages
+                .iter()
+                .any(|message| message.content.contains(expected)),
+            "{expected}"
+        );
+    }
+    assert!(!worker.messages.iter().any(|message| message
+        .content
+        .contains("Unrelated Section description fixture")));
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.assignments.len(), 1);
+    let receipt = snapshot.assignments[assignment_id]
+        .runtime
+        .as_ref()
+        .unwrap();
+    let session = state
+        .storage
+        .load_session(&receipt.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.kind, SessionKind::Root);
+    assert_eq!(
+        session.project_id_meta().as_deref(),
+        Some(project_id.as_str())
+    );
+    let manifest = state.project_store.get(&project_id).unwrap();
+    assert_eq!(
+        manifest.sidebar.unwrap().session_sections[&session.id].as_deref(),
+        Some(section.as_str())
+    );
+    assert_eq!(
+        manifest.sidebar_section_bindings[&session.id].root_birth_token,
+        session.root_mode_birth_token()
+    );
+    worker.reply.send(LLMChunk::ToolCalls(vec![ToolCall {
+        id: "project-worker-task".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "Task".into(),
+            arguments: json!({"tasks":[{"id":"done","content":"Prepare installation checks","status":"completed"}]}).to_string(),
+        },
+    }])).unwrap();
+    let completion = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(completion
+        .messages
+        .iter()
+        .any(
+            |message| message.tool_call_id.as_deref() == Some("project-worker-task")
+                && message.tool_success == Some(true)
+        ));
+    completion
+        .reply
+        .send(LLMChunk::Token(RESULT.into()))
+        .unwrap();
+
+    let submission_id = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(id) = &service.published().unwrap().1.tickets[&work_id].current_submission {
+                break id.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("result published to the original Work");
+    let facts = service
+        .work_submission_facts(&owner, &work_id, &submission_id, None)
+        .unwrap()
+        .data;
+    assert_eq!(facts.assignment.id, assignment_id);
+    assert_eq!(
+        service.published().unwrap().1.tickets[&work_id].state,
+        WorkState::Submitted
+    );
+    assert_eq!(
+        facts.submission.artifacts[0].sha256,
+        content_hash(RESULT.as_bytes())
+    );
+    let card = owner_post!(
+        app,
+        "/api/v1/tickets/inspect",
+        &json!({"ids":[work_id],"sections":["submissions"],"depth":0,"budget_bytes":65536,"fixed_commit":null}),
+        StatusCode::OK
+    );
+    assert_eq!(card["data"][0]["ticket"]["id"], work_id);
+    assert_eq!(card["data"][0]["submissions"][0]["id"], submission_id);
+    drop(app);
+    state.shutdown().await;
+}

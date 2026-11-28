@@ -14,6 +14,10 @@ use std::path::{Component, Path, PathBuf};
 
 type Response = Result<HttpResponse, AppError>;
 
+pub(crate) fn list_git_worktrees(repo: &Path) -> Result<Vec<git::Worktree>, String> {
+    git::list_until(repo, std::time::Instant::now() + git::inventory_budget())
+}
+
 fn project(state: &AppState, id: &str) -> Result<ProjectManifest, AppError> {
     let id = ProjectId::parse(id).map_err(|e| AppError::BadRequest(e.to_string()))?;
     state

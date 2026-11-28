@@ -724,7 +724,11 @@ impl AppState {
             messenger: session_messenger.clone(),
             account: account_sink.clone(),
         });
-        tickets.bind_managed_work_host(root_creator.clone(), provider_registry.clone());
+        tickets.bind_managed_work_host(
+            root_creator.clone(),
+            persistence.clone(),
+            provider_registry.clone(),
+        );
         let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
         let workflow_workspace_scope_guard =
             Arc::new(crate::workflow::WorkflowWorkspaceScopeGuard::default());

@@ -126,6 +126,8 @@ impl OverlayToolExecutor {
                 "work_changes",
                 "work_update",
                 "work_dispatch",
+                "project_manager_work",
+                "work_project_manager",
             ]
             .iter()
             .any(|name| self.overlay.name().eq_ignore_ascii_case(name));

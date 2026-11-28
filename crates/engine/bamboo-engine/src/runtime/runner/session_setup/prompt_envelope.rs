@@ -339,6 +339,7 @@ pub(crate) fn build_supervisor_route_observation(
                 super::tool_schemas::offers_session_control_action(schema, action)
             }))
         };
+    let manager = route("work_project_manager");
     let observation = serde_json::json!({
         "main_execution": {
             "spawn_session": exposure(route("spawn_session")),
@@ -346,15 +347,20 @@ pub(crate) fn build_supervisor_route_observation(
             "session_control.followup": control_action("followup"),
             "session_message.send": exposure(route("session_message")),
             "work_dispatch": exposure(route("work_dispatch")),
+            "work_project_manager": exposure(manager),
         },
         "auxiliary": { "SubAgent": exposure(route("SubAgent")) },
     });
+    let mut content = format!("Current delegation route observation: {observation}");
+    if manager.is_some() {
+        content.push_str(" For a Project's status or next steps, use work_project_manager to locate and inspect its board. Send Project planning and execution requests to its Project Manager. Use the direct Work and Session routes for standalone assignments or when the user explicitly asks you to own execution coordination.");
+    }
     Some(ContextBlock::new(
         ContextBlockType::RootOrchestration,
         ContextBlockPriority::High,
         ContextBlockStability::RoundDynamic,
         "Supervisor Delegation Routes",
-        format!("Current delegation route observation: {observation}"),
+        content,
     ))
 }
 

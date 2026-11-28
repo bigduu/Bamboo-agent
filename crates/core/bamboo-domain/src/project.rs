@@ -171,6 +171,14 @@ pub struct ProjectSidebarSectionBinding {
     pub root_birth_token: String,
 }
 
+/// Host-owned binding to the independent Project Manager Root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectManagerBinding {
+    pub session_id: uuid::Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Authoritative `${BAMBOO_DATA_DIR}/projects/<id>/project.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectManifest {
@@ -191,6 +199,8 @@ pub struct ProjectManifest {
     /// Root IDs mapped to the lifetimes authorized by the sidebar CAS.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sidebar_section_bindings: BTreeMap<String, ProjectSidebarSectionBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_manager: Option<ProjectManagerBinding>,
     #[serde(default)]
     pub status: ProjectStatus,
     /// Canonical user source/work folder used when an assigned session has no
@@ -273,6 +283,7 @@ impl ProjectManifest {
             section: None,
             sidebar: None,
             sidebar_section_bindings: BTreeMap::new(),
+            project_manager: None,
             status: ProjectStatus::Active,
             project_path: None,
             project_path_status: ProjectPathStatus::NeedsConfiguration,
@@ -302,6 +313,7 @@ impl ProjectManifest {
     /// Keep the public Project representation free of server-owned bindings.
     pub fn into_public_view(mut self) -> Self {
         self.sidebar_section_bindings.clear();
+        self.project_manager = None;
         self
     }
 }
