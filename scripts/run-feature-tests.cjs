@@ -307,7 +307,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // The Ticket Creator changes the existing Server Tools and Engine sources.
 // Its native Project admission case uses native_work_acceptance in
 // server-tests-1. Additive selections stay intact.
-const FEATURE_SOURCE_SHA256 = "a9a80c4ac31f9985f4d3e02487d79004eda9693019949b4b055fc363a11c61ed";
+// Project scan uses native_work_acceptance in server-tests-1. Required-file
+// checks stay with default Tickets in packages-0, and summary parsing stays
+// with the default Orchestration owner. Additive case selections stay intact.
+const FEATURE_SOURCE_SHA256 = "e44ef6ef3611644e3fe3881f7f630f7dc7b328fe6b33a550193e1a861dfbf5af";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

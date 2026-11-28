@@ -106,6 +106,21 @@ impl Snapshot {
 }
 
 impl TicketService {
+    /// Read-only Host preflight for a declared input. Use the Assignment Read
+    /// path and file limits without collecting any source bytes or granting tools.
+    pub fn verify_work_input(&self, workspace: &ExecutionWorkspace, relative: &str) -> Result<()> {
+        if !valid_relative_input(relative) {
+            return Err(Error::ScopeDenied("invalid worktree-relative input".into()));
+        }
+        let path = Path::new(&workspace.worktree).join(relative);
+        let (dir, name) = {
+            let store = self.inner.lock().expect("store mutex");
+            let root = file_root(&store, workspace, &path)?;
+            physical::parent(root, &path)?
+        };
+        physical::verify_read_source(&dir, &name)
+    }
+
     /// Identity and tools come from a creation-fenced Host Run. Callers must
     /// preserve the native permission gate before this Rust-only port.
     pub fn workspace_file(
@@ -317,6 +332,17 @@ impl TicketService {
     }
 }
 
+pub(crate) fn valid_relative_input(path: &str) -> bool {
+    path.len() <= 256
+        && !path.contains(['\\', ':'])
+        && !path.chars().any(char::is_control)
+        && path.split('/').all(|part| {
+            !matches!(part, "" | "." | "..")
+                && !part.eq_ignore_ascii_case(".git")
+                && !part.eq_ignore_ascii_case(".bamboo")
+        })
+}
+
 fn file_root<'a>(
     store: &store::FileStore,
     workspace: &'a ExecutionWorkspace,
@@ -444,12 +470,16 @@ mod physical {
     pub(super) fn read_source(dir: &File, name: &CString) -> Result<Option<FileContents>> {
         read_bounded(dir, name, READ_SOURCE_BYTES_LIMIT, true)
     }
-    fn read_bounded(
+    pub(super) fn verify_read_source(dir: &File, name: &CString) -> Result<()> {
+        open_bounded(dir, name, READ_SOURCE_BYTES_LIMIT)?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound).into())
+            .map(|_| ())
+    }
+    fn open_bounded(
         dir: &File,
         name: &CString,
         limit: usize,
-        stable: bool,
-    ) -> Result<Option<FileContents>> {
+    ) -> Result<Option<(File, std::fs::Metadata)>> {
         let file = match open(dir, name, libc::O_RDONLY | libc::O_NONBLOCK) {
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             other => other?,
@@ -463,6 +493,17 @@ mod physical {
         if meta.len() > limit as u64 {
             return Err(Error::ContextBudgetExceeded);
         }
+        Ok(Some((file, meta)))
+    }
+    fn read_bounded(
+        dir: &File,
+        name: &CString,
+        limit: usize,
+        stable: bool,
+    ) -> Result<Option<FileContents>> {
+        let Some((file, meta)) = open_bounded(dir, name, limit)? else {
+            return Ok(None);
+        };
         let mut bytes = Vec::new();
         (&file).take((limit + 1) as u64).read_to_end(&mut bytes)?;
         if bytes.len() > limit {
@@ -585,6 +626,9 @@ mod physical {
         Err(unavailable())
     }
     pub(super) fn read_source(_: &(), _: &()) -> Result<Option<FileContents>> {
+        Err(unavailable())
+    }
+    pub(super) fn verify_read_source(_: &(), _: &()) -> Result<()> {
         Err(unavailable())
     }
     pub fn create_absent(_: &(), _: &(), _: &[u8]) -> Result<()> {

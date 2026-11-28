@@ -220,6 +220,7 @@ fn project_draft_brief_is_bound_once_and_follows_the_work_to_execution() {
         facts: vec!["Cover a fresh installation.".into()],
         decisions: vec!["Use the existing test document.".into()],
         open_questions: Vec::new(),
+        required_files: BTreeSet::new(),
         sources: vec![DraftSource {
             message_id: "source-message".into(),
             content_sha256: content_hash(b"source text"),

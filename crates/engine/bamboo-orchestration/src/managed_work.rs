@@ -27,19 +27,20 @@ pub const WORK_HANDOFF_GUIDANCE: &str = concat!(
 );
 
 pub fn validate_start(spec: &DispatchSpec) -> Result<()> {
-    if spec.workspace.is_none()
-        || !spec.contract.allowed_tools.contains("Task")
-        || spec
-            .contract
-            .allowed_tools
-            .iter()
-            .any(|tool| !matches!(tool.as_str(), "Read" | "Task"))
-    {
+    if spec.workspace.is_none() || !supports_contract(&spec.contract) {
         return Err(Error::ScopeDenied(
             "Managed Work requires an explicit worktree and a Task or Read/Task contract".into(),
         ));
     }
     Ok(())
+}
+
+pub(crate) fn supports_contract(contract: &Contract) -> bool {
+    contract.allowed_tools.contains("Task")
+        && contract
+            .allowed_tools
+            .iter()
+            .all(|tool| matches!(tool.as_str(), "Read" | "Task"))
 }
 
 pub fn first_instruction(

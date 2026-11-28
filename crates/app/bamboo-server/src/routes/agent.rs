@@ -334,6 +334,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::post().to(crate::app_state::ticket_application::project_manager::open),
         )
         .route(
+            "/projects/{project_id}/scan",
+            web::get().to(crate::app_state::ticket_application::project_scan::status),
+        )
+        .route(
+            "/projects/{project_id}/scan",
+            web::post().to(crate::app_state::ticket_application::project_scan::control),
+        )
+        .route(
             "/projects/{project_id}",
             web::get().to(agent::projects::get_project),
         )

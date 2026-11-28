@@ -32,7 +32,7 @@ pub async fn open(
     ))
 }
 
-async fn ensure_manager(
+pub(super) async fn ensure_manager(
     projects: &bamboo_projects::ProjectStore,
     persistence: &bamboo_storage::LockedSessionStore,
     config: &RwLock<Config>,
@@ -116,7 +116,7 @@ async fn ensure_manager(
     Err(Error::RevisionConflict)
 }
 
-fn active_project(
+pub(super) fn active_project(
     store: &bamboo_projects::ProjectStore,
     id: &ProjectId,
 ) -> Result<ProjectManifest> {
@@ -411,7 +411,7 @@ impl TicketApplication {
     }
 }
 
-fn selected_workspace(
+pub(super) fn selected_workspace(
     project: &ProjectManifest,
     requested: Option<&str>,
 ) -> Result<(WorkspaceBinding, ExecutionWorkspace)> {
@@ -477,6 +477,7 @@ impl TicketApplication {
             .await?
             .filter(|session| caller.matches_session(session))
             .ok_or_else(|| Error::ScopeDenied("Project Manager Session changed".into()))?;
+        let scan = super::project_scan::latest_permit(&manager)?;
         let iteration = manager
             .messages
             .iter()
@@ -488,7 +489,7 @@ impl TicketApplication {
                     .as_ref()
                     .is_some_and(|metadata| metadata["runtime_kind"] == "paced_loop_iteration")
             });
-        if iteration.is_some() {
+        if iteration.is_some() && scan.is_none() {
             return Err(Error::ScopeDenied(
                 "Automatic Project dispatch requires a scan permit".into(),
             ));
@@ -499,6 +500,9 @@ impl TicketApplication {
             &project.id,
             operation_id,
         )?;
+        let key = scan
+            .as_ref()
+            .map_or(key, super::project_scan::Permit::start_key);
         let (service, _) = self.authority(coordinator()).await?;
         let mut snapshot = service.published()?.1;
         if snapshot.project.links.get(work_id) != Some(&project.id) {
@@ -525,6 +529,9 @@ impl TicketApplication {
             return self
                 .enqueue_receipt(&service, &stored, receipt.clone())
                 .await;
+        }
+        if let Some(scan) = &scan {
+            scan.validate_work(&project.id, &snapshot, ticket)?;
         }
         if let Some(assignment) = &ticket.active_assignment {
             return Ok(
@@ -565,6 +572,11 @@ impl TicketApplication {
         .await
         .map_err(|error| Error::AuthorityUnavailable(error.to_string()))??;
         bamboo_engine::ticket_worker_plan::files::verify_workspace(workspace.clone()).await?;
+        super::project_scan::verify_required_inputs(&service, ticket, &workspace).await?;
+        let _scan_guard = match &scan {
+            Some(scan) => Some(self.scan_start_guard(scan).await?),
+            None => None,
+        };
         let latest_context = snapshot
             .project
             .work_contexts
@@ -583,6 +595,7 @@ impl TicketApplication {
             sources: latest_context
                 .map_or_else(Default::default, |context| context.sources.clone()),
         };
+        let mut prepared_record_revision = ticket.record_revision;
         // Creating a Draft is independent of execution preparation. Adopt the
         // current snapshot while the Work is stopped, then claim that revision.
         if latest_context != Some(&context) {
@@ -605,6 +618,7 @@ impl TicketApplication {
                 source: None,
             };
             self.update(coordinator(), &prepare).await?;
+            prepared_record_revision += 1;
             snapshot = service.published()?.1;
         }
         let ticket = snapshot
@@ -623,6 +637,12 @@ impl TicketApplication {
                 .get(work_id)
                 .and_then(|hash| snapshot.project.contexts.get(hash))
                 != Some(&context)
+        {
+            return Err(Error::RevisionConflict);
+        }
+        if scan.is_some()
+            && (ticket.record_revision != prepared_record_revision
+                || !bamboo_orchestration::project_scan::eligible(&snapshot, &project.id, ticket))
         {
             return Err(Error::RevisionConflict);
         }

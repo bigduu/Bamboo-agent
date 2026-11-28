@@ -53,6 +53,9 @@ pub struct DraftBrief {
     pub facts: Vec<String>,
     pub decisions: Vec<String>,
     pub open_questions: Vec<String>,
+    /// Explicit source inputs, relative to the isolated execution worktree.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub required_files: BTreeSet<String>,
     pub sources: Vec<DraftSource>,
 }
 

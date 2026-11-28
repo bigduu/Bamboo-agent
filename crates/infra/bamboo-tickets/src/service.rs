@@ -835,6 +835,18 @@ fn apply(
             {
                 return Err(invalid("Draft brief needs bounded source references"));
             }
+            if brief.required_files.len() > 8
+                || brief
+                    .required_files
+                    .iter()
+                    .any(|path| !crate::workspace_files::valid_relative_input(path))
+                || (!brief.required_files.is_empty()
+                    && !work.contract.allowed_tools.contains("Read"))
+            {
+                return Err(invalid(
+                    "Required files need Read and at most eight worktree-relative paths",
+                ));
+            }
             work.draft_brief = Some(brief.clone());
             work.record_revision += 1;
             work.updated_seq = seq;
