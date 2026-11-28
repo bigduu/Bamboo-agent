@@ -423,6 +423,7 @@ mod tests {
                 user_acceptance_required: false,
                 allowed_tools: ["Task".into()].into(),
             },
+            draft_brief: None,
             workspace: Some(ExecutionWorkspace {
                 repo: "fixture".into(),
                 base_commit: "base".into(),

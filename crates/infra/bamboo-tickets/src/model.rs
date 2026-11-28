@@ -39,6 +39,23 @@ pub struct Contract {
     pub allowed_tools: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DraftSource {
+    pub message_id: String,
+    pub content_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DraftBrief {
+    pub source_session_id: String,
+    pub facts: Vec<String>,
+    pub decisions: Vec<String>,
+    pub open_questions: Vec<String>,
+    pub sources: Vec<DraftSource>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Ticket {
     pub id: String,
@@ -50,6 +67,8 @@ pub struct Ticket {
     pub contract_revision: u64,
     pub generation: u64,
     pub contract: Contract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_brief: Option<DraftBrief>,
     /// User planning metadata; medium is the legacy default, not a runtime grant.
     #[serde(default, skip_serializing_if = "crate::planning::is_default_priority")]
     pub priority: bamboo_domain::TaskPriority,
@@ -514,6 +533,10 @@ pub enum Operation {
     SetProjectContext {
         work_id: String,
         context: crate::ProjectContextSnapshot,
+    },
+    SetDraftBrief {
+        work_id: String,
+        brief: DraftBrief,
     },
     Create {
         temp_id: String,

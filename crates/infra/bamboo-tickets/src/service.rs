@@ -803,6 +803,42 @@ fn apply(
             authority.supervisor()?;
             crate::project::set_context(snapshot, &resolve(work_id, ids), context)?;
         }
+        SetDraftBrief { work_id, brief } => {
+            authority.supervisor()?;
+            let id = resolve(work_id, ids);
+            if !snapshot.project.links.contains_key(&id) {
+                return Err(invalid("Draft brief requires a Project"));
+            }
+            let work = snapshot
+                .tickets
+                .get_mut(&id)
+                .ok_or_else(|| invalid("Work not found"))?;
+            if work.kind != TicketKind::Work
+                || work.state != WorkState::Draft
+                || work.generation != 0
+                || work.draft_brief.is_some()
+            {
+                return Err(invalid("Draft brief must be adopted once on a new Draft"));
+            }
+            if brief.source_session_id.is_empty()
+                || brief.sources.is_empty()
+                || brief.sources.len() > 16
+                || canonical_bytes(brief)?.len() > 8192
+                || brief.sources.iter().any(|source| {
+                    source.message_id.is_empty()
+                        || source.content_sha256.len() != 64
+                        || !source
+                            .content_sha256
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                return Err(invalid("Draft brief needs bounded source references"));
+            }
+            work.draft_brief = Some(brief.clone());
+            work.record_revision += 1;
+            work.updated_seq = seq;
+        }
         Create {
             temp_id,
             kind,
@@ -828,6 +864,7 @@ fn apply(
                     contract_revision: 1,
                     generation: 0,
                     contract: contract.clone(),
+                    draft_brief: None,
                     priority: Default::default(),
                     expected_completion_at: None,
                     state: WorkState::Draft,
@@ -1984,7 +2021,7 @@ fn apply(
             }
             let id = allocate(temp_id, ids)?;
             snapshot.tickets.insert(id.clone(), Ticket { id, scope_id: snapshot.binding.scope_id.clone(), kind: TicketKind::Work,
-                parent: None, depends_on: BTreeSet::new(), record_revision: 1, contract_revision: 1, generation: 0, contract: contract.clone(), priority: Default::default(), expected_completion_at: None,
+                parent: None, depends_on: BTreeSet::new(), record_revision: 1, contract_revision: 1, generation: 0, contract: contract.clone(), draft_brief: None, priority: Default::default(), expected_completion_at: None,
                 state: WorkState::Blocked, blocked: Some(BlockReason { reason: "imported legacy task requires explicit review; no runtime ownership transferred".into(), resume_state: WorkState::Submitted }),
                 paused: false, archived: false, active_assignment: None, current_submission: None, accepted_submission: None, updated_seq: seq, import_source: Some(source.clone()) });
             snapshot.graph_revision += 1;
