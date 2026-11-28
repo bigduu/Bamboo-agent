@@ -958,6 +958,7 @@ async fn existing_project_work_survives_restart_and_dispatches_into_section() {
         max_requests: 8,
     });
     let section = format!("section:{}", uuid::Uuid::new_v4());
+    let source_pins = BTreeMap::from([("installation-requirements".into(), "revision-1".into())]);
     let (project_id, manager_id, work_id) = {
         let state = web::Data::new(Box::pin(host(&path, provider.clone())).await);
         let project = state
@@ -1028,6 +1029,31 @@ async fn existing_project_work_survives_restart_and_dispatches_into_section() {
             )
             .unwrap();
         let work_id = service.work_update(&owner, &command).unwrap().ids["work"].clone();
+        let current_project = state.project_store.get(&project.id).unwrap();
+        let work = service.published().unwrap().1.tickets[&work_id].clone();
+        let adopt_context = service
+            .prepare_command(
+                &owner,
+                "project-manager-initial-adopted-context",
+                vec![Operation::SetProjectContext {
+                    work_id: work_id.clone(),
+                    context: ProjectContextSnapshot {
+                        project_id: project.id.clone(),
+                        project_revision: current_project.revision,
+                        resource_revision: current_project.resource_revision,
+                        workspace_binding: current_project.workspace_bindings[0].clone(),
+                        contract_revision: work.contract_revision,
+                        contract: work.contract,
+                        sources: source_pins.clone(),
+                    },
+                }],
+            )
+            .unwrap();
+        state
+            .tickets
+            .update(owner.principal().clone(), &adopt_context)
+            .await
+            .unwrap();
         let mut ordinary = Session::new("ordinary-project-session", native_work::MODEL);
         ordinary.set_project_id_meta(project.id.to_string());
         state.storage.save_session(&ordinary).await.unwrap();
@@ -1236,6 +1262,8 @@ async fn existing_project_work_survives_restart_and_dispatches_into_section() {
         .contains("Unrelated Section description fixture")));
     let snapshot = service.published().unwrap().1;
     assert_eq!(snapshot.assignments.len(), 1);
+    let adopted = &snapshot.project.contexts[&snapshot.project.assignment_contexts[assignment_id]];
+    assert_eq!(adopted.sources, source_pins);
     let receipt = snapshot.assignments[assignment_id]
         .runtime
         .as_ref()

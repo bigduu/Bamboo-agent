@@ -522,9 +522,12 @@ impl TicketApplication {
                 json!({"status": "already_dispatched", "work_id": work_id, "assignment_id": assignment}),
             );
         }
-        if ticket.archived || !matches!(ticket.state, WorkState::Draft | WorkState::Ready) {
+        if ticket.archived
+            || ticket.paused
+            || !matches!(ticket.state, WorkState::Draft | WorkState::Ready)
+        {
             return Err(Error::InvalidTransition(
-                "Work must be Draft or Ready to start".into(),
+                "Work must be an unpaused Draft or Ready card to start".into(),
             ));
         }
         let sections = project
@@ -553,6 +556,14 @@ impl TicketApplication {
         .await
         .map_err(|error| Error::AuthorityUnavailable(error.to_string()))??;
         bamboo_engine::ticket_worker_plan::files::verify_workspace(workspace.clone()).await?;
+        let latest_context = snapshot
+            .project
+            .work_contexts
+            .get(work_id)
+            .and_then(|hash| snapshot.project.contexts.get(hash));
+        if latest_context.is_some_and(|context| context.project_id != project.id) {
+            return Err(Error::RevisionConflict);
+        }
         let context = ProjectContextSnapshot {
             project_id: project.id.clone(),
             project_revision: project.revision,
@@ -560,17 +571,12 @@ impl TicketApplication {
             workspace_binding: binding,
             contract_revision: ticket.contract_revision,
             contract: ticket.contract.clone(),
-            sources: Default::default(),
+            sources: latest_context
+                .map_or_else(Default::default, |context| context.sources.clone()),
         };
         // Creating a Draft is independent of execution preparation. Adopt the
         // current snapshot while the Work is stopped, then claim that revision.
-        if snapshot
-            .project
-            .work_contexts
-            .get(work_id)
-            .and_then(|hash| snapshot.project.contexts.get(hash))
-            != Some(&context)
-        {
+        if latest_context != Some(&context) {
             if self.verify_project_manager(caller).await?.revision != project.revision {
                 return Err(Error::RevisionConflict);
             }
@@ -600,6 +606,7 @@ impl TicketApplication {
             || ticket.contract_revision != context.contract_revision
             || ticket.active_assignment.is_some()
             || ticket.archived
+            || ticket.paused
             || !matches!(ticket.state, WorkState::Draft | WorkState::Ready)
             || snapshot
                 .project
