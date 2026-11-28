@@ -21,23 +21,27 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    if let Some(err) = app
-        .schedules
-        .error
-        .as_ref()
-        .filter(|_| app.schedules.schedules.is_empty())
-    {
-        let error =
-            Paragraph::new(format!("Error: {}", err)).style(Style::default().fg(colors::error()));
-        f.render_widget(error, area);
-        return;
+    let catalog_error = app.schedules.error.as_deref().map(|error| {
+        Paragraph::new(error)
+            .style(Style::default().fg(colors::error()))
+            .wrap(Wrap { trim: true })
+    });
+    if app.schedules.schedules.is_empty() {
+        if let Some(error) = catalog_error {
+            f.render_widget(error, area);
+            return;
+        }
     }
 
     let compact = area.width < 80 || area.height < 18;
+    let error_height = catalog_error
+        .as_ref()
+        .map_or(0, |error| error.line_count(area.width).min(2) as u16);
     let chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
             ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Length(error_height),
             ratatui::layout::Constraint::Min(5),
             ratatui::layout::Constraint::Length(1),
         ])
@@ -85,12 +89,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             ),
         ])
     };
-    if app.schedules.error.is_some() {
-        header.spans.insert(
-            1,
-            Span::styled(" · Refresh failed", Style::default().fg(colors::error())),
-        );
-    }
     if !app.schedules.schedules.is_empty() {
         let key = app
             .keymap
@@ -124,8 +122,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         );
     }
     f.render_widget(Paragraph::new(header), chunks[0]);
+    if let Some(error) = catalog_error {
+        f.render_widget(error, chunks[1]);
+    }
 
-    let body = chunks[1];
+    let body = chunks[2];
     let detail_width = body.width.saturating_sub(2);
     let toggle = selected_schedule
         .filter(|_| body.height > 2 && detail_width > 0)
@@ -251,7 +252,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         app.key_hint(ActionContext::Schedules, ActionId::RunSchedule),
     );
     let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
-    f.render_widget(footer, chunks[2]);
+    f.render_widget(footer, chunks[3]);
 }
 
 fn toggle_line(
@@ -667,11 +668,17 @@ mod tests {
         assert!(disabled.contains("/ Enable"), "{disabled}");
         assert!(!disabled.contains("t Disable"), "{disabled}");
 
-        app.schedules.error = Some("RAW_REFRESH_DIAGNOSTIC".into());
+        let retry_message = "Could not load schedules. Reopen Schedules to try again.";
+        app.schedules.error = Some(retry_message.into());
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
         let stale = terminal_rows(&terminal);
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_ERRORS").is_some() {
+            eprintln!(
+                "SCHEDULE CATALOG ERROR PREVIEW\n{stale}\nEND SCHEDULE CATALOG ERROR PREVIEW"
+            );
+        }
         for expected in [
-            "Refresh failed",
+            retry_message,
             "› Weekly archive",
             "/ Enable",
             "Enter runs",
@@ -679,7 +686,6 @@ mod tests {
         ] {
             assert!(stale.contains(expected), "missing {expected:?}\n{stale}");
         }
-        assert!(!stale.contains("RAW_REFRESH_DIAGNOSTIC"), "{stale}");
 
         app.schedules.error = None;
         app.schedules.selected = 2;

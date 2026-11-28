@@ -333,6 +333,15 @@ fn parse_auto_resume_status(body: &str) -> std::result::Result<String, RespondFa
 
 const MAX_SCHEDULE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SESSION_LOOP_PREVIEW_BYTES: usize = 128 * 1024;
+const SCHEDULE_LIST_UNAVAILABLE: &str = "Could not load schedules. Reopen Schedules to try again.";
+const SCHEDULE_UNAVAILABLE_OR_CHANGED: &str =
+    "Schedule is unavailable or changed. Reopen Schedules.";
+const SCHEDULE_CREATE_UNCONFIRMED: &str =
+    "Could not confirm creation. Check Schedules before trying again.";
+const SCHEDULE_DELETE_UNCONFIRMED: &str =
+    "Could not confirm deletion. Check the schedule before trying again.";
+const SCHEDULE_RUN_UNCONFIRMED: &str =
+    "Could not confirm Run Now. Check Recent runs before trying again.";
 
 enum BoundedBodyError {
     TooLarge,
@@ -375,6 +384,29 @@ async fn schedule_response_code(response: reqwest::Response) -> Option<String> {
 
 async fn schedule_response_has_code(response: reqwest::Response, code: &str) -> bool {
     schedule_response_code(response).await.as_deref() == Some(code)
+}
+
+async fn schedule_project_conflict(response: reqwest::Response) -> Option<&'static str> {
+    // A slow error body should not delay feedback in the Schedule views.
+    let code = tokio::time::timeout(Duration::from_millis(500), schedule_response_code(response))
+        .await
+        .ok()
+        .flatten()?;
+    match code.as_str() {
+        "project_archived" => Some("The schedule needs an active Project."),
+        "project_workspace_conflict" => {
+            Some("The workspace belongs to another Project. Check the Project settings.")
+        }
+        "project_path_missing" => Some("Set a workspace path for the schedule's Project."),
+        "project_path_unavailable" => {
+            Some("The Project workspace is unavailable. Check its path on the Host.")
+        }
+        _ => None,
+    }
+}
+
+fn schedule_action_unconfirmed(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT
 }
 
 #[derive(Clone)]
@@ -1185,13 +1217,26 @@ impl BambooClient {
             .client
             .get(self.url("/api/v1/schedules"))
             .send()
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!(SCHEDULE_LIST_UNAVAILABLE))?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("list schedules failed ({status}): {body}");
-        }
-        let parsed: ListSchedulesResponse = resp.json().await?;
+        anyhow::ensure!(
+            !schedule_action_unconfirmed(status),
+            SCHEDULE_LIST_UNAVAILABLE
+        );
+        anyhow::ensure!(
+            status.is_success(),
+            "The Host refused to load schedules. Reopen Schedules to try again."
+        );
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|_| anyhow::anyhow!(SCHEDULE_LIST_UNAVAILABLE))?;
+        let parsed: ListSchedulesResponse = serde_json::from_slice(&body).map_err(|_| {
+            anyhow::anyhow!(
+                "The Host returned an invalid schedule list. Reopen Schedules to try again."
+            )
+        })?;
         Ok(parsed
             .schedules
             .into_iter()
@@ -2026,18 +2071,27 @@ impl BambooClient {
     }
 
     pub async fn create_schedule(&self, req: CreateScheduleRequest) -> Result<()> {
+        use reqwest::StatusCode;
+
         let resp = self
             .client
             .post(self.url("/api/v1/schedules"))
             .json(&req)
             .send()
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!(SCHEDULE_CREATE_UNCONFIRMED))?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("create schedule failed ({status}): {body}");
-        }
-        Ok(())
+        let refused = "The Host refused to create the schedule.";
+        let message = match status {
+            status if status.is_success() => return Ok(()),
+            status if schedule_action_unconfirmed(status) => SCHEDULE_CREATE_UNCONFIRMED,
+            StatusCode::BAD_REQUEST => {
+                "Could not create the schedule. Check its details and Host settings."
+            }
+            StatusCode::CONFLICT => schedule_project_conflict(resp).await.unwrap_or(refused),
+            _ => refused,
+        };
+        anyhow::bail!("{message}")
     }
 
     pub async fn delete_schedule(&self, id: &str) -> Result<()> {
@@ -2045,27 +2099,43 @@ impl BambooClient {
             .client
             .delete(self.url(&format!("/api/v1/schedules/{}", id)))
             .send()
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!(SCHEDULE_DELETE_UNCONFIRMED))?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("delete schedule failed ({status}): {body}");
-        }
+        anyhow::ensure!(
+            !schedule_action_unconfirmed(status),
+            SCHEDULE_DELETE_UNCONFIRMED
+        );
+        anyhow::ensure!(
+            status != reqwest::StatusCode::NOT_FOUND,
+            SCHEDULE_UNAVAILABLE_OR_CHANGED
+        );
+        anyhow::ensure!(
+            status.is_success(),
+            "The Host refused to delete the schedule."
+        );
         Ok(())
     }
 
     pub async fn run_schedule_now(&self, id: &str) -> Result<()> {
+        use reqwest::StatusCode;
+
         let resp = self
             .client
             .post(self.url(&format!("/api/v1/schedules/{}/run", id)))
             .send()
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!(SCHEDULE_RUN_UNCONFIRMED))?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("run schedule failed ({status}): {body}");
-        }
-        Ok(())
+        let refused = "The Host refused Run Now. Check the saved schedule and Host settings.";
+        let message = match status {
+            status if status.is_success() => return Ok(()),
+            status if schedule_action_unconfirmed(status) => SCHEDULE_RUN_UNCONFIRMED,
+            StatusCode::NOT_FOUND => SCHEDULE_UNAVAILABLE_OR_CHANGED,
+            StatusCode::CONFLICT => schedule_project_conflict(resp).await.unwrap_or(refused),
+            _ => refused,
+        };
+        anyhow::bail!("{message}")
     }
 
     // ── Skills ──
@@ -2568,6 +2638,319 @@ mod tests {
                 "Session loop status response is too large (128 KiB limit)"
             );
         }
+    }
+
+    async fn schedule_action_reply<T, F>(
+        request_line: &str,
+        request_body: Option<serde_json::Value>,
+        status: &str,
+        body: &str,
+        request: impl FnOnce(BambooClient) -> F,
+    ) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(request.lines().next(), Some(request_line));
+            if let Some(expected) = request_body {
+                assert_eq!(request_json(&request), expected);
+            } else {
+                assert_eq!(request.split_once("\r\n\r\n").unwrap().1, "");
+            }
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(request(client), serve)
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn list_schedules_preserves_empty_catalogs_and_returns_fixed_errors() {
+        const GET: &str = "GET /api/v1/schedules HTTP/1.1";
+        for body in [r#"{"schedules":[]}"#, "{}"] {
+            assert!(
+                schedule_action_reply(GET, None, "200 OK", body, |client| async move {
+                    client.list_schedules().await
+                })
+                .await
+                .unwrap()
+                .is_empty()
+            );
+        }
+        for (status, body, expected) in [
+            (
+                "503 Service Unavailable",
+                r#"{"error":{"message":"RAW_HOST_BODY"}}"#,
+                "Could not load schedules. Reopen Schedules to try again.",
+            ),
+            (
+                "408 Request Timeout",
+                "",
+                "Could not load schedules. Reopen Schedules to try again.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"project_archived","message":"RAW_HOST_BODY"}}"#,
+                "The Host refused to load schedules. Reopen Schedules to try again.",
+            ),
+            (
+                "200 OK",
+                r#"{"schedules":"RAW_HOST_BODY"}"#,
+                "The Host returned an invalid schedule list. Reopen Schedules to try again.",
+            ),
+        ] {
+            assert_eq!(
+                schedule_action_reply(GET, None, status, body, |client| async move {
+                    client.list_schedules().await
+                })
+                .await
+                .unwrap_err()
+                .to_string(),
+                expected
+            );
+        }
+    }
+
+    async fn create_schedule_action_reply(expr: &str, status: &str, body: &str) -> Result<()> {
+        schedule_action_reply(
+            "POST /api/v1/schedules HTTP/1.1",
+            Some(serde_json::json!({
+                "name":"Review results",
+                "trigger":{"type":"cron","expr":expr},
+                "enabled":true,
+                "run_config":{"task_message":"Check the report","auto_execute":true},
+            })),
+            status,
+            body,
+            |client| async move {
+                client
+                    .create_schedule(CreateScheduleRequest {
+                        name: "Review results".into(),
+                        trigger: ScheduleTriggerReq::Cron { expr: expr.into() },
+                        timezone: None,
+                        enabled: true,
+                        run_config: ScheduleRunConfigReq {
+                            project_id: None,
+                            task_message: Some("Check the report".into()),
+                            auto_execute: true,
+                        },
+                    })
+                    .await
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn create_schedule_preserves_request_and_maps_validation_and_project_failures() {
+        const EXPR: &str = "0 0 9 * * MON";
+        create_schedule_action_reply(EXPR, "201 Created", "")
+            .await
+            .unwrap();
+        for (status, body, expected) in [
+            (
+                "400 Bad Request",
+                r#"{"error":{"type":"api_error","message":"trigger.expr is not a valid cron expression: invalid cron"}}"#,
+                "Could not create the schedule. Check its details and Host settings.",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":{"code":"project_archived","message":"RAW_HOST_BODY"}}"#,
+                "Could not create the schedule. Check its details and Host settings.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"project_archived","message":"RAW_HOST_BODY"},"project_id":"example"}"#,
+                "The schedule needs an active Project.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"project_path_missing","message":"RAW_HOST_BODY"}}"#,
+                "Set a workspace path for the schedule's Project.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"future_conflict","message":"RAW_HOST_BODY"}}"#,
+                "The Host refused to create the schedule.",
+            ),
+            (
+                "503 Service Unavailable",
+                "RAW_HOST_BODY",
+                "Could not confirm creation. Check Schedules before trying again.",
+            ),
+        ] {
+            let expr = if status.starts_with("400") {
+                "invalid cron"
+            } else {
+                EXPR
+            };
+            assert_eq!(
+                create_schedule_action_reply(expr, status, body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_schedule_now_reports_stale_selection_project_conflicts_and_uncertain_outcomes() {
+        const POST: &str = "POST /api/v1/schedules/schedule-17/run HTTP/1.1";
+        let run =
+            |client: BambooClient| async move { client.run_schedule_now("schedule-17").await };
+        schedule_action_reply(POST, None, "202 Accepted", "", run)
+            .await
+            .unwrap();
+        for (status, body, expected) in [
+            (
+                "404 Not Found",
+                r#"{"error":{"type":"api_error","message":"Schedule not found"},"schedule_id":"schedule-17"}"#,
+                "Schedule is unavailable or changed. Reopen Schedules.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"project_workspace_conflict","message":"RAW_HOST_BODY"}}"#,
+                "The workspace belongs to another Project. Check the Project settings.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"project_path_unavailable","message":"RAW_HOST_BODY"}}"#,
+                "The Project workspace is unavailable. Check its path on the Host.",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":{"type":"api_error","message":"run_config.project_id references a Project that does not exist"},"project_id":"example"}"#,
+                "The Host refused Run Now. Check the saved schedule and Host settings.",
+            ),
+            (
+                "500 Internal Server Error",
+                "RAW_HOST_BODY",
+                "Could not confirm Run Now. Check Recent runs before trying again.",
+            ),
+        ] {
+            assert_eq!(
+                schedule_action_reply(POST, None, status, body, run)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_schedule_reports_stale_selection_and_uncertain_outcomes() {
+        const DELETE: &str = "DELETE /api/v1/schedules/schedule-17 HTTP/1.1";
+        let delete =
+            |client: BambooClient| async move { client.delete_schedule("schedule-17").await };
+        schedule_action_reply(DELETE, None, "204 No Content", "", delete)
+            .await
+            .unwrap();
+        for (status, expected) in [
+            (
+                "404 Not Found",
+                "Schedule is unavailable or changed. Reopen Schedules.",
+            ),
+            (
+                "408 Request Timeout",
+                "Could not confirm deletion. Check the schedule before trying again.",
+            ),
+            ("403 Forbidden", "The Host refused to delete the schedule."),
+        ] {
+            assert_eq!(
+                schedule_action_reply(DELETE, None, status, "RAW_HOST_BODY", delete)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_transport_failures_provide_actionable_list_and_run_feedback() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        for (list, request_line, expected) in [
+            (
+                true,
+                "GET /api/v1/schedules HTTP/1.1",
+                "Could not load schedules. Reopen Schedules to try again.",
+            ),
+            (
+                false,
+                "POST /api/v1/schedules/schedule-17/run HTTP/1.1",
+                "Could not confirm Run Now. Check Recent runs before trying again.",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let serve = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_request(&mut socket).await.lines().next(),
+                    Some(request_line)
+                );
+                socket.shutdown().await.unwrap();
+            };
+            let request = async {
+                if list {
+                    client.list_schedules().await.map(|_| ())
+                } else {
+                    client.run_schedule_now("schedule-17").await
+                }
+            };
+            let (result, ()) = timeout(Duration::from_secs(5), async {
+                tokio::join!(request, serve)
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap_err().to_string(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_project_conflict_falls_back_when_the_host_holds_the_error_body() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (release, held) = oneshot::channel();
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_request(&mut socket).await.lines().next(),
+                Some("POST /api/v1/schedules/schedule-17/run HTTP/1.1")
+            );
+            socket
+                .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 99\r\n\r\n")
+                .await
+                .unwrap();
+            held.await.unwrap();
+            drop(socket);
+        };
+        let run = async {
+            let result = client.run_schedule_now("schedule-17").await;
+            release.send(()).unwrap();
+            result
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async { tokio::join!(run, serve) })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "The Host refused Run Now. Check the saved schedule and Host settings."
+        );
     }
 
     #[tokio::test]
