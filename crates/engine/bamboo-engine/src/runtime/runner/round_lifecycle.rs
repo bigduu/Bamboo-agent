@@ -788,7 +788,9 @@ pub(crate) async fn maybe_apply_mid_turn_context_compression(
     model_name: &str,
     tool_schemas: &[ToolSchema],
 ) -> Result<bool, AgentError> {
-    if config.context_management.strategy == ContextManagementStrategy::MessageSummary {
+    if config.context_management.strategy == ContextManagementStrategy::MessageSummary
+        || context_preparation::tool_output_pruning::enabled(session, config)
+    {
         // Tool execution reaches this check after each result. Only the latest
         // assistant batch can still be receiving results at this boundary.
         let current_batch = session

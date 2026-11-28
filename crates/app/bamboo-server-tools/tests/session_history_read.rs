@@ -59,6 +59,69 @@ fn returned_message_ids(result: &Value) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn read_slice_returns_the_saved_tool_text_when_the_model_view_has_a_preview() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let mut session = Session::new("tool-preview-history", "test-model");
+    let original = "header\n中间的原始日志\ntail";
+    let source_sha256 = bamboo_domain::sha256_hex(original.as_bytes());
+    session.add_message(Message::user("Check the test output."));
+    session.add_message(Message::assistant(
+        "",
+        Some(vec![call(
+            "build-call",
+            "Bash",
+            json!({"command":"cargo test"}),
+        )]),
+    ));
+    session.add_message(identified(
+        Message::tool_result("build-call", original),
+        "result-id",
+    ));
+    session
+        .model_context_state
+        .get_or_insert_with(Default::default)
+        .tool_output_previews
+        .insert(
+            "result-id".into(),
+            bamboo_domain::session::ToolOutputPreview {
+                source_sha256: source_sha256.clone(),
+                rendered_text: "head and tail preview".into(),
+            },
+        );
+    let params = json!({"action":"read_slice","message_id":"result-id","offset":7,"max_chars":7});
+    session.add_message(Message::assistant(
+        "",
+        Some(vec![call(
+            "read-call",
+            "session_history_current",
+            params.clone(),
+        )]),
+    ));
+    store.save_session(&session).await.unwrap();
+    let reopened = store.load_session(&session.id).await.unwrap().unwrap();
+    assert!(reopened
+        .model_context_state
+        .unwrap()
+        .tool_output_previews
+        .contains_key("result-id"));
+    let tool = SessionInspectorTool::current(store.clone(), store);
+    let result = completed(
+        tool.invoke(params, context(&session.id, "read-call"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(result["available"], true);
+    assert_eq!(result["content"], "中间的原始日志");
+    assert_eq!(result["next_offset"], 14);
+    assert_eq!(result["content_sha256"], source_sha256);
+}
+
+#[tokio::test]
 async fn read_current_pages_exact_atomic_turns_with_a_cursor_stable_across_retrieval_calls() {
     let home = tempfile::tempdir().unwrap();
     let store = Arc::new(

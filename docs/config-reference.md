@@ -450,6 +450,7 @@ the active provider window, and directs the model to
 | Field | Default | What it does |
 |---|---|---|
 | `strategy` | `summary` | `summary` preserves the current summarizer path. `message_summary` summarizes historical user and assistant prose and removes unpinned completed tool exchanges from the active model view. `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
+| `prune_old_tool_outputs` | `false` | Experimental. For a persistent ordinary Root using `summary`, try shortening older build, test and search results before auto-summarizing. |
 | `trigger_usage_ratio` | `0.80` | Shared proactive compression upper bound relative to the smaller of the joint model window and any independent input ceiling. Output and safety headroom can move the effective trigger earlier. |
 | `target_usage_ratio` | `0.25` | Shared post-compression target on the same window. The effective target is rounded down to whole percentages and remains below the trigger. Required content must fit; the target is not silently raised. |
 | `retrieval_window.min_recent_user_turns` | `3` | Minimum newest complete user-anchored turns that remain active. Must be greater than zero. |
@@ -469,6 +470,28 @@ compression past that boundary. Message summaries wait for the current tool
 batch to complete. After a newer user turn and with no pending tool work,
 an unanswered call from an earlier turn can be archived with its original
 transcript intact. Provider prefix-cache hits do not disable maintenance.
+
+### Experimental tool-output pruning
+
+Set `"context_management": {"prune_old_tool_outputs": true}` to opt in.
+At the automatic trigger, Bamboo first tries shortening old, completed text
+results from recognized build, test and search tools. It protects the two
+newest complete tool batches, unfinished calls, file reads and pinned content.
+The effective request must expose `session_history_current.read_slice`.
+Sessions that require native provider replay use the usual summary path.
+
+The pruning trial aims for a buffer below the trigger equal to 10% of the
+trigger, capped at 8,192 tokens. Bamboo commits the pruning view only when the
+projected request fits this target. Otherwise it runs the existing summarizer
+on saved history. Each preview keeps the result's message ID, and
+`session_history_current` can read the saved text by ID and offset. Tool
+output that was already shortened at execution can have a separate recovery
+file, subject to its retention and screening.
+
+Changing an earlier tool result starts a new model-context prefix epoch.
+Subsequent requests and restarts reuse the saved preview until its source
+message is archived, removed or replaced. Switching the option off stops
+new pruning decisions.
 
 For a reported or configured 1M window with 64K output and 10K safety
 triggers at 800K with a 250K target. Smaller windows or larger output reservations

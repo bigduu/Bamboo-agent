@@ -648,6 +648,7 @@ pub(super) struct ProjectedRequestUsage {
     /// The transformed message vector after any provider-only history
     /// projection. Refit must subtract this count rather than durable bytes.
     pub prepared_message_input_tokens: u32,
+    pub history_slice_callable: bool,
 }
 
 fn measure_request_usage(
@@ -735,7 +736,28 @@ fn measure_request_usage(
         ledger_rendered_bytes,
         history_boundary_input_tokens,
         prepared_message_input_tokens: 0,
+        history_slice_callable: false,
     }
+}
+
+fn history_slice_callable(session: &Session, wire_tool_schemas: &[ToolSchema]) -> bool {
+    const TOOL: &str = "session_history_current";
+    session.allows_model_tool_execution(TOOL)
+        && wire_tool_schemas
+            .iter()
+            .find(|schema| schema.function.name == TOOL)
+            .and_then(|schema| {
+                schema
+                    .function
+                    .parameters
+                    .pointer("/properties/action/enum")
+            })
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|actions| {
+                actions
+                    .iter()
+                    .any(|action| action.as_str() == Some("read_slice"))
+            })
 }
 
 fn build_trimmed_history_reference(
@@ -743,24 +765,9 @@ fn build_trimmed_history_reference(
     prepared: &PreparedContext,
     wire_tool_schemas: &[ToolSchema],
 ) -> Option<ContextBlock> {
-    const TOOL: &str = "session_history_current";
     if !prepared.truncation_occurred
         || prepared.compressed_message_ids.is_empty()
-        || !session.allows_model_tool_execution(TOOL)
-    {
-        return None;
-    }
-    let schema = wire_tool_schemas
-        .iter()
-        .find(|schema| schema.function.name == TOOL)?;
-    let actions = schema
-        .function
-        .parameters
-        .pointer("/properties/action/enum")?;
-    if !actions
-        .as_array()?
-        .iter()
-        .any(|action| action.as_str() == Some("read_slice"))
+        || !history_slice_callable(session, wire_tool_schemas)
     {
         return None;
     }
@@ -994,6 +1001,7 @@ pub(super) async fn project_request_usage(
         })?;
     let mut usage = measure_request_usage(&shadow, &envelope, &tool_footprint);
     usage.prepared_message_input_tokens = prepared_message_input_tokens;
+    usage.history_slice_callable = history_slice_callable(&shadow, wire_schemas.as_ref());
     Ok(usage)
 }
 

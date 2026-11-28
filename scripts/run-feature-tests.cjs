@@ -312,7 +312,11 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // with the default Orchestration owner. Additive case selections stay intact.
 // Skill quality uses the default Skills package and the existing list case in
 // server-handlers.
-const FEATURE_SOURCE_SHA256 = "1c3fd0d7c3e7951866e6909d6c8028ec04fd4fdbe569ffac9ae0b230980b6426";
+// Tool-output previews use the default Engine (packages-3), Config and
+// Server Tools (packages-4), Domain (packages-2), and Compression and Storage
+// (packages-0) owners. The original-output regression uses session_history_read.
+// The existing five additive contexts and 23 cases retain their owners.
+const FEATURE_SOURCE_SHA256 = "a7872ac4254b5faa78813453caf1e86be7377c12089b8681dacc94df98d423c1";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
