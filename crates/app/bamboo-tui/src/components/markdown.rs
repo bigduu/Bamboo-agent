@@ -43,6 +43,7 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
 /// Handles: backtick and tilde fences, inline `code`, **bold**, _italic_,
 /// links, image descriptions, ATX and single-line Setext headings, nested
 /// bullet and ordered lists, task lists, thematic breaks, quotes and tables.
+/// Top-level quote paragraphs can have two explicit quote markers.
 /// Completed top-level Mermaid fences can preview a short vertical or horizontal path.
 pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     render_markdown_preview(text, width, false)
@@ -167,20 +168,43 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
         // Blockquote.
         let quote = body.strip_prefix('>');
         let quote_can_continue = quote.is_some_and(paragraph_can_be_lazy);
-        let quote_content = body.strip_prefix("> ").or_else(|| {
-            let content = quote?;
-            if block_container != ParagraphContainer::None || top_level_body(raw_line) != Some(body)
-            {
-                return None;
-            }
-            let content = content.strip_prefix('\t').unwrap_or(content);
-            (!content.is_empty()
-                && !content.starts_with(|ch: char| ch == '>' || ch.is_whitespace()))
-            .then_some(content)
-        });
+        let top_level_quote = quote.is_some()
+            && block_container == ParagraphContainer::None
+            && top_level_body(raw_line) == Some(body);
+        let nested_quote = if top_level_quote {
+            nested_quote_paragraph(body).filter(|content| {
+                // Keep a potential nested Setext heading on the previous path.
+                setext_title(content).is_none()
+                    || !input.peek().is_some_and(|next| {
+                        top_level_body(next.text)
+                            .and_then(two_quote_markers)
+                            .and_then(setext_level)
+                            .is_some()
+                    })
+            })
+        } else {
+            None
+        };
+        let quote_content = nested_quote
+            .or_else(|| body.strip_prefix("> "))
+            .or_else(|| {
+                let content = quote?;
+                if !top_level_quote {
+                    return None;
+                }
+                let content = content.strip_prefix('\t').unwrap_or(content);
+                (!content.is_empty()
+                    && !content.starts_with(|ch: char| ch == '>' || ch.is_whitespace()))
+                .then_some(content)
+            });
         if let Some(content) = quote_content {
+            let markers = if nested_quote.is_some() {
+                "│ │ "
+            } else {
+                "│ "
+            };
             let mut spans = vec![Span::styled(
-                format!("{indent}│ "),
+                format!("{indent}{markers}"),
                 Style::default().fg(colors::thinking()),
             )];
             spans.extend(parse_inline(content));
@@ -310,6 +334,28 @@ impl ParagraphContainer {
 fn top_level_body(line: &str) -> Option<&str> {
     let body = line.trim_start_matches(' ');
     (line.len() - body.len() <= 3 && !body.starts_with('\t')).then_some(body)
+}
+
+fn two_quote_markers(mut body: &str) -> Option<&str> {
+    for _ in 0..2 {
+        let tail = body.strip_prefix('>')?;
+        body = tail.strip_prefix([' ', '\t']).unwrap_or(tail);
+    }
+    (!body.is_empty() && !body.starts_with(|ch: char| ch == '>' || ch.is_whitespace()))
+        .then_some(body)
+}
+
+fn nested_quote_paragraph(body: &str) -> Option<&str> {
+    let body = two_quote_markers(body)?;
+    if is_atx_heading_anchor(body)
+        || list_anchor(body).is_some()
+        || rule_markers(body).is_some_and(|markers| markers.forms_break())
+        || setext_level(body).is_some()
+        || fence::opening_prefix(body).is_some()
+    {
+        return None;
+    }
+    Some(body)
 }
 
 fn is_top_level_fence(line: &str) -> bool {
@@ -1850,8 +1896,6 @@ mod tests {
         for (source, expected) in [
             (">", ">"),
             (">\t", ">\t"),
-            (">>nested", ">>nested"),
-            (">\t>nested", ">\t>nested"),
             (">\t\ttwo tabs", ">\t\ttwo tabs"),
             (">\t extra whitespace", ">\t extra whitespace"),
             ("    >indented", "    >indented"),
@@ -1871,6 +1915,105 @@ mod tests {
         assert!(fenced[1].contains(">compact"));
         assert!(fenced[2].contains(">"));
         assert!(fenced[2].contains("tab"));
+    }
+
+    #[test]
+    fn nested_blockquotes_recognize_two_top_level_markers_and_keep_inline_styles() {
+        const CONTENT: &str = "**复核** `plan` 🚀";
+        for width in [60, 80, 120] {
+            for spaces in 0..=3 {
+                let indent = " ".repeat(spaces);
+                let expected = render_markdown(&format!("{indent}> > {CONTENT}"), width);
+                assert_eq!(text_of(&expected[0]), format!("{indent}│ │ 复核 plan 🚀"));
+                assert_eq!(expected[0].spans[0].style.fg, Some(colors::thinking()));
+                assert!(expected[0].spans.iter().any(|span| {
+                    span.content == "复核" && span.style.add_modifier.contains(Modifier::BOLD)
+                }));
+                assert!(expected[0].spans.iter().any(|span| {
+                    span.content == "plan" && span.style.add_modifier.contains(Modifier::REVERSED)
+                }));
+
+                for first_gap in ["", " ", "\t"] {
+                    for second_gap in ["", " ", "\t"] {
+                        let source = format!("{indent}>{first_gap}>{second_gap}{CONTENT}");
+                        assert_eq!(render_markdown(&source, width), expected, "{source:?}");
+                        assert_eq!(
+                            render_streaming_markdown(&source, width),
+                            expected,
+                            "{source:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_blockquotes_keep_existing_marker_and_container_fallbacks() {
+        for (source, expected) in [
+            (">>", ">>"),
+            ("> >", "│ >"),
+            (">\t>\t", ">\t>\t"),
+            (">>>third level", ">>>third level"),
+            ("> > > third level", "│ > > third level"),
+            (">  >extra space", "│  >extra space"),
+            (">\t>  extra space", ">\t>  extra space"),
+            (">># Heading", ">># Heading"),
+            (">>- list item", ">>- list item"),
+            (">>1. list item", ">>1. list item"),
+            (">>---", ">>---"),
+            (">>~~~rust", ">>~~~rust"),
+            ("    >>indented", "    >>indented"),
+            ("\t>>indented", "  >>indented"),
+        ] {
+            assert_eq!(render(source), [expected], "{source:?}");
+            assert_eq!(
+                render_streaming_markdown(source, 60)
+                    .iter()
+                    .map(text_of)
+                    .collect::<Vec<_>>(),
+                [expected],
+                "{source:?}"
+            );
+        }
+        assert_eq!(render("- item\n  >>inside"), ["  • item", "  >>inside"]);
+        assert_eq!(
+            render(">>first\n> > second\ncontinued"),
+            ["│ │ first", "│ │ second", "continued"]
+        );
+        for (source, expected) in [
+            (">>Title\r\n>>===", [">>Title", ">>==="]),
+            ("> > Title\n> > ---", ["│ > Title", "│ > ---"]),
+            (">\t>Title\n>>-", [">\t>Title", ">>-"]),
+            (">>Title\n-", ["│ │ Title", "-"]),
+            (">>Title\n>>=written", ["│ │ Title", "│ │ =written"]),
+        ] {
+            assert_eq!(render(source), expected, "{source:?}");
+            assert_eq!(
+                render_streaming_markdown(source, 60)
+                    .iter()
+                    .map(text_of)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_blockquotes_keep_tables_fences_and_following_rules_independent() {
+        let table = render("| Notes | State |\n| --- | --- |\n| >>cell | Ready |\n>>outside\n---");
+        assert_eq!(table.len(), 5);
+        assert!(table[2].contains(">>cell"), "{table:?}");
+        assert_eq!(table[3], "│ │ outside");
+        assert_eq!(table[4], "─".repeat(80));
+
+        let fence = render("~~~text\n>>fenced\n~~~\n>>outside");
+        assert_eq!(fence.len(), 4);
+        assert!(fence[0].starts_with("┌ text "), "{fence:?}");
+        assert_eq!(fence[1], format!("│ {:<76} │", ">>fenced"));
+        assert!(fence[2].starts_with('└'), "{fence:?}");
+        assert_eq!(fence[3], "│ │ outside");
     }
 
     #[test]
