@@ -817,6 +817,9 @@ async fn project_tool(
         false,
         None,
         None,
+    )
+    .with_executing_supervisor(
+        ExecutingSupervisorObservation::capture_from_executing_session(caller),
     );
     let result = with_executing_session_caller(
         Some(Arc::new(SessionCallerReference::from(caller))),
@@ -877,6 +880,66 @@ fn model_tool_result(request: &native_work::ModelRequest, id: &str) -> Value {
         .unwrap_or_else(|| panic!("missing model Tool result for {id}"));
     assert_eq!(result.tool_success, Some(true), "{}", result.content);
     serde_json::from_str(&result.content).unwrap()
+}
+
+#[actix_web::test]
+async fn supervisor_can_discover_projects_beyond_the_first_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (requests, _received) = mpsc::unbounded_channel();
+    let state = Box::pin(host(
+        &root,
+        Arc::new(LocalProvider {
+            requests,
+            calls: AtomicUsize::new(0),
+            max_requests: 0,
+        }),
+    ))
+    .await;
+    for index in 0..33 {
+        state
+            .project_store
+            .create(format!("Route fixture #{index:02}"), None)
+            .unwrap();
+    }
+    let supervisor = state
+        .storage
+        .load_root_authority(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    let first = project_tool(
+        &state,
+        &supervisor,
+        "work_project_manager",
+        json!({"action":"projects", "query":"ROUTE FIXTURE"}),
+        true,
+    )
+    .await;
+    assert_eq!(first["projects"].as_array().unwrap().len(), 32);
+    assert_eq!(first["next_offset"], 32);
+    let last = project_tool(
+        &state,
+        &supervisor,
+        "work_project_manager",
+        json!({"action":"projects", "query":"ROUTE FIXTURE", "offset":first["next_offset"]}),
+        true,
+    )
+    .await;
+    assert_eq!(last["projects"].as_array().unwrap().len(), 1);
+    assert!(last["next_offset"].is_null());
+    let unseen = &last["projects"][0];
+    assert!(!first["projects"].as_array().unwrap().contains(unseen));
+    let found = project_tool(
+        &state,
+        &supervisor,
+        "work_project_manager",
+        json!({"action":"projects", "query":unseen["name"]}),
+        true,
+    )
+    .await;
+    assert_eq!(found["projects"], json!([unseen]));
+    state.shutdown().await;
 }
 
 #[actix_web::test]
@@ -1296,6 +1359,22 @@ async fn existing_project_work_survives_restart_and_dispatches_into_section() {
     assert_eq!(next["board"]["data"]["rows"].as_array().unwrap().len(), 1);
     assert_eq!(next["board"]["snapshot"], first["board"]["snapshot"]);
     assert!(next["board"]["next_cursor"].is_null());
+    let supervisor = state
+        .storage
+        .load_root_authority(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    let inspected = project_tool(
+        &state,
+        &supervisor,
+        "work_project_manager",
+        json!({"action":"inspect","project_id":project_id,"cursor":first["board"]["next_cursor"],
+             "fixed_commit":first["board"]["snapshot"]["commit"]}),
+        true,
+    )
+    .await;
+    assert_eq!(inspected["board"], next["board"]);
 
     let deleted = test::call_service(
         &app,

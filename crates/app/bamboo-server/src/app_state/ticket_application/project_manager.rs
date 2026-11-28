@@ -159,15 +159,37 @@ pub(crate) enum ManagerRequest {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum SupervisorProjectRequest {
-    Projects,
+    Projects {
+        query: Option<String>,
+        offset: Option<usize>,
+    },
     Inspect {
         project_id: ProjectId,
+        cursor: Option<ReadCursor>,
+        fixed_commit: Option<String>,
     },
     Send {
         project_id: ProjectId,
         message: String,
         operation_id: uuid::Uuid,
     },
+}
+
+fn project_board_request(
+    project_id: ProjectId,
+    cursor: Option<ReadCursor>,
+    fixed_commit: Option<String>,
+) -> ProjectBoardRequest {
+    ProjectBoardRequest {
+        project_id,
+        include_cancelled: false,
+        include_archived: false,
+        sprint_filter: None,
+        overdue_as_of: None,
+        limit: 24,
+        cursor,
+        fixed_commit,
+    }
 }
 
 fn operation_key(
@@ -220,31 +242,41 @@ impl TicketApplication {
             })
             .await?;
         match request {
-            SupervisorProjectRequest::Projects => {
+            SupervisorProjectRequest::Projects { query, offset } => {
                 let projects = host
                     .creator
                     .projects
                     .list()
                     .map_err(|error| Error::AuthorityUnavailable(error.to_string()))?;
-                Ok(
-                    json!({"projects":projects.iter().filter(|project| project.status == ProjectStatus::Active)
-                    .take(32).map(|project| json!({"id":project.id,"name":project.name})).collect::<Vec<_>>()}),
-                )
+                let query = query.as_deref().map(|value| value.trim().to_lowercase());
+                let offset = offset.unwrap_or(0);
+                let mut matching = projects
+                    .iter()
+                    .filter(|project| project.status == ProjectStatus::Active)
+                    .filter(|project| {
+                        query.as_ref().is_none_or(|term| {
+                            project.name.to_lowercase().contains(term)
+                                || project.id.as_str().to_lowercase().contains(term)
+                        })
+                    })
+                    .skip(offset);
+                let page = matching
+                    .by_ref()
+                    .take(32)
+                    .map(|project| json!({"id":project.id,"name":project.name}))
+                    .collect::<Vec<_>>();
+                let next_offset = matching.next().and_then(|_| offset.checked_add(page.len()));
+                Ok(json!({"projects":page,"next_offset":next_offset}))
             }
-            SupervisorProjectRequest::Inspect { project_id } => {
+            SupervisorProjectRequest::Inspect {
+                project_id,
+                cursor,
+                fixed_commit,
+            } => {
                 let project = active_project(&host.creator.projects, &project_id)?;
                 let board = service.project_board(
                     &authority,
-                    &ProjectBoardRequest {
-                        project_id,
-                        include_cancelled: false,
-                        include_archived: false,
-                        sprint_filter: None,
-                        overdue_as_of: None,
-                        limit: 24,
-                        cursor: None,
-                        fixed_commit: None,
-                    },
+                    &project_board_request(project_id, cursor, fixed_commit),
                 )?;
                 Ok(
                     json!({"name":project.name,"manager":project.project_manager.map(|binding| binding.session_id),"board":board}),
@@ -331,16 +363,7 @@ impl TicketApplication {
             } => {
                 let board = service.project_board(
                     &authority,
-                    &ProjectBoardRequest {
-                        project_id: project.id.clone(),
-                        include_cancelled: false,
-                        include_archived: false,
-                        sprint_filter: None,
-                        overdue_as_of: None,
-                        limit: 24,
-                        cursor,
-                        fixed_commit,
-                    },
+                    &project_board_request(project.id.clone(), cursor, fixed_commit),
                 )?;
                 Ok(json!({
                     "board": board,

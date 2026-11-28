@@ -58,18 +58,27 @@ impl Tool for ProjectWorkTool {
 
     fn description(&self) -> &str {
         if self.name == CONTACT {
-            "Supervisor only. List Projects, inspect one Project's Work, or send an instruction to its Project Manager. Delivery is asynchronous."
+            "Supervisor only. Find Projects by name or ID, or continue a list with next_offset. Inspect a Project's Work or send a durable instruction to its Project Manager."
         } else {
             "Project Manager only. List or inspect this Project's Work and sections. Pass board.next_cursor to read another page. Start an existing Work on explicit user instruction with a matching Section and registered prepared worktree."
         }
     }
 
     fn parameters_schema(&self) -> Value {
+        let cursor = json!({"anyOf":[{"type":"null"},schema::object(json!({
+            "commit":{"type":"string","minLength":1},
+            "query_hash":{"type":"string","minLength":1},
+            "offset":{"type":"integer","minimum":0}
+        }), &["commit","query_hash","offset"])]});
         if self.name == CONTACT {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "action": {"type":"string","enum":["projects","inspect","send"]},
+                    "query": {"type":["string","null"],"description":"Filter active Projects by name or ID"},
+                    "offset": {"type":["integer","null"],"minimum":0,"description":"Pass next_offset to continue the same Project search"},
+                    "cursor":cursor,
+                    "fixed_commit":{"type":["string","null"],"description":"Optional fixed Work board snapshot for inspect"},
                     "project_id": {"type":"string","description":"Exact Project ID for inspect or send"},
                     "message": {"type":"string","description":"Instruction for send"},
                     "operation_id": {"type":"string","format":"uuid","description":"Required for send; reuse on retries"}
@@ -81,11 +90,7 @@ impl Tool for ProjectWorkTool {
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "action":{"type":"string","enum":["list","inspect","start"]},
-                    "cursor":{"anyOf":[{"type":"null"},schema::object(json!({
-                        "commit":{"type":"string","minLength":1},
-                        "query_hash":{"type":"string","minLength":1},
-                        "offset":{"type":"integer","minimum":0}
-                    }), &["commit","query_hash","offset"])]},
+                    "cursor":cursor,
                     "fixed_commit":{"type":["string","null"],"description":"Optional fixed board snapshot for list"},
                     "work_id":{"type":"string","description":"Exact Work ID for inspect or start"},
                     "section_id":{"type":["string","null"],"description":"Existing Section ID for start, required when this Project has sections"},
