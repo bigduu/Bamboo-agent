@@ -1,10 +1,11 @@
 //! Compiled private role package; declarations never grant runtime capabilities.
 use super::*;
 
-const DOCUMENTS: [&[u8]; 3] = [
+const DOCUMENTS: [&[u8]; 4] = [
     include_bytes!("builtin/explorer.md"),
     include_bytes!("builtin/implementer.md"),
     include_bytes!("builtin/reviewer.md"),
+    include_bytes!("builtin/ticket-creator.md"),
 ];
 const MAX_BUILTIN_PROMPT_BYTES: usize = 4_096;
 

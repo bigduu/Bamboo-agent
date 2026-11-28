@@ -1461,3 +1461,208 @@ async fn existing_project_work_survives_restart_and_dispatches_into_section() {
     drop(app);
     state.shutdown().await;
 }
+
+#[actix_web::test]
+async fn ordinary_project_session_drafts_work_through_the_named_ticket_creator() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().canonicalize().unwrap();
+    let workspace = execution_workspace(&path);
+    let (send, mut requests) = mpsc::unbounded_channel();
+    let provider = Arc::new(LocalProvider {
+        requests: send,
+        calls: AtomicUsize::new(0),
+        max_requests: 8,
+    });
+    let draft_report = json!({
+        "status": "draft",
+        "title": "Installation documentation",
+        "objective": "Prepare an installation acceptance checklist",
+        "acceptance": ["List the proposed installation checks"],
+        "facts": ["The target is macOS ARM64."],
+        "decisions": ["Cover fresh installations."],
+        "open_questions": [],
+    });
+    let state = web::Data::new(Box::pin(host(&path, provider.clone())).await);
+    let project = state
+        .project_store
+        .create_with_project_path(
+            "Project Manager acceptance",
+            Some("Project description fixture for the installation project".into()),
+            workspace.repo.clone(),
+            vec![WorkspaceBinding {
+                path: workspace.worktree.clone(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .unwrap();
+    let mut ordinary = Session::new("reporter", native_work::MODEL);
+    ordinary.title = "Installation planning".into();
+    ordinary.title_generated = true;
+    ordinary.set_project_id_meta(project.id.to_string());
+    ordinary.set_workspace_path_meta(workspace.repo.clone());
+    ordinary.add_message(Message::user(
+        "Use macOS ARM64 and cover a fresh installation.",
+    ));
+    ordinary.add_message(Message::assistant("I will use that scope.", None));
+    state.storage.save_session(&ordinary).await.unwrap();
+    let ordinary = state
+        .storage
+        .load_session(&ordinary.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!ordinary
+        .messages
+        .iter()
+        .any(|message| message.content.contains("Project Manager")));
+    assert!(!ordinary.allows_model_tool_execution("project_manager_work"));
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes),
+    )
+    .await;
+    owner_post!(
+        app,
+        "/api/v1/chat",
+        &json!({"session_id": ordinary.id, "message":"We should follow up separately on the installation acceptance checklist.", "model":native_work::MODEL}),
+        StatusCode::CREATED
+    );
+    owner_post!(
+        app,
+        &format!("/api/v1/execute/{}", ordinary.id),
+        &json!({ "model": native_work::MODEL }),
+        StatusCode::ACCEPTED
+    );
+    let admission = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("ordinary Project model request")
+        .unwrap();
+    assert!(admission.messages.iter().any(|message| message
+        .content
+        .contains("Project description fixture for the installation project")));
+    assert!(!admission
+        .messages
+        .iter()
+        .any(|message| message.content.contains("Section description fixture")));
+    assert!(!admission.messages.iter().any(|message| message
+        .content
+        .contains("You are this Project's Project Manager")));
+    assert_eq!(
+        admission
+            .messages
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .contains("For work needing separate tracking")
+            })
+            .count(),
+        1,
+        "the ordinary Project turn gets one concise Ticket Creator cue"
+    );
+    assert!(!admission.tools.iter().any(|tool| matches!(
+        tool.function.name.as_str(),
+        "project_manager_work" | "project_ticket_create"
+    )));
+    let admission = discover_project_tool(&mut requests, admission, "SubAgent").await;
+    model_tool(
+        admission,
+        "launch-ticket-creator",
+        "SubAgent",
+        json!({"role":"ticket-creator","message":"Draft the installation acceptance checklist follow-up."}),
+    );
+    let first = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("SubAgent launch or Child request")
+        .unwrap();
+    let second = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("SubAgent launch and Child request")
+        .unwrap();
+    let (launched, creator) = if first
+        .messages
+        .iter()
+        .any(|message| message.tool_call_id.as_deref() == Some("launch-ticket-creator"))
+    {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let launch = model_tool_result(&launched, "launch-ticket-creator");
+    let child_id = launch["actor_id"].as_str().expect("creator actor");
+    assert!(creator.messages.iter().any(|message| {
+        message.role == Role::System && message.content.contains("Create one Work draft")
+    }));
+    assert!(creator
+        .messages
+        .iter()
+        .any(|message| message.content.contains("macOS ARM64")));
+    assert!(!creator
+        .messages
+        .iter()
+        .any(|message| message.content.contains("description fixture")));
+    assert!(
+        creator.tools.is_empty(),
+        "Creator receives only drafting context"
+    );
+    model_tool(
+        launched,
+        "await-ticket-creator",
+        "SubAgent",
+        json!({"intent":"wait","target":child_id}),
+    );
+    creator
+        .reply
+        .send(LLMChunk::Token(draft_report.to_string()))
+        .unwrap();
+    let drafted = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("Project model request after the Host saves the draft")
+        .unwrap();
+    assert!(drafted
+        .messages
+        .iter()
+        .any(|message| message.content.contains("ticket_draft")));
+    drafted
+        .reply
+        .send(LLMChunk::Token("Draft recorded.".into()))
+        .unwrap();
+    let ordinary = state
+        .storage
+        .load_session(&ordinary.id)
+        .await
+        .unwrap()
+        .unwrap();
+    project_tool(
+        &state,
+        &ordinary,
+        "project_manager_work",
+        json!({"action":"list"}),
+        false,
+    )
+    .await;
+    let (service, _) = state
+        .tickets
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.tickets.len(), 1);
+    let work_id = snapshot.tickets.keys().next().unwrap().clone();
+    assert_eq!(snapshot.project.links[&work_id], project.id);
+    assert_eq!(snapshot.tickets[&work_id].state, WorkState::Draft);
+    let brief = snapshot.tickets[&work_id].draft_brief.as_ref().unwrap();
+    assert_eq!(brief.source_session_id, ordinary.id);
+    assert!(brief.sources.len() >= 2);
+    assert!(snapshot.assignments.is_empty());
+    drop(app);
+    state.shutdown().await;
+}
