@@ -1,3 +1,4 @@
+use bamboo_skills::catalog::WorkflowSource;
 use bamboo_skills::types::SkillDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -6,6 +7,33 @@ use serde_json::Value;
 pub(super) struct SkillListResponse {
     pub(super) skills: Vec<SkillDefinition>,
     pub(super) total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) management: Option<SkillManagementSnapshot>,
+}
+
+#[derive(Serialize)]
+pub(super) struct SkillManagementSnapshot {
+    pub(super) revision: u64,
+    pub(super) total: usize,
+    pub(super) entries: Vec<SkillManagementEntry>,
+}
+
+#[derive(Serialize)]
+pub(super) struct SkillManagementEntry {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) source: WorkflowSource,
+    pub(super) revision: u64,
+    pub(super) availability: SkillAvailability,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SkillAvailability {
+    Ready,
+    Retained,
+    ViewOnly,
 }
 
 #[derive(Deserialize)]
@@ -13,6 +41,7 @@ pub struct ListSkillsQuery {
     pub(super) search: Option<String>,
     pub(super) refresh: Option<bool>,
     pub(super) include_disabled: Option<bool>,
+    pub(super) include_management: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -59,11 +88,13 @@ mod tests {
         let response = SkillListResponse {
             skills: vec![],
             total: 0,
+            management: None,
         };
 
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"skills\":[]"));
-        assert!(json.contains("\"total\":0"));
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({"skills": [], "total": 0})
+        );
     }
 
     #[test]
@@ -96,12 +127,24 @@ mod tests {
     }
 
     #[test]
+    fn test_list_skills_query_with_include_management() {
+        for include_management in [true, false] {
+            let query: ListSkillsQuery = serde_json::from_value(
+                serde_json::json!({ "include_management": include_management }),
+            )
+            .unwrap();
+            assert_eq!(query.include_management, Some(include_management));
+        }
+    }
+
+    #[test]
     fn test_list_skills_query_empty() {
         let json = r#"{}"#;
         let query: ListSkillsQuery = serde_json::from_str(json).unwrap();
 
         assert_eq!(query.search, None);
         assert_eq!(query.refresh, None);
+        assert_eq!(query.include_management, None);
     }
 
     #[test]
