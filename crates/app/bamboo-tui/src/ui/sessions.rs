@@ -5,7 +5,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::types::SessionSummary;
-use crate::app::{App, SessionActivity, SessionActivityStatus};
+use crate::api::SessionLoopPreviewState;
+use crate::app::{App, SessionActivity, SessionActivityStatus, SessionListLoopStatus};
 use crate::keymap::{ActionContext, ActionId};
 use crate::text;
 use crate::theme::colors;
@@ -46,7 +47,23 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     // Header
-    let header = if area.width < 80 {
+    let header = if let Some(status) = app.selected_session_loop_status() {
+        let title = " Selected · ";
+        let (detail, color) = loop_status_detail(status);
+        let detail = text::clip_cells(
+            &detail,
+            usize::from(area.width).saturating_sub(text::display_width(title)),
+        );
+        Line::from(vec![
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(colors::brand())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(detail, Style::default().fg(color)),
+        ])
+    } else if area.width < 80 {
         Line::from(Span::styled(
             format!(" Sessions · {} total", app.sessions.total),
             Style::default()
@@ -136,13 +153,42 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     // Footer
     let footer_text = format!(
-        " {} open · {} delete · {} refresh",
+        " {} open · {} delete · {} refresh · {} loop status",
         app.key_hint(ActionContext::Sessions, ActionId::Activate),
         app.key_hint(ActionContext::Sessions, ActionId::DeleteSelection),
         app.key_hint(ActionContext::Sessions, ActionId::Refresh),
+        app.key_hint(
+            ActionContext::Sessions,
+            ActionId::InspectSelectedSessionLoop
+        ),
     );
     let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
     f.render_widget(footer, chunks[3]);
+}
+
+fn loop_status_detail(status: &SessionListLoopStatus) -> (String, Color) {
+    let text = match status {
+        SessionListLoopStatus::Loading => "Checking loop status…".into(),
+        SessionListLoopStatus::Available(None) => "No session loop".into(),
+        SessionListLoopStatus::Available(Some(record)) => match &record.state {
+            SessionLoopPreviewState::Scheduled => record.next_fire_at.as_ref().map_or_else(
+                || "Loop scheduled".into(),
+                |next| {
+                    format!(
+                        "Loop scheduled · next {} UTC",
+                        next.format("%Y-%m-%d %H:%M:%S")
+                    )
+                },
+            ),
+            SessionLoopPreviewState::Paused => "Loop paused".into(),
+            SessionLoopPreviewState::Stopped => "Loop stopped".into(),
+            SessionLoopPreviewState::Expired => "Loop expired".into(),
+        },
+        SessionListLoopStatus::Unavailable => {
+            return ("Loop status unavailable".into(), colors::error());
+        }
+    };
+    (text, colors::subtle())
 }
 
 /// Select the contiguous list window that keeps `selected` visible.

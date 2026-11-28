@@ -240,6 +240,7 @@ pub(crate) enum ActionId {
     #[serde(rename = "quick-answer-9")]
     QuickAnswer9,
     DeleteSelection,
+    InspectSelectedSessionLoop,
     NextPage,
     PreviousPage,
     ShowTools,
@@ -1357,6 +1358,14 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (SessionPickerBrowse, "Delete; Ctrl+D"),
             (Permissions, "d; Delete")
         ]
+    ),
+    spec!(
+        InspectSelectedSessionLoop,
+        "Check session loop status",
+        "Read the selected session's paced loop status",
+        false,
+        [Sessions],
+        [(Sessions, "l")]
     ),
     spec!(
         NextPage,
