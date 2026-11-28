@@ -140,6 +140,19 @@ async fn ensure_provision_capabilities(
             )
             .await?;
         }
+        if spec
+            .capabilities
+            .native_tool_ceiling
+            .as_ref()
+            .is_some_and(|ceiling| ceiling.tools.iter().any(|name| name == "ViewImage"))
+        {
+            require_worker_capability(
+                worker_bin,
+                worker_args,
+                crate::provision::VIEW_IMAGE_NATIVE_CEILING_WORKER_CAPABILITY,
+            )
+            .await?;
+        }
     }
     if spec.capabilities.child_creation_identity {
         require_worker_capability(
@@ -372,7 +385,7 @@ pub async fn spawn_worker_on_bus(
 mod tests {
     #[cfg(unix)]
     #[tokio::test]
-    async fn exec_session_native_ceiling_requires_additive_capability_before_spawn() {
+    async fn native_ceiling_extensions_require_additive_capabilities_before_spawn() {
         use std::os::unix::fs::PermissionsExt;
 
         const EXTENSION: &str = "native_tool_ceiling_exec_sessions_v1";
@@ -481,7 +494,35 @@ mod tests {
         ensure_provision_capabilities(&worker, &args, &spec)
             .await
             .unwrap();
+        use crate::provision::VIEW_IMAGE_NATIVE_CEILING_WORKER_CAPABILITY as VIEW_IMAGE_EXTENSION;
+
+        expanded_report
+            .capabilities
+            .retain(|entry| entry != VIEW_IMAGE_EXTENSION);
+        std::fs::write(&report_path, serde_json::to_vec(&expanded_report).unwrap()).unwrap();
+        spec.capabilities
+            .native_tool_ceiling
+            .as_mut()
+            .unwrap()
+            .tools = vec!["Read".into(), "ViewImage".into(), "exec_command".into()];
+        spec.validate().unwrap();
+        for result in [
+            spawn_worker(&worker, &args, &spec, Duration::from_secs(1)).await,
+            spawn_worker_on_bus(&worker, &args, &spec).await,
+        ] {
+            assert!(
+                matches!(result, Err(ref error) if error.to_string().contains(VIEW_IMAGE_EXTENSION))
+            );
+        }
         assert!(!marker.exists() && !fabric.exists());
+
+        expanded_report
+            .capabilities
+            .push(VIEW_IMAGE_EXTENSION.into());
+        std::fs::write(&report_path, serde_json::to_vec(&expanded_report).unwrap()).unwrap();
+        ensure_provision_capabilities(&worker, &args, &spec)
+            .await
+            .unwrap();
     }
 
     use super::*;

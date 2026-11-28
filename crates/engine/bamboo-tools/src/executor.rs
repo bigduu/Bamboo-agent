@@ -384,7 +384,9 @@ impl BuiltinToolExecutor {
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, TaskTool::new()) {
             framework_tools.insert(name, tool);
         }
-        let _ = registry.register(ViewImageTool::new());
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ViewImageTool::new()) {
+            framework_tools.insert(name, tool);
+        }
         let _ = registry.register(WebFetchTool::new());
         let _ = registry.register(WorkspaceTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, WriteTool::new()) {
@@ -413,11 +415,12 @@ impl BuiltinToolExecutor {
 
     // Kept in sync with the active startup wire's NativeToolCeiling::NAMES.
     // This crate intentionally does not depend on the sub-agent transport crate.
-    const NATIVE_TOOL_NAMES: [&'static str; 7] = [
+    const NATIVE_TOOL_NAMES: [&'static str; 8] = [
         "Edit",
         "Glob",
         "Read",
         "Task",
+        "ViewImage",
         "Write",
         "exec_command",
         "write_stdin",
@@ -1377,13 +1380,10 @@ impl BuiltinToolExecutorBuilder {
 
     /// Registers a specific filesystem tool by name
     pub fn with_filesystem_tool(mut self, name: &str) -> Result<Self, ToolError> {
-        if name == "ViewImage" {
-            self.registry
-                .register(ViewImageTool::new())
-                .map_err(|error| ToolError::Execution(error.to_string()))?;
-            return Ok(self);
-        }
         let (name, tool) = match name {
+            "ViewImage" => {
+                BuiltinToolExecutor::register_tracked_builtin(&self.registry, ViewImageTool::new())?
+            }
             "Read" => {
                 BuiltinToolExecutor::register_tracked_builtin(&self.registry, ReadTool::new())?
             }

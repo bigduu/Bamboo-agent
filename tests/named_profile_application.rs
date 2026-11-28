@@ -17,6 +17,16 @@ use std::{
     time::Duration,
 };
 
+const VISION_CHILD_MODEL: &str = "gpt-4o-mini";
+const PIXEL_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x7e, 0x9b,
+    0x55, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x01, 0x48, 0xaf, 0xa4, 0x71, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+const PIXEL_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==";
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Case {
     Implementer,
@@ -75,7 +85,9 @@ fn shell_allowed(case: Case) -> bool {
     !matches!(case, Case::Narrow | Case::RoleDeniesShell)
 }
 fn child_model(case: Case) -> &'static str {
-    if case == Case::ExplicitModel {
+    if builtin(case) {
+        VISION_CHILD_MODEL
+    } else if case == Case::ExplicitModel {
         "explicit-child"
     } else {
         "native-child"
@@ -164,7 +176,14 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 } else {
                     assert!(result.contains("not callable"), "{result}");
                 }
-                (json!({"content":"NATIVE_CHILD_COMPLETED"}), "stop")
+                if builtin(probe.case) {
+                    call(
+                        "ViewImage",
+                        json!({"path": probe.workspace.join("pixel.png")}),
+                    )
+                } else {
+                    (json!({"content":"NATIVE_CHILD_COMPLETED"}), "stop")
+                }
             }
             _ => (json!({"content":"NATIVE_CHILD_COMPLETED"}), "stop"),
         }
@@ -177,7 +196,7 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             1 => {
                 let mut args = json!({"action":"create","title":"Profile child","responsibility":"Complete a bounded assignment with evidence","prompt":"Use the real file tools and report evidence","subagent_type":role(probe.case),"workspace":probe.workspace,"auto_run":false});
                 if probe.case == Case::Unknown || builtin(probe.case) {
-                    args["model"] = json!("openai:native-child");
+                    args["model"] = json!(format!("openai:{}", child_model(probe.case)));
                 } else if probe.case == Case::ExplicitModel {
                     args["model"] = json!("openai:explicit-child");
                 }
@@ -295,6 +314,9 @@ async fn fixture(case: Case) {
     std::fs::create_dir_all(&data).unwrap();
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("input.txt"), "ACTUAL_READ_EVIDENCE").unwrap();
+    if builtin(case) {
+        std::fs::write(workspace.join("pixel.png"), PIXEL_PNG).unwrap();
+    }
     let skill = workspace.join(".bamboo/skills/ceiling-forbidden");
     std::fs::create_dir_all(&skill).unwrap();
     std::fs::write(skill.join("SKILL.md"), "---\nname: ceiling-forbidden\ndescription: Use the authorized native surface\n---\nWORKSPACE_SKILL_SHOULD_NOT_APPLY\n").unwrap();
@@ -324,6 +346,11 @@ async fn fixture(case: Case) {
         );
         if case == Case::RoleDeniesShell {
             project_role = project_role.replace("deny: [Edit]", "deny: [Edit, Bash]");
+        } else if case == Case::Narrow {
+            project_role = project_role.replace(
+                "allow: [Read, Glob, Write]",
+                "allow: [Read, Glob, ViewImage, Write]",
+            );
         }
         std::fs::write(&profile_path, project_role).unwrap();
         if case == Case::Duplicate {
@@ -372,7 +399,7 @@ async fn fixture(case: Case) {
                 "/v1/models",
                 web::get().to(|| async {
                     HttpResponse::Ok()
-                        .json(json!({"data":[{"id":"native-root"},{"id":"native-child"},{"id":"explicit-child"}]}))
+                        .json(json!({"data":[{"id":"native-root"},{"id":"native-child"},{"id":"explicit-child"},{"id":VISION_CHILD_MODEL}]}))
                 }),
             )
     })
@@ -384,10 +411,14 @@ async fn fixture(case: Case) {
     let handle = running.handle();
     actix_web::rt::spawn(running);
     let mut config = json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture-key","base_url":url,"model":"native-root"}},"defaults":{"chat":{"provider":"openai","model":"native-root"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}});
-    config["providers"]["openai"]["runtime_models"] =
-        json!(["native-root", "native-child", "explicit-child"]);
+    config["providers"]["openai"]["runtime_models"] = json!([
+        "native-root",
+        "native-child",
+        "explicit-child",
+        VISION_CHILD_MODEL
+    ]);
     if case == Case::Narrow {
-        config["tools"] = json!({"disabled":["Bash","write_stdin","Edit","Write"]});
+        config["tools"] = json!({"disabled":["Bash","write_stdin","Edit","Write","ViewImage"]});
     }
     std::fs::write(
         data.join("config.json"),
@@ -520,6 +551,20 @@ async fn fixture(case: Case) {
             return;
         }
         assert!(child.len() >= 7);
+        if builtin(case) {
+            let sent_fixture_image = child
+                .iter()
+                .flat_map(|request| request["messages"].as_array().unwrap())
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .any(|part| {
+                    part["type"] == "image_url" && part["image_url"]["url"] == PIXEL_DATA_URL
+                });
+            assert!(
+                sent_fixture_image,
+                "native Child must deliver the actual PNG"
+            );
+        }
         if case != Case::Unknown {
             for request in &child {
                 let text = request["messages"].to_string();
@@ -598,6 +643,10 @@ async fn fixture(case: Case) {
         }
         if case == Case::Unknown {
             assert!(names.contains("Grep"), "the default role retains Grep");
+            assert!(
+                names.contains("ViewImage"),
+                "the default role retains ViewImage"
+            );
         } else {
             let mut expected = BTreeSet::from([DISCOVERY_CONTROL_FALLBACK_TOOL_NAME, "Read"]);
             if shell_allowed(case) {
@@ -608,6 +657,9 @@ async fn fixture(case: Case) {
                 Case::Implementer | Case::ExplicitModel | Case::BuiltinImplementer
             ) {
                 expected.insert("Write");
+            }
+            if builtin(case) {
+                expected.insert("ViewImage");
             }
             if case == Case::BuiltinImplementer {
                 expected.insert("Edit");

@@ -7627,7 +7627,7 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
                 child_session::named_profile::named_profile_tool_names(&child)
                     .unwrap()
                     .unwrap(),
-                ["exec_command", "write_stdin", "Glob", "Read"]
+                ["exec_command", "write_stdin", "Glob", "Read", "ViewImage"]
             );
         }
         if index == 2 {

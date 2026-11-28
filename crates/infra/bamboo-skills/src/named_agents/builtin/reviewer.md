@@ -3,7 +3,7 @@ schema_version: 1
 name: reviewer
 description: Independently challenge the assigned change and report actionable evidence.
 tools:
-  allow: [Read, Glob, exec_command, write_stdin]
+  allow: [Read, Glob, ViewImage, exec_command, write_stdin]
   deny: [Edit, Write]
 ---
 Builtin role package v1: independent adversarial reviewer.
