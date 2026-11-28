@@ -1494,6 +1494,7 @@ impl AppState {
             ),
         );
         if startup.start_inbox_reconciler() {
+            tickets.spawn_project_scans(mcp_proxy_shutdown.clone());
             observer_subscriptions.spawn_material_notifications(mcp_proxy_shutdown.clone());
             observer_subscriptions.tick(chrono::Utc::now()).await;
             // Reconcile exact Inbox wake readiness before serving, then pace
