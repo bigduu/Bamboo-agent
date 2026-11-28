@@ -207,6 +207,33 @@ fn expected_parent_coordination_guide(
     )
 }
 
+fn expected_parent_project_work_guide(
+    schemas: &[ToolSchema],
+    ticket_creator_is_eligible: bool,
+) -> Option<String> {
+    if !ticket_creator_is_eligible {
+        return None;
+    }
+    let has_tool = |name| schemas.iter().any(|schema| schema.function.name == name);
+    let instruction = if has_tool("SubAgent") {
+        "For work needing separate tracking, later follow-up, or handoff, call SubAgent with role=ticket-creator and wait for its Work receipt."
+    } else if has_tool(bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME) {
+        "For work needing separate tracking, later follow-up, or handoff, call discover_capabilities with query=SubAgent to load it, then use SubAgent with role=ticket-creator and wait for its Work receipt."
+    } else {
+        return None;
+    };
+    Some(
+        ContextBlock::new(
+            ContextBlockType::ToolGuide,
+            ContextBlockPriority::High,
+            ContextBlockStability::RoundDynamic,
+            "Project Work",
+            instruction,
+        )
+        .render_runtime_context_text(),
+    )
+}
+
 fn unique_parent_guide_index(
     messages: &[Value],
     expected: Option<String>,
@@ -255,7 +282,7 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
             Ok(schemas) => schemas,
             Err(_) => return unexpected_request(&probe, &body, "invalid Parent tool catalog"),
         };
-        let (memory_is_eligible, coordination_is_eligible) = {
+        let (memory_is_eligible, coordination_is_eligible, ticket_creator_is_eligible) = {
             let allowed_names = probe.parent_tool_names.lock().unwrap();
             let mut seen = BTreeSet::new();
             if schemas.is_empty()
@@ -284,6 +311,7 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
             (
                 eligible("memory"),
                 eligible(bamboo_domain::SESSION_COORDINATION_TOOL_NAME),
+                parent.project_id_meta().is_some() && eligible("SubAgent"),
             )
         };
         // Use the real post-filter provider catalog. The Root surface also
@@ -313,6 +341,14 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
             Ok(index) => index,
             Err(reason) => return unexpected_request(&probe, &body, reason),
         };
+        let project_work_guide_index = match unique_parent_guide_index(
+            messages,
+            expected_parent_project_work_guide(&schemas, ticket_creator_is_eligible),
+            "missing or repeated Parent Project Work guide",
+        ) {
+            Ok(index) => index,
+            Err(reason) => return unexpected_request(&probe, &body, reason),
+        };
         let prefix = format!(
             "Runtime notification: child session `{child_id}` finished with status `completed`."
         );
@@ -329,6 +365,7 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
             if message["role"] == "system"
                 || memory_guide_index == Some(index)
                 || coordination_guide_index == Some(index)
+                || project_work_guide_index == Some(index)
                 || is_persisted_parent_context(message, &parent, &expected_guide)
             {
                 continue;
@@ -366,6 +403,13 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
                     &probe,
                     &body,
                     "Parent Session coordination guide follows the current outcome",
+                );
+            }
+            if project_work_guide_index.is_some_and(|guide| guide >= index) {
+                return unexpected_request(
+                    &probe,
+                    &body,
+                    "Parent Project Work guide follows the current outcome",
                 );
             }
             fresh.push((outcome.unwrap(), content.to_string()));
