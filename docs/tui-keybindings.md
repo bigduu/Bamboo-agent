@@ -54,6 +54,17 @@ hyphens, as in `edge-api`, `_worker2`, and `缓存`. Use a first segment outside
 Mermaid's reserved keywords and keep `x` or `X` away from the position after a
 hyphen, where it can denote an arrow. [Mermaid sequence syntax](https://mermaid.js.org/syntax/sequenceDiagram.html)
 
+Settled `stateDiagram-v2` fences can preview one top-down path. Write
+`Waiting --> Working` or `Waiting --> Working: Start` for a transition.
+`[*]` on the left marks the initial state, and `[*]` on the right marks the
+final state. Give each state at most one plain label with `ID: Description`
+or `state "Description" as ID`. Ordinary state IDs use letters, digits, and
+underscores and begin with a letter or underscore. The initial and final
+markers reserve `root_start` and `root_end` respectively. The preview fits
+eight path nodes total, including endpoint markers, in 4 KiB. Branches, cycles,
+composite or concurrent states, and direction or shape directives use the
+source view. [Mermaid state syntax](https://mermaid.js.org/syntax/stateDiagram.html)
+
 The transcript shows the original diagram source while the reply streams, when
 the syntax is unsupported, or when the diagram is wider than the terminal.
 Select the Mermaid fence to copy its source after the reply settles.
