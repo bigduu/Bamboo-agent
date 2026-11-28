@@ -1987,6 +1987,151 @@ async fn projected_usage_adds_the_provider_visible_schema_lane_once() {
 }
 
 #[test]
+fn request_usage_accounts_for_multipart_content_and_reasoning() {
+    use bamboo_compression::TiktokenTokenCounter;
+    use bamboo_domain::{ImageUrlRef, MessagePart};
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-multipart-projection", "test-model");
+    let config = test_config("system");
+    let prepared = PreparedContext {
+        messages: vec![
+            Message::user("inspect this"),
+            Message::assistant("result", None),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let measure = |context: &PreparedContext| {
+        let envelope = super::build_request_envelope(&session, context, &config, &[]);
+        super::measure_request_usage(
+            &session,
+            &envelope,
+            &ProviderVisibleToolFootprint::default(),
+        )
+        .message_input_tokens
+    };
+    let baseline = measure(&prepared);
+    let counter = TiktokenTokenCounter::default();
+
+    let mut with_text = prepared.clone();
+    let mirror = MessagePart::Text {
+        text: with_text.messages[0].content.clone(),
+    };
+    with_text.messages[0].content_parts = Some(vec![mirror.clone()]);
+    assert_eq!(measure(&with_text), baseline);
+
+    let supplemental_text = "This text exists only in the multipart content.";
+    with_text.messages[0].content_parts = Some(vec![
+        mirror,
+        MessagePart::Text {
+            text: supplemental_text.into(),
+        },
+    ]);
+    assert_eq!(
+        measure(&with_text),
+        baseline + counter.count_text(supplemental_text)
+    );
+
+    let reasoning = "Compare both observations before replying.";
+    let mut with_reasoning = prepared.clone();
+    with_reasoning.messages[1].reasoning = Some(reasoning.into());
+    let reasoned = measure(&with_reasoning);
+    assert_eq!(reasoned, baseline + counter.count_text(reasoning));
+
+    let signature = "fixture-signed-reasoning";
+    with_reasoning.messages[1].reasoning_signature = Some(signature.into());
+    assert_eq!(
+        measure(&with_reasoning),
+        reasoned + counter.count_text(signature)
+    );
+
+    let mut with_image = prepared;
+    with_image.messages[0].content_parts = Some(vec![MessagePart::ImageUrl {
+        image_url: ImageUrlRef {
+            url: "data:image/png;base64,AAAA".into(),
+            detail: None,
+        },
+    }]);
+    assert!(measure(&with_image) > baseline);
+}
+
+#[test]
+fn trimmed_history_reference_is_budgeted_and_routes_only_to_callable_self_history() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-trimmed-history", "test-model");
+    let old = Message::user("old evidence kept only in the session file");
+    let orphan = Message::tool_result("missing-call", "malformed tool result");
+    let current = Message::user("check the current claim");
+    session.add_message(old.clone());
+    session.add_message(orphan.clone());
+    session.add_message(current.clone());
+    let mut prepared = PreparedContext {
+        messages: vec![current.clone()],
+        token_usage: usage(0, 24),
+        truncation_occurred: true,
+        segments_removed: 1,
+        compressed_message_ids: vec![old.id.clone(), orphan.id.clone()],
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let config = test_config("system");
+    let history = ToolSchema {
+        schema_type: "function".into(),
+        function: FunctionSchema {
+            name: "session_history_current".into(),
+            description: "Read this session".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"action": {"enum": ["search_current", "read_slice"]}},
+            }),
+        },
+    };
+    let tools = [history];
+    let before = super::build_request_envelope(&session, &prepared, &config, &[]);
+    assert!(before.ir.body_chat().iter().all(|message| {
+        !message
+            .content
+            .contains("On-demand trimmed history reference")
+    }));
+
+    let with_reference = super::build_request_envelope(&session, &prepared, &config, &tools);
+    let body = with_reference.ir.body_chat();
+    assert!(body
+        .iter()
+        .all(|message| !message.content.contains(&old.content)));
+    let reference = body
+        .iter()
+        .position(|message| {
+            message
+                .content
+                .contains("On-demand trimmed history reference")
+        })
+        .unwrap();
+    let current_index = body
+        .iter()
+        .position(|message| message.id == current.id)
+        .unwrap();
+    assert!(reference < current_index);
+    assert!(body[reference].content.contains("read_slice"));
+    assert!(body[reference].content.contains(&old.id));
+    assert!(!body[reference].content.contains(&orphan.id));
+
+    prepared.truncation_occurred = false;
+    prepared.compressed_message_ids.clear();
+    let untrimmed = super::build_request_envelope(&session, &prepared, &config, &tools);
+    let footprint = ProviderVisibleToolFootprint::default();
+    assert!(
+        super::measure_request_usage(&session, &with_reference, &footprint).input_tokens
+            > super::measure_request_usage(&session, &untrimmed, &footprint).input_tokens
+    );
+}
+
+#[test]
 fn openai_loaded_tool_items_increase_only_the_message_lane() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-openai-loaded-budget", "test-model");
@@ -7016,6 +7161,123 @@ async fn prepared_main_stream_over_budget_request_rejects_before_checkpoint_and_
         0,
         "an over-budget prepared request must be rejected before any checkpoint"
     );
+}
+
+#[tokio::test]
+async fn final_guard_counts_native_multipart_input_before_checkpoint_and_dispatch() {
+    use bamboo_domain::MessagePart;
+    use std::sync::atomic::Ordering;
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "multipart-final-budget";
+    let model = "test-model";
+    let text = "inspect the attached evidence";
+    let plain = Message::user(text);
+    let mut parts_only = plain.clone();
+    parts_only.content.clear();
+    parts_only.content_parts = Some(vec![MessagePart::Text {
+        text: "long evidence stored in the text part only ".repeat(500),
+    }]);
+    let image = retained_image_message(text);
+
+    for (case, message, extra_input_tokens, expect_dispatch) in [
+        ("plain control", plain.clone(), 64, true),
+        ("parts-only text", parts_only, 64, false),
+        ("native image", image.clone(), 64, false),
+        ("native image within the window", image, 8_000, true),
+    ] {
+        let mut session = Session::new(session_id, model);
+        session.add_message(message.clone());
+        let persistence = Arc::new(AdoptingRoundPersistence {
+            durable: Mutex::new(session.clone()),
+            saves: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut config = test_config("system");
+        config.persistence = Some(persistence.clone());
+        let llm = mock_llm(vec![LLMChunk::Token("ok".into()), LLMChunk::Done]);
+        let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+        let mut prepared = PreparedContext {
+            messages: vec![plain.clone()],
+            token_usage: usage(0, 24),
+            truncation_occurred: false,
+            segments_removed: 0,
+            compressed_message_ids: Vec::new(),
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+        };
+        let baseline =
+            super::project_request_usage(&session, &prepared, &config, &[], model, &llm_dyn)
+                .await
+                .unwrap()
+                .input_tokens;
+        prepared.messages[0] = message.clone();
+        let budget = TokenBudget::with_safety_margin(
+            baseline + extra_input_tokens + 200,
+            200,
+            BudgetStrategy::default(),
+            0,
+        );
+
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(64);
+        let result = execute_llm_stream(
+            &mut session,
+            &config,
+            &llm_dyn,
+            &prepared,
+            &[],
+            &LlmStreamFrame {
+                provider_default_output: false,
+                event_tx: &event_tx,
+                cancel_token: &CancellationToken::new(),
+                session_id,
+                model,
+                provider_name: None,
+                provider_type: None,
+                reasoning_effort: None,
+                output_limit_recovery: None,
+                budget: &budget,
+                observation_progress_hint: None,
+                prompt_memory_exposure: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            persistence.saves.load(Ordering::SeqCst),
+            usize::from(expect_dispatch),
+            "{case}"
+        );
+        assert_eq!(
+            llm.ir_call_count.load(Ordering::SeqCst),
+            usize::from(expect_dispatch),
+            "{case}"
+        );
+        let stored_messages = &persistence.durable.lock().unwrap().messages;
+        assert_eq!(
+            serde_json::to_value(stored_messages).unwrap(),
+            serde_json::to_value([&message]).unwrap(),
+            "{case}"
+        );
+        if expect_dispatch {
+            assert!(result.is_ok(), "{case} must complete");
+            let dispatched = llm.requested_messages.lock().unwrap();
+            let request = dispatched.iter().find(|row| row.id == message.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(&request.content_parts).unwrap(),
+                serde_json::to_value(&message.content_parts).unwrap(),
+                "{case}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(AgentError::Budget(_))),
+                "{case} must fail the final budget check"
+            );
+            assert!(
+                session.model_context_state.is_none(),
+                "{case} must not leave an uncommitted ledger"
+            );
+        }
+    }
 }
 
 #[tokio::test]

@@ -211,6 +211,62 @@ fn contract(title: &str) -> Contract {
 }
 
 #[test]
+fn project_draft_brief_is_bound_once_and_follows_the_work_to_execution() {
+    let fixture = Fixture::new();
+    let work = fixture.create("linked draft", true);
+    let unlinked = fixture.create("unlinked draft", false);
+    let brief = DraftBrief {
+        source_session_id: "source-root".into(),
+        facts: vec!["Cover a fresh installation.".into()],
+        decisions: vec!["Use the existing test document.".into()],
+        open_questions: Vec::new(),
+        required_files: BTreeSet::new(),
+        sources: vec![DraftSource {
+            message_id: "source-message".into(),
+            content_sha256: content_hash(b"source text"),
+        }],
+    };
+    let assign = |id: &str, work: &str| {
+        fixture.service.work_update(
+            &fixture.authority,
+            &fixture.command(
+                id,
+                vec![Operation::SetDraftBrief {
+                    work_id: work.into(),
+                    brief: brief.clone(),
+                }],
+            ),
+        )
+    };
+    assert!(assign("refuse-unlinked", &unlinked).is_err());
+    assert!(fixture.service.published().unwrap().1.tickets[&unlinked]
+        .draft_brief
+        .is_none());
+    assign("save-draft-brief", &work).unwrap();
+    assert!(assign("refuse-second-brief", &work).is_err());
+    let (assignment, _, worker) = fixture.running(&work);
+    assert_eq!(
+        fixture
+            .service
+            .child_context_packet(&worker, &assignment, 32_768)
+            .unwrap()
+            .draft_brief
+            .as_ref(),
+        Some(&brief)
+    );
+    let Fixture { root, service, .. } = fixture;
+    let binding = service.published().unwrap().1.binding;
+    drop(service);
+    let reopened = TicketService::open(root.path(), binding).unwrap();
+    assert_eq!(
+        reopened.published().unwrap().1.tickets[&work]
+            .draft_brief
+            .as_ref(),
+        Some(&brief)
+    );
+}
+
+#[test]
 fn review_context_adoption_rechecks_existing_answers_before_publication() {
     for replace_existing in [false, true] {
         let f = Fixture::new();

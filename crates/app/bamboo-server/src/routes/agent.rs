@@ -330,8 +330,24 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route("/projects", web::get().to(agent::projects::list_projects))
         .route("/projects", web::post().to(agent::projects::create_project))
         .route(
+            "/projects/{project_id}/manager",
+            web::post().to(crate::app_state::ticket_application::project_manager::open),
+        )
+        .route(
+            "/projects/{project_id}/scan",
+            web::get().to(crate::app_state::ticket_application::project_scan::status),
+        )
+        .route(
+            "/projects/{project_id}/scan",
+            web::post().to(crate::app_state::ticket_application::project_scan::control),
+        )
+        .route(
             "/projects/{project_id}",
             web::get().to(agent::projects::get_project),
+        )
+        .route(
+            "/projects/{project_id}/session-categories",
+            web::get().to(agent::projects::project_session_categories),
         )
         .route(
             "/projects/{project_id}",
@@ -475,6 +491,38 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/schedules/{schedule_id}",
             web::patch().to(agent::schedules::patch_schedule),
+        )
+        .route(
+            "/schedules/{schedule_id}/name",
+            web::patch().to(agent::schedules::rename_schedule),
+        )
+        .route(
+            "/schedules/{schedule_id}/interval",
+            web::patch().to(agent::schedules::set_schedule_interval),
+        )
+        .route(
+            "/schedules/{schedule_id}/cron-expression",
+            web::patch().to(agent::schedules::set_schedule_cron_expression),
+        )
+        .route(
+            "/schedules/{schedule_id}/once-at",
+            web::patch().to(agent::schedules::set_schedule_once_at),
+        )
+        .route(
+            "/schedules/{schedule_id}/daily-time",
+            web::patch().to(agent::schedules::set_schedule_daily_time),
+        )
+        .route(
+            "/schedules/{schedule_id}/weekly-time",
+            web::patch().to(agent::schedules::set_schedule_weekly_time),
+        )
+        .route(
+            "/schedules/{schedule_id}/monthly-time",
+            web::patch().to(agent::schedules::set_schedule_monthly_time),
+        )
+        .route(
+            "/schedules/{schedule_id}/prompt",
+            web::patch().to(agent::schedules::set_schedule_prompt),
         )
         .route(
             "/schedules/{schedule_id}",

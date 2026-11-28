@@ -298,7 +298,19 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #3169 keeps message-fork tests in default Storage/packages-0 and server-handlers.
 // The five additive contexts and 23 case selections retain their current owners.
 // #3189 adds default Server HTTP and Storage Root writer regression cases.
-const FEATURE_SOURCE_SHA256 = "3aeb7d252224343918e02d009a018facd9a2a3e7e7be200ed00424f6d7115d2a";
+// Request-budget and self-history checks retain the existing Engine and Storage owners.
+// #3266 adds Project Manager routing to the existing Server Ticket owner.
+// Restart, Section placement, and submission use native_work_acceptance in
+// server-tests-1. Cargo features and additive case selections stay the same.
+// #3268 updates the Ticket command source. Draft context uses the default
+// project_board integration target in packages-0. Additive selections stay intact.
+// The Ticket Creator changes the existing Server Tools and Engine sources.
+// Its native Project admission case uses native_work_acceptance in
+// server-tests-1. Additive selections stay intact.
+// Project scan uses native_work_acceptance in server-tests-1. Required-file
+// checks stay with default Tickets in packages-0, and summary parsing stays
+// with the default Orchestration owner. Additive case selections stay intact.
+const FEATURE_SOURCE_SHA256 = "e44ef6ef3611644e3fe3881f7f630f7dc7b328fe6b33a550193e1a861dfbf5af";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

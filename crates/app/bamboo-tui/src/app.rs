@@ -22,9 +22,9 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::api::sse::{SessionSseEvent, SseStream, SESSION_SSE_CHANNEL_CAPACITY};
 use crate::api::types::*;
-use crate::api::{BambooClient, LoopChatRecord, RespondFailure};
+use crate::api::{BambooClient, LoopChatRecord, RespondFailure, SessionLoopPreview};
 use crate::clipboard::{self, ClipboardContents, ClipboardImage};
-use crate::components::markdown::copyable_fences;
+use crate::components::markdown::{copyable_fences, MermaidGlyphs};
 use crate::components::session_rows::SessionRows;
 use crate::event::{AnswerSubmissionOutcome, AppEvent};
 use crate::file_reference::{pasted_files, FileReference};
@@ -33,7 +33,9 @@ use crate::keymap::{
     text_character, text_widget_input_allowed, ActionAvailability, ActionContext, ActionId,
     HelpEntry, KeyResolution, Keymap, PendingSequence,
 };
-use crate::schedule_form::ScheduleForm;
+use crate::schedule_form::{
+    parse_schedule_clock, parse_schedule_once_at, ScheduleForm, SCHEDULE_ONCE_AT_INPUT_ERROR,
+};
 use crate::search::ranked_indices;
 use crate::subagents::{SubagentTreeState, SubagentTreeStatus, MAX_SUBAGENT_TREE_SESSIONS};
 use crate::task_plan::{TaskPlanOverlayState, TaskPlanPane, TaskProgressState};
@@ -1853,6 +1855,17 @@ async fn observe_loop(
 
 // ── Per-tab states ──
 
+pub(crate) enum SessionListLoopStatus {
+    Loading,
+    Available(Option<SessionLoopPreview>),
+    Unavailable,
+}
+
+struct SessionLoopLookup {
+    session_id: String,
+    status: SessionListLoopStatus,
+}
+
 pub struct SessionsState {
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
@@ -1875,6 +1888,8 @@ pub struct SessionsState {
     /// Newest list request issued for this tab. A slower prior page must not
     /// replace newer rows after a rapid refresh.
     summary_observation_epoch: u64,
+    loop_status_generation: u64,
+    loop_lookup: Option<SessionLoopLookup>,
 }
 
 impl SessionsState {
@@ -1889,6 +1904,19 @@ impl SessionsState {
             page_limit: 0,
             next_offset: None,
             summary_observation_epoch: 0,
+            loop_status_generation: 0,
+            loop_lookup: None,
+        }
+    }
+
+    fn selected_id(&self) -> Option<&str> {
+        self.sessions.get(self.selected).map(|row| row.id.as_str())
+    }
+
+    fn select(&mut self, index: usize) {
+        if self.selected != index {
+            self.selected = index;
+            self.loop_lookup = None;
         }
     }
 }
@@ -1928,6 +1956,138 @@ struct PendingScheduleToggle {
     generation: u64,
     schedule_id: String,
     enabled: bool,
+}
+
+struct PendingScheduleRename {
+    generation: u64,
+    schedule_id: String,
+    name: String,
+}
+
+pub(crate) struct ScheduleRename {
+    schedule_id: String,
+    pub(crate) draft: String,
+    pub(crate) error: Option<String>,
+}
+
+struct PendingScheduleCadence {
+    generation: u64,
+    schedule_id: String,
+    value: ScheduleCadenceValue,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ScheduleCadenceKind {
+    Interval,
+    Clock(ScheduleClockKind),
+    OnceAt,
+    CronExpression,
+}
+
+#[derive(Clone)]
+enum ScheduleCadenceValue {
+    Interval(u64),
+    Clock(ScheduleClockKind, ScheduleClockTime),
+    OnceAt(DateTime<Utc>),
+    CronExpression(String),
+}
+
+const INTERVAL_INPUT_ERROR: &str = "Enter a positive whole number of seconds";
+const INTERVAL_TOO_LARGE: &str = "Interval is too large";
+const SCHEDULE_CLOCK_INPUT_ERROR: &str = "Enter a time in HH:MM or HH:MM:SS format";
+const SCHEDULE_CRON_INPUT_ERROR: &str = "Enter a Cron expression";
+
+pub(crate) struct ScheduleCadenceEdit {
+    schedule_id: String,
+    pub(crate) kind: ScheduleCadenceKind,
+    pub(crate) timezone: Option<String>,
+    pub(crate) calendar_days: Option<String>,
+    pub(crate) draft: String,
+    pub(crate) error: Option<String>,
+}
+
+impl ScheduleCadenceEdit {
+    fn value(&self) -> Result<ScheduleCadenceValue, &'static str> {
+        match self.kind {
+            ScheduleCadenceKind::Interval if self.draft.bytes().all(|byte| byte == b'0') => {
+                Err(INTERVAL_INPUT_ERROR)
+            }
+            ScheduleCadenceKind::Interval => self
+                .draft
+                .parse::<u64>()
+                .ok()
+                .filter(|seconds| is_valid_schedule_interval(*seconds))
+                .map(ScheduleCadenceValue::Interval)
+                .ok_or(INTERVAL_TOO_LARGE),
+            ScheduleCadenceKind::Clock(kind) => parse_schedule_clock(&self.draft)
+                .map(|time| ScheduleCadenceValue::Clock(kind, time))
+                .ok_or(SCHEDULE_CLOCK_INPUT_ERROR),
+            ScheduleCadenceKind::OnceAt => {
+                parse_schedule_once_at(&self.draft, Utc::now()).map(ScheduleCadenceValue::OnceAt)
+            }
+            ScheduleCadenceKind::CronExpression => {
+                let expression = self.draft.trim();
+                if expression.is_empty() {
+                    Err(SCHEDULE_CRON_INPUT_ERROR)
+                } else {
+                    Ok(ScheduleCadenceValue::CronExpression(expression.to_owned()))
+                }
+            }
+        }
+    }
+
+    fn push_character(&mut self, character: char) {
+        let (allowed, limit, invalid, overflow) = match self.kind {
+            ScheduleCadenceKind::Interval => (
+                character.is_ascii_digit(),
+                Some(20),
+                INTERVAL_INPUT_ERROR,
+                INTERVAL_TOO_LARGE,
+            ),
+            ScheduleCadenceKind::Clock(_) => (
+                character.is_ascii_digit() || character == ':',
+                Some(8),
+                SCHEDULE_CLOCK_INPUT_ERROR,
+                SCHEDULE_CLOCK_INPUT_ERROR,
+            ),
+            ScheduleCadenceKind::OnceAt => (
+                character.is_ascii_digit() || "-+:TtZz. ".contains(character),
+                Some(64),
+                SCHEDULE_ONCE_AT_INPUT_ERROR,
+                "Once timestamp is too long",
+            ),
+            ScheduleCadenceKind::CronExpression => (
+                valid_cron_editor_character(character),
+                None,
+                SCHEDULE_CRON_INPUT_ERROR,
+                SCHEDULE_CRON_INPUT_ERROR,
+            ),
+        };
+        if !allowed {
+            self.error = Some(invalid.into());
+        } else if limit.is_some_and(|limit| self.draft.len() >= limit) {
+            self.error = Some(overflow.into());
+        } else {
+            self.draft.push(character);
+            self.error = None;
+        }
+    }
+}
+
+fn valid_cron_editor_character(character: char) -> bool {
+    !character.is_control() || matches!(character, '\t' | '\r' | '\n')
+}
+
+struct PendingSchedulePrompt {
+    generation: u64,
+    schedule_id: String,
+    task_message: String,
+}
+
+pub(crate) struct SchedulePromptEdit {
+    schedule_id: String,
+    pub(crate) textarea: TextArea<'static>,
+    pub(crate) error: Option<String>,
 }
 
 pub(crate) enum ScheduleRunsContent {
@@ -5101,6 +5261,7 @@ pub struct App {
     pub running: bool,
     pub tab: Tab,
     pub theme: crate::theme::ThemePalette,
+    pub(crate) mermaid_glyphs: MermaidGlyphs,
     pub(crate) terminal_settings: Option<SettingsMenu>,
     pub(crate) workspace_hints: bool,
     pub(crate) keymap: Keymap,
@@ -5171,6 +5332,15 @@ pub struct App {
     /// In-progress new-schedule form (Schedules tab). When `Some`, a modal
     /// captures the fields.
     pub schedule_form: Option<ScheduleForm>,
+    pub(crate) schedule_rename: Option<ScheduleRename>,
+    pending_schedule_rename: Option<PendingScheduleRename>,
+    schedule_rename_generation: u64,
+    pub(crate) schedule_cadence: Option<ScheduleCadenceEdit>,
+    pending_schedule_cadence: Option<PendingScheduleCadence>,
+    schedule_cadence_generation: u64,
+    pub(crate) schedule_prompt: Option<SchedulePromptEdit>,
+    pending_schedule_prompt: Option<PendingSchedulePrompt>,
+    schedule_prompt_generation: u64,
     pub(crate) schedule_runs: Option<ScheduleRunsPane>,
     schedule_runs_request_id: u64,
     pub(crate) schedule_sessions: Option<ScheduleSessionsPane>,
@@ -5392,6 +5562,7 @@ impl App {
             running: true,
             tab: Tab::Chat,
             theme: crate::theme::ThemePalette::TrueColor,
+            mermaid_glyphs: MermaidGlyphs::default(),
             terminal_settings: None,
             workspace_hints: true,
             keymap: Keymap::default(),
@@ -5427,6 +5598,15 @@ impl App {
             pending_question: None,
             dismissed_question: None,
             schedule_form: None,
+            schedule_rename: None,
+            pending_schedule_rename: None,
+            schedule_rename_generation: 0,
+            schedule_cadence: None,
+            pending_schedule_cadence: None,
+            schedule_cadence_generation: 0,
+            schedule_prompt: None,
+            pending_schedule_prompt: None,
+            schedule_prompt_generation: 0,
             schedule_runs: None,
             schedule_runs_request_id: 0,
             schedule_sessions: None,
@@ -5654,6 +5834,9 @@ impl App {
         self.terminal_settings = None;
         self.fence_copy_picker = None;
         self.close_schedule_sessions();
+        self.schedule_rename = None;
+        self.schedule_cadence = None;
+        self.schedule_prompt = None;
         self.chat.pressed_block = None;
         self.chat.pressed_attachment_remove = None;
         self.invalidate_permission_mode_context();
@@ -5677,7 +5860,10 @@ impl App {
             && !self.active_needs_history_refresh
         {
             self.chat.background_unread = 0;
-            self.tab = Tab::Chat;
+            self.schedule_rename = None;
+            self.schedule_cadence = None;
+            self.schedule_prompt = None;
+            self.set_tab(Tab::Chat);
             self.status_message = "Session already active".to_string();
             self.discover_active_loop();
             return true;
@@ -5693,7 +5879,7 @@ impl App {
         self.park_active_context();
         self.install_active_context(context);
         self.chat.background_unread = 0;
-        self.tab = Tab::Chat;
+        self.set_tab(Tab::Chat);
         self.status_message = if self.pending_question.is_some() {
             "Switched session — waiting for a decision".to_string()
         } else if self.chat.streaming {
@@ -6012,6 +6198,9 @@ impl App {
     pub fn set_theme(&mut self, palette: crate::theme::ThemePalette) {
         self.theme = palette;
         apply_textarea_palette(&mut self.chat.textarea, palette);
+        if let Some(editor) = self.schedule_prompt.as_mut() {
+            apply_textarea_palette(&mut editor.textarea, palette);
+        }
         if let Some(editor) = self.config_editor.as_mut() {
             apply_textarea_palette(&mut editor.textarea, palette);
         }
@@ -6170,8 +6359,7 @@ impl App {
             self.refresh_transient_status(Instant::now());
             self.poll_sse();
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
-            // Other editors continue receiving the terminal's ordinary text input.
-            let wants_paste = self.chat_composer_focused();
+            let wants_paste = self.wants_bracketed_paste();
             if wants_paste != bracketed_paste {
                 let result = if wants_paste {
                     crossterm::execute!(terminal.backend_mut(), EnableBracketedPaste)
@@ -6748,7 +6936,17 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key).await?,
             AppEvent::Paste(text) => {
-                if self.chat_composer_focused() {
+                if self.active_action_contexts().first() == Some(&ActionContext::SchedulePrompt) {
+                    self.pending_key_sequence = None;
+                    if !self.schedule_prompt_is_saving() {
+                        if let Some(editor) = self.schedule_prompt.as_mut() {
+                            editor.textarea.insert_str(&text);
+                            editor.error = None;
+                        }
+                    }
+                } else if self.cron_editor_focused() {
+                    self.paste_cron_expression(&text);
+                } else if self.chat_composer_focused() {
                     self.pending_key_sequence = None;
                     self.insert_composer_text(&text);
                 }
@@ -6765,13 +6963,15 @@ impl App {
                 }
                 self.sessions.summary_observation_epoch = observation_epoch;
                 self.sessions.loading = false;
+                self.sessions.loop_lookup = None;
                 match r {
                     Ok(envelope) => {
                         self.observe_cached_summaries(&envelope.sessions, observation_epoch);
-                        self.sessions.selected = self
+                        let selected = self
                             .sessions
                             .selected
                             .min(envelope.sessions.len().saturating_sub(1));
+                        self.sessions.select(selected);
                         self.sessions.total = envelope.total;
                         self.sessions.offset = envelope.offset;
                         self.sessions.page_limit = envelope.limit;
@@ -6780,6 +6980,28 @@ impl App {
                         self.sessions.error = None;
                     }
                     Err(e) => self.sessions.error = Some(e),
+                }
+            }
+            AppEvent::SelectedSessionLoopStatusLoaded {
+                generation,
+                session_id,
+                result,
+            } => {
+                if generation == self.sessions.loop_status_generation
+                    && matches!(
+                        self.selected_session_loop_lookup(),
+                        Some(lookup)
+                            if lookup.session_id == session_id
+                                && matches!(lookup.status, SessionListLoopStatus::Loading)
+                    )
+                {
+                    self.sessions.loop_lookup = Some(SessionLoopLookup {
+                        session_id,
+                        status: match result {
+                            Ok(preview) => SessionListLoopStatus::Available(preview),
+                            Err(()) => SessionListLoopStatus::Unavailable,
+                        },
+                    });
                 }
             }
             AppEvent::McpServersLoaded(r) => {
@@ -6818,6 +7040,27 @@ impl App {
                 result,
             } => {
                 self.finish_schedule_toggle(generation, schedule_id, result);
+            }
+            AppEvent::ScheduleRenameFinished {
+                generation,
+                schedule_id,
+                result,
+            } => {
+                self.finish_schedule_rename(generation, schedule_id, result);
+            }
+            AppEvent::ScheduleCadenceFinished {
+                generation,
+                schedule_id,
+                result,
+            } => {
+                self.finish_schedule_cadence(generation, schedule_id, result);
+            }
+            AppEvent::SchedulePromptFinished {
+                generation,
+                schedule_id,
+                result,
+            } => {
+                self.finish_schedule_prompt(generation, schedule_id, result);
             }
             AppEvent::SkillsLoaded(r) => {
                 self.skills.loading = false;
@@ -7426,9 +7669,7 @@ impl App {
                 }
                 match result {
                     Ok(()) => self.notify(NoticeLevel::Info, "Schedule deleted"),
-                    Err(error) => {
-                        self.notify(NoticeLevel::Error, format!("Delete failed: {error}"))
-                    }
+                    Err(error) => self.notify(NoticeLevel::Error, error),
                 }
                 self.load_tab_data();
             }
@@ -7729,7 +7970,7 @@ impl App {
                         self.sync_conversation_block_ui();
                         self.chat.auto_scroll = auto_scroll;
                         self.chat.background_unread = 0;
-                        self.tab = Tab::Chat;
+                        self.set_tab(Tab::Chat);
                         self.status_message = "Session resumed".to_string();
 
                         if opened.truncated {
@@ -8279,7 +8520,7 @@ impl App {
                             content.push_str(&arguments);
                         }
                         self.install_command_draft(content);
-                        self.tab = Tab::Chat;
+                        self.set_tab(Tab::Chat);
                         self.close_command_palette();
                         self.status_message =
                             format!("Command loaded into composer — review; {send}");
@@ -9032,6 +9273,9 @@ impl App {
             || self.pending_delete.is_some()
             || self.pending_schedule_delete.is_some()
             || self.schedule_form.is_some()
+            || self.schedule_rename.is_some()
+            || self.schedule_cadence.is_some()
+            || self.schedule_prompt.is_some()
             || self.schedule_runs.is_some()
             || self.schedule_sessions.is_some()
             || self.config_editor.is_some()
@@ -9261,8 +9505,9 @@ impl App {
                 }
             }
             Tab::Sessions => {
-                self.sessions.selected =
+                let selected =
                     scroll_selection(self.sessions.selected, self.sessions.sessions.len(), delta);
+                self.sessions.select(selected);
             }
             Tab::Mcp => {
                 self.mcp.selected =
@@ -9769,6 +10014,9 @@ impl App {
             || self.model_picker.is_some()
             || self.command_palette.is_some()
             || self.schedule_form.is_some()
+            || self.schedule_rename.is_some()
+            || self.schedule_cadence.is_some()
+            || self.schedule_prompt.is_some()
             || self.schedule_runs.is_some()
             || self.schedule_sessions.is_some()
             || self.fence_copy_picker.is_some()
@@ -9840,6 +10088,12 @@ impl App {
             ActionContext::ModelPicker
         } else if self.command_palette.is_some() {
             ActionContext::CommandPalette
+        } else if self.schedule_rename.is_some() {
+            ActionContext::ScheduleRename
+        } else if self.schedule_cadence.is_some() {
+            ActionContext::ScheduleInterval
+        } else if self.schedule_prompt.is_some() {
+            ActionContext::SchedulePrompt
         } else if self.schedule_form.is_some() {
             ActionContext::ScheduleForm
         } else if self.schedule_sessions.is_some() {
@@ -9937,6 +10191,12 @@ impl App {
         let message = format!("{} — {reason}", action.label());
         if let Some(question) = self.pending_question.as_mut() {
             question.error = Some(message.clone());
+        } else if let Some(rename) = self.schedule_rename.as_mut() {
+            rename.error = Some(message.clone());
+        } else if let Some(cadence) = self.schedule_cadence.as_mut() {
+            cadence.error = Some(message.clone());
+        } else if let Some(editor) = self.schedule_prompt.as_mut() {
+            editor.error = Some(message.clone());
         } else if let Some(form) = self.schedule_form.as_mut() {
             form.error = Some(message.clone());
         } else if let Some(editor) = self.config_editor.as_mut() {
@@ -10045,31 +10305,26 @@ impl App {
             ActionId::OpenSessionsTab => self.open_tab(Tab::Sessions),
             ActionId::OpenMcpTab => self.open_tab(Tab::Mcp),
             ActionId::OpenSkillsTab => self.open_tab(Tab::Skills),
-            ActionId::OpenConfigTab => {
-                self.tab = Tab::Config;
-                self.load_tab_data();
-            }
+            ActionId::OpenConfigTab => self.open_tab(Tab::Config),
             ActionId::OpenPermissionPolicy => self.open_permission_policy(),
             ActionId::TogglePermissionBypass => self.begin_permission_mode_toggle(),
-            ActionId::OpenSchedulesTab => {
-                self.tab = Tab::Schedules;
-                self.load_tab_data();
-            }
-            ActionId::NextTab => {
-                self.tab = self.tab.next();
-                self.load_tab_data();
-            }
-            ActionId::PreviousTab => {
-                self.tab = self.tab.prev();
-                self.load_tab_data();
-            }
+            ActionId::OpenSchedulesTab => self.open_tab(Tab::Schedules),
+            ActionId::NextTab => self.open_tab(self.tab.next()),
+            ActionId::PreviousTab => self.open_tab(self.tab.prev()),
             _ => {}
         }
     }
 
     fn open_tab(&mut self, tab: Tab) {
-        self.tab = tab;
+        self.set_tab(tab);
         self.load_tab_data();
+    }
+
+    fn set_tab(&mut self, tab: Tab) {
+        if self.tab == Tab::Sessions && tab != Tab::Sessions {
+            self.sessions.loop_lookup = None;
+        }
+        self.tab = tab;
     }
 
     pub(crate) fn workspace_controls_enabled(&self) -> bool {
@@ -10078,6 +10333,17 @@ impl App {
 
     fn chat_composer_focused(&self) -> bool {
         self.active_action_contexts()[0] == ActionContext::Chat
+    }
+
+    fn cron_editor_focused(&self) -> bool {
+        self.schedule_cadence
+            .as_ref()
+            .is_some_and(|editor| matches!(editor.kind, ScheduleCadenceKind::CronExpression))
+            && self.active_action_contexts()[0] == ActionContext::ScheduleInterval
+    }
+
+    fn wants_bracketed_paste(&self) -> bool {
+        self.chat_composer_focused() || self.cron_editor_focused()
     }
 
     pub(crate) fn workspace_context_id(&self) -> u64 {
@@ -10147,6 +10413,12 @@ impl App {
             }),
             TerminalSetting::ToolDetails => self.toggle_default_tool_details(),
             TerminalSetting::KeyHints => self.workspace_hints = !self.workspace_hints,
+            TerminalSetting::MermaidGlyphs => {
+                self.mermaid_glyphs = match self.mermaid_glyphs {
+                    MermaidGlyphs::Unicode => MermaidGlyphs::Ascii,
+                    MermaidGlyphs::Ascii => MermaidGlyphs::Unicode,
+                };
+            }
             TerminalSetting::ServerConfig => {
                 self.terminal_settings = None;
                 self.config.view = ConfigView::Raw;
@@ -10175,8 +10447,7 @@ impl App {
             _ => None,
         };
         if let Some(index) = index {
-            self.tab = Tab::from_index(index).unwrap_or(self.tab);
-            self.load_tab_data();
+            self.open_tab(Tab::from_index(index).unwrap_or(self.tab));
         }
     }
 
@@ -10209,6 +10480,9 @@ impl App {
             | ActionContext::SessionPickerPinning => self.handle_session_picker_key(key).await?,
             ActionContext::ModelPicker => self.handle_model_picker_key(key).await?,
             ActionContext::CommandPalette => self.handle_command_palette_key(key),
+            ActionContext::ScheduleRename => self.handle_schedule_rename_key(key),
+            ActionContext::ScheduleInterval => self.handle_schedule_cadence_key(key),
+            ActionContext::SchedulePrompt => self.handle_schedule_prompt_key(key),
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
             ActionContext::ScheduleRuns => self.handle_schedule_runs_key(key),
             ActionContext::ScheduleSessions => self.handle_schedule_sessions_key(key),
@@ -11861,6 +12135,9 @@ impl App {
     /// tab loading and spawn the fetch, which posts its result back as an
     /// `AppEvent` handled in `handle_event`.
     fn load_tab_data(&mut self) {
+        if self.tab == Tab::Sessions {
+            self.sessions.loop_lookup = None;
+        }
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
@@ -12753,7 +13030,7 @@ impl App {
         self.chat.project_id = project_id;
         self.chat.expand_tools = expand_tools;
         self.opening_session_id = None;
-        self.tab = Tab::Chat;
+        self.set_tab(Tab::Chat);
         self.status_message = "New session".to_string();
     }
 
@@ -14945,15 +15222,63 @@ impl App {
         });
     }
 
+    fn selected_session_loop_lookup(&self) -> Option<&SessionLoopLookup> {
+        self.sessions.loop_lookup.as_ref().filter(|lookup| {
+            self.tab == Tab::Sessions
+                && self.sessions.selected_id() == Some(lookup.session_id.as_str())
+        })
+    }
+
+    pub(crate) fn selected_session_loop_status(&self) -> Option<&SessionListLoopStatus> {
+        self.selected_session_loop_lookup()
+            .map(|lookup| &lookup.status)
+    }
+
+    fn inspect_selected_session_loop(&mut self) {
+        if self.sessions.loading
+            || self.sessions.error.is_some()
+            || matches!(
+                self.selected_session_loop_status(),
+                Some(SessionListLoopStatus::Loading)
+            )
+        {
+            return;
+        }
+        let (Some(session_id), Some(tx)) = (self.sessions.selected_id(), self.event_tx.clone())
+        else {
+            return;
+        };
+        let session_id = session_id.to_owned();
+        let generation = self.sessions.loop_status_generation.wrapping_add(1);
+        self.sessions.loop_status_generation = generation;
+        self.sessions.loop_lookup = Some(SessionLoopLookup {
+            session_id: session_id.clone(),
+            status: SessionListLoopStatus::Loading,
+        });
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .selected_session_loop_status(&session_id)
+                .await
+                .map_err(|_| ());
+            let _ = tx.send(AppEvent::SelectedSessionLoopStatusLoaded {
+                generation,
+                session_id,
+                result,
+            });
+        });
+    }
+
     async fn handle_sessions_key(&mut self, key: KeyEvent) -> Result<()> {
         let action = self.resolve_context_action(ActionContext::Sessions, key);
         match action {
             Some(ActionId::NavigateDown) if !self.sessions.sessions.is_empty() => {
-                self.sessions.selected =
-                    (self.sessions.selected + 1).min(self.sessions.sessions.len() - 1);
+                let selected = (self.sessions.selected + 1).min(self.sessions.sessions.len() - 1);
+                self.sessions.select(selected);
             }
             Some(ActionId::NavigateUp) => {
-                self.sessions.selected = self.sessions.selected.saturating_sub(1);
+                self.sessions
+                    .select(self.sessions.selected.saturating_sub(1));
             }
             Some(ActionId::Activate) => {
                 // Full resume, off the event loop: history replay + live
@@ -14971,20 +15296,21 @@ impl App {
                     self.pending_delete = Some((session.id.clone(), session.title.clone()));
                 }
             }
+            Some(ActionId::InspectSelectedSessionLoop) => self.inspect_selected_session_loop(),
             Some(ActionId::Refresh) => {
                 self.load_tab_data();
             }
             Some(ActionId::NextPage) => {
                 if let Some(next) = self.sessions.next_offset {
                     self.sessions.offset = next;
-                    self.sessions.selected = 0;
+                    self.sessions.select(0);
                     self.load_tab_data();
                 }
             }
             Some(ActionId::PreviousPage) if self.sessions.offset > 0 => {
                 let step = self.sessions.page_limit.max(1);
                 self.sessions.offset = self.sessions.offset.saturating_sub(step);
-                self.sessions.selected = 0;
+                self.sessions.select(0);
                 self.load_tab_data();
             }
             _ => {}
@@ -15064,6 +15390,26 @@ impl App {
             Some(ActionId::Activate) => self.open_schedule_runs(),
             Some(ActionId::OpenScheduleSessions) => self.open_schedule_sessions(),
             Some(ActionId::ToggleScheduleEnabled) => self.toggle_selected_schedule(),
+            Some(ActionId::RenameSchedule) => self.open_schedule_rename(),
+            Some(ActionId::EditScheduleInterval) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::Interval)
+            }
+            Some(ActionId::EditScheduleDailyTime) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::Clock(ScheduleClockKind::Daily))
+            }
+            Some(ActionId::EditScheduleWeeklyTime) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::Clock(ScheduleClockKind::Weekly))
+            }
+            Some(ActionId::EditScheduleMonthlyTime) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::Clock(ScheduleClockKind::Monthly))
+            }
+            Some(ActionId::EditScheduleOnceTime) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::OnceAt)
+            }
+            Some(ActionId::EditScheduleCronExpression) => {
+                self.open_schedule_cadence(ScheduleCadenceKind::CronExpression)
+            }
+            Some(ActionId::EditSchedulePrompt) => self.open_schedule_prompt(),
             Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
                     (self.schedules.selected + 1).min(self.schedules.schedules.len() - 1);
@@ -15080,6 +15426,13 @@ impl App {
                     return Ok(());
                 }
                 if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
+                    if self.schedule_rename_pending_for(&schedule.id)
+                        || self.schedule_cadence_pending_for(&schedule.id)
+                        || self.schedule_prompt_pending_for(&schedule.id)
+                    {
+                        self.notify(NoticeLevel::Warn, "Wait for the schedule update to finish");
+                        return Ok(());
+                    }
                     self.pending_schedule_delete = Some((
                         schedule.id.clone(),
                         schedule
@@ -15099,7 +15452,7 @@ impl App {
                     tokio::spawn(async move {
                         let outcome = match client.run_schedule_now(&id).await {
                             Ok(()) => Ok("Schedule triggered".to_string()),
-                            Err(e) => Err(format!("Run failed: {e}")),
+                            Err(error) => Err(error.to_string()),
                         };
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
@@ -15112,6 +15465,570 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn open_schedule_rename(&mut self) {
+        let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) else {
+            return;
+        };
+        if self.schedule_rename_is_saving()
+            || self.schedule_cadence_pending_for(&schedule.id)
+            || self.schedule_prompt_pending_for(&schedule.id)
+            || self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
+            || self
+                .schedules
+                .pending_toggle
+                .as_ref()
+                .is_some_and(|pending| pending.schedule_id == schedule.id)
+        {
+            self.notify(NoticeLevel::Warn, "Wait for the schedule update to finish");
+            return;
+        }
+        self.schedule_rename = Some(ScheduleRename {
+            schedule_id: schedule.id.clone(),
+            draft: schedule.name.clone().unwrap_or_default(),
+            error: None,
+        });
+    }
+
+    pub(crate) fn schedule_rename_is_saving(&self) -> bool {
+        self.pending_schedule_rename.is_some()
+    }
+
+    fn schedule_rename_pending_for(&self, schedule_id: &str) -> bool {
+        self.pending_schedule_rename
+            .as_ref()
+            .is_some_and(|rename| rename.schedule_id == schedule_id)
+    }
+
+    fn handle_schedule_rename_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::ScheduleRename, key);
+        if self.schedule_rename_is_saving() {
+            return;
+        }
+        let Some(rename) = self.schedule_rename.as_mut() else {
+            return;
+        };
+        match action {
+            Some(ActionId::Cancel) => self.schedule_rename = None,
+            Some(ActionId::Backspace) => {
+                rename.draft.pop();
+                rename.error = None;
+            }
+            Some(ActionId::Activate) => {
+                let name = rename.draft.trim().to_owned();
+                if name.is_empty() {
+                    rename.error = Some("Enter a schedule name".into());
+                    return;
+                }
+                let Some(tx) = self.event_tx.clone() else {
+                    rename.error = Some("Host connection is unavailable".into());
+                    return;
+                };
+                let schedule_id = rename.schedule_id.clone();
+                self.schedule_rename_generation = self.schedule_rename_generation.wrapping_add(1);
+                let generation = self.schedule_rename_generation;
+                self.pending_schedule_rename = Some(PendingScheduleRename {
+                    generation,
+                    schedule_id: schedule_id.clone(),
+                    name: name.clone(),
+                });
+                rename.error = None;
+
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .rename_schedule(&schedule_id, &name)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::ScheduleRenameFinished {
+                        generation,
+                        schedule_id,
+                        result,
+                    });
+                });
+            }
+            None => {
+                if let Some(character) = text_character(key) {
+                    rename.draft.push(character);
+                    rename.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_schedule_rename(
+        &mut self,
+        generation: u64,
+        schedule_id: String,
+        result: Result<String, String>,
+    ) {
+        let Some(pending) = self.pending_schedule_rename.take_if(|pending| {
+            pending.generation == generation && pending.schedule_id == schedule_id
+        }) else {
+            return;
+        };
+        match result {
+            Ok(name) if name == pending.name => {
+                if let Some(row) = self
+                    .schedules
+                    .schedules
+                    .iter_mut()
+                    .find(|row| row.id == schedule_id)
+                {
+                    row.name = Some(name);
+                }
+                if self.schedule_rename.take().is_some() {
+                    self.status_message = "Schedule renamed".into();
+                }
+                self.refresh_schedule_catalog_after_change();
+            }
+            result => {
+                if let Some(rename) = self.schedule_rename.as_mut() {
+                    rename.error = Some(
+                        result
+                            .err()
+                            .unwrap_or_else(|| "Invalid schedule rename response".into()),
+                    );
+                }
+            }
+        }
+    }
+
+    fn open_schedule_cadence(&mut self, kind: ScheduleCadenceKind) {
+        let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) else {
+            return;
+        };
+        let (draft, timezone, calendar_days) = match kind {
+            ScheduleCadenceKind::Interval => {
+                let Some(every_seconds) = schedule.interval_seconds else {
+                    return;
+                };
+                (every_seconds.to_string(), None, None)
+            }
+            ScheduleCadenceKind::OnceAt => {
+                let Some(draft) = schedule
+                    .upcoming_once_at(Utc::now())
+                    .and_then(format_schedule_once_at)
+                else {
+                    return;
+                };
+                (draft, None, None)
+            }
+            ScheduleCadenceKind::CronExpression => {
+                let Some(expression) = &schedule.cron_expression else {
+                    return;
+                };
+                let timezone = schedule.timezone.as_deref().unwrap_or("UTC").to_owned();
+                (expression.clone(), Some(timezone), None)
+            }
+            ScheduleCadenceKind::Clock(kind) => {
+                let Some(ScheduleClockTime {
+                    hour,
+                    minute,
+                    second,
+                }) = schedule.clock_time(kind)
+                else {
+                    return;
+                };
+                let draft = if second == 0 {
+                    format!("{hour:02}:{minute:02}")
+                } else {
+                    format!("{hour:02}:{minute:02}:{second:02}")
+                };
+                let timezone = schedule.timezone.as_deref().unwrap_or("UTC").to_owned();
+                let calendar_days = match kind {
+                    ScheduleClockKind::Daily => None,
+                    ScheduleClockKind::Weekly => schedule
+                        .weekly_time
+                        .as_ref()
+                        .map(|weekly| format_schedule_weekdays(&weekly.weekdays)),
+                    ScheduleClockKind::Monthly => schedule
+                        .monthly_time
+                        .as_ref()
+                        .map(|monthly| format_schedule_month_days(&monthly.days)),
+                };
+                (draft, Some(timezone), calendar_days)
+            }
+        };
+        if self.schedule_cadence_is_saving()
+            || self.schedule_rename_pending_for(&schedule.id)
+            || self.schedule_prompt_pending_for(&schedule.id)
+            || self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
+            || self.schedules.toggle_pending_for(&schedule.id)
+        {
+            self.notify(NoticeLevel::Warn, "Wait for the schedule update to finish");
+            return;
+        }
+        self.schedule_cadence = Some(ScheduleCadenceEdit {
+            schedule_id: schedule.id.clone(),
+            kind,
+            timezone,
+            calendar_days,
+            draft,
+            error: None,
+        });
+    }
+
+    pub(crate) fn schedule_cadence_is_saving(&self) -> bool {
+        self.pending_schedule_cadence.is_some()
+    }
+
+    fn schedule_cadence_pending_for(&self, schedule_id: &str) -> bool {
+        self.pending_schedule_cadence
+            .as_ref()
+            .is_some_and(|edit| edit.schedule_id == schedule_id)
+    }
+
+    fn paste_cron_expression(&mut self, text: &str) {
+        if self.schedule_cadence_is_saving() {
+            return;
+        }
+        self.pending_key_sequence = None;
+        if let Some(editor) = self.schedule_cadence.as_mut() {
+            if text.chars().all(valid_cron_editor_character) {
+                editor.draft.push_str(text);
+                editor.error = None;
+            } else {
+                editor.error = Some(SCHEDULE_CRON_INPUT_ERROR.into());
+            }
+        }
+    }
+
+    fn handle_schedule_cadence_key(&mut self, key: KeyEvent) {
+        // Share the existing cadence editor's input and remappable save keys.
+        let action = self.resolve_context_action(ActionContext::ScheduleInterval, key);
+        if self.schedule_cadence_is_saving() {
+            return;
+        }
+        let Some(edit) = self.schedule_cadence.as_mut() else {
+            return;
+        };
+        match action {
+            Some(ActionId::Cancel) => self.schedule_cadence = None,
+            Some(ActionId::Backspace) => {
+                edit.draft.pop();
+                edit.error = None;
+            }
+            Some(ActionId::ClearInput) => {
+                edit.draft.clear();
+                edit.error = None;
+            }
+            Some(ActionId::Activate) => {
+                let value = match edit.value() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        edit.error = Some(error.into());
+                        return;
+                    }
+                };
+                let Some(tx) = self.event_tx.clone() else {
+                    edit.error = Some("Host connection is unavailable".into());
+                    return;
+                };
+                let schedule_id = edit.schedule_id.clone();
+                self.schedule_cadence_generation = self.schedule_cadence_generation.wrapping_add(1);
+                let generation = self.schedule_cadence_generation;
+                self.pending_schedule_cadence = Some(PendingScheduleCadence {
+                    generation,
+                    schedule_id: schedule_id.clone(),
+                    value: value.clone(),
+                });
+                edit.error = None;
+
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    let result = match value {
+                        ScheduleCadenceValue::Interval(seconds) => {
+                            client.update_schedule_interval(&schedule_id, seconds).await
+                        }
+                        ScheduleCadenceValue::Clock(kind, time) => {
+                            client
+                                .update_schedule_clock_time(&schedule_id, kind, time)
+                                .await
+                        }
+                        ScheduleCadenceValue::OnceAt(at) => {
+                            client.update_schedule_once_at(&schedule_id, at).await
+                        }
+                        ScheduleCadenceValue::CronExpression(expression) => {
+                            client
+                                .update_schedule_cron_expression(&schedule_id, &expression)
+                                .await
+                        }
+                    };
+                    let _ = tx.send(AppEvent::ScheduleCadenceFinished {
+                        generation,
+                        schedule_id,
+                        result: result.map_err(|error| error.to_string()),
+                    });
+                });
+            }
+            None => {
+                if let Some(character) = text_character(key) {
+                    edit.push_character(character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_schedule_cadence(
+        &mut self,
+        generation: u64,
+        schedule_id: String,
+        result: Result<Schedule, String>,
+    ) {
+        let Some(pending) = self.pending_schedule_cadence.take_if(|pending| {
+            pending.generation == generation && pending.schedule_id == schedule_id
+        }) else {
+            return;
+        };
+        let (invalid_response, saved_status) = match pending.value {
+            ScheduleCadenceValue::Interval(_) => (
+                "Invalid schedule interval response",
+                "Schedule interval saved",
+            ),
+            ScheduleCadenceValue::Clock(ScheduleClockKind::Daily, _) => {
+                ("Invalid Daily time response", "Daily schedule time saved")
+            }
+            ScheduleCadenceValue::Clock(ScheduleClockKind::Weekly, _) => {
+                ("Invalid Weekly time response", "Weekly schedule time saved")
+            }
+            ScheduleCadenceValue::Clock(ScheduleClockKind::Monthly, _) => (
+                "Invalid Monthly time response",
+                "Monthly schedule time saved",
+            ),
+            ScheduleCadenceValue::OnceAt(_) => {
+                ("Invalid Once time response", "Once schedule time saved")
+            }
+            ScheduleCadenceValue::CronExpression(_) => (
+                "Invalid Cron expression response",
+                "Cron schedule expression saved",
+            ),
+        };
+        let correct_value = |schedule: &Schedule| match &pending.value {
+            ScheduleCadenceValue::Interval(seconds) => schedule.interval_seconds == Some(*seconds),
+            ScheduleCadenceValue::Clock(kind, time) => schedule.clock_time(*kind) == Some(*time),
+            ScheduleCadenceValue::OnceAt(at) => {
+                schedule.once_at == Some(*at) && schedule.next_run == Some(*at)
+            }
+            ScheduleCadenceValue::CronExpression(expression) => {
+                schedule.cron_expression.as_deref().map(str::trim) == Some(expression.as_str())
+            }
+        };
+        let result = result.and_then(|schedule| {
+            if schedule.id == schedule_id && correct_value(&schedule) {
+                Ok(schedule)
+            } else {
+                Err(invalid_response.into())
+            }
+        });
+        match result {
+            Ok(schedule) => {
+                if let Some(row) = self.schedules.schedules.iter_mut().find(|row| {
+                    row.id == schedule_id
+                        && match &pending.value {
+                            ScheduleCadenceValue::Interval(_) => row.interval_seconds.is_some(),
+                            ScheduleCadenceValue::Clock(kind, _) => row.clock_time(*kind).is_some(),
+                            ScheduleCadenceValue::OnceAt(_) => row.once_at.is_some(),
+                            ScheduleCadenceValue::CronExpression(_) => {
+                                row.cron_expression.is_some()
+                            }
+                        }
+                }) {
+                    match pending.value {
+                        ScheduleCadenceValue::Interval(seconds) => {
+                            row.interval_seconds = Some(seconds);
+                        }
+                        ScheduleCadenceValue::Clock(..) => {
+                            row.daily_time = schedule.daily_time;
+                            row.weekly_time = schedule.weekly_time;
+                            row.monthly_time = schedule.monthly_time;
+                            row.timezone = schedule.timezone;
+                        }
+                        ScheduleCadenceValue::OnceAt(at) => {
+                            row.once_at = Some(at);
+                            row.timezone = schedule.timezone;
+                        }
+                        ScheduleCadenceValue::CronExpression(_) => {
+                            row.cron = schedule.cron;
+                            row.cron_expression = schedule.cron_expression;
+                            row.timezone = schedule.timezone;
+                        }
+                    }
+                    row.cadence_detail = schedule.cadence_detail;
+                    row.next_run = schedule.next_run;
+                }
+                if self
+                    .schedule_cadence
+                    .take_if(|edit| edit.schedule_id == schedule_id)
+                    .is_some()
+                {
+                    self.status_message = saved_status.into();
+                }
+                self.refresh_schedule_catalog_after_change();
+            }
+            Err(error) => {
+                if let Some(edit) = self
+                    .schedule_cadence
+                    .as_mut()
+                    .filter(|edit| edit.schedule_id == schedule_id)
+                {
+                    edit.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn open_schedule_prompt(&mut self) {
+        let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) else {
+            return;
+        };
+        let Some(prompt) = schedule
+            .prompt
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+        else {
+            return;
+        };
+        if self.schedule_prompt_is_saving()
+            || self.schedule_rename_pending_for(&schedule.id)
+            || self.schedule_cadence_pending_for(&schedule.id)
+            || self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
+            || self.schedules.toggle_pending_for(&schedule.id)
+        {
+            self.notify(NoticeLevel::Warn, "Wait for the schedule update to finish");
+            return;
+        }
+        let mut textarea = TextArea::new(prompt.split('\n').map(str::to_string).collect());
+        apply_textarea_palette(&mut textarea, self.theme);
+        textarea.move_cursor(CursorMove::Bottom);
+        textarea.move_cursor(CursorMove::End);
+        self.schedule_prompt = Some(SchedulePromptEdit {
+            schedule_id: schedule.id.clone(),
+            textarea,
+            error: None,
+        });
+    }
+
+    pub(crate) fn schedule_prompt_is_saving(&self) -> bool {
+        self.pending_schedule_prompt.is_some()
+    }
+
+    fn schedule_prompt_pending_for(&self, schedule_id: &str) -> bool {
+        self.pending_schedule_prompt
+            .as_ref()
+            .is_some_and(|edit| edit.schedule_id == schedule_id)
+    }
+
+    fn handle_schedule_prompt_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::SchedulePrompt, key);
+        if self.schedule_prompt_is_saving() {
+            return;
+        }
+        let Some(edit) = self.schedule_prompt.as_mut() else {
+            return;
+        };
+        match action {
+            Some(ActionId::Cancel) => self.schedule_prompt = None,
+            Some(ActionId::SaveSchedulePrompt) => {
+                let task_message = edit.textarea.lines().join("\n");
+                if task_message.trim().is_empty() {
+                    edit.error = Some("Enter a task prompt".into());
+                    return;
+                }
+                let Some(tx) = self.event_tx.clone() else {
+                    edit.error = Some("Host connection is unavailable".into());
+                    return;
+                };
+                let schedule_id = edit.schedule_id.clone();
+                self.schedule_prompt_generation = self.schedule_prompt_generation.wrapping_add(1);
+                let generation = self.schedule_prompt_generation;
+                self.pending_schedule_prompt = Some(PendingSchedulePrompt {
+                    generation,
+                    schedule_id: schedule_id.clone(),
+                    task_message: task_message.clone(),
+                });
+                edit.error = None;
+
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .set_schedule_prompt(&schedule_id, &task_message)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::SchedulePromptFinished {
+                        generation,
+                        schedule_id,
+                        result,
+                    });
+                });
+            }
+            None if text_widget_input_allowed(key) => {
+                edit.textarea.input(key);
+                edit.error = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_schedule_prompt(
+        &mut self,
+        generation: u64,
+        schedule_id: String,
+        result: Result<String, String>,
+    ) {
+        let Some(pending) = self.pending_schedule_prompt.take_if(|pending| {
+            pending.generation == generation && pending.schedule_id == schedule_id
+        }) else {
+            return;
+        };
+        let result = result.and_then(|task_message| {
+            if task_message == pending.task_message {
+                Ok(task_message)
+            } else {
+                Err("Invalid schedule prompt response".into())
+            }
+        });
+        match result {
+            Ok(task_message) => {
+                if let Some(row) = self
+                    .schedules
+                    .schedules
+                    .iter_mut()
+                    .find(|row| row.id == schedule_id && row.prompt.is_some())
+                {
+                    row.prompt = Some(task_message);
+                }
+                if self
+                    .schedule_prompt
+                    .take_if(|edit| edit.schedule_id == schedule_id)
+                    .is_some()
+                {
+                    self.status_message = "Task prompt saved".into();
+                }
+                self.refresh_schedule_catalog_after_change();
+            }
+            Err(error) => {
+                if let Some(edit) = self
+                    .schedule_prompt
+                    .as_mut()
+                    .filter(|edit| edit.schedule_id == schedule_id)
+                {
+                    edit.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn refresh_schedule_catalog_after_change(&mut self) {
+        // A catalog already in flight may have read the old saved fields.
+        if std::mem::take(&mut self.schedules.loading) {
+            if let Some(tx) = self.event_tx.clone() {
+                self.load_schedule_catalog(self.client.clone(), tx);
+            }
+        }
     }
 
     fn toggle_selected_schedule(&mut self) {
@@ -15127,7 +16044,11 @@ impl App {
         let Some(enabled) = schedule.enabled else {
             return;
         };
-        if self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str()) {
+        if self.deleting_schedule_id.as_deref() == Some(schedule.id.as_str())
+            || self.schedule_rename_pending_for(&schedule.id)
+            || self.schedule_cadence_pending_for(&schedule.id)
+            || self.schedule_prompt_pending_for(&schedule.id)
+        {
             return;
         }
 
@@ -15186,13 +16107,7 @@ impl App {
                 if let Some(row) = row {
                     *row = schedule;
                 }
-                // Any catalog request already in flight may have read the old
-                // enabled flag. Replace it with a read after the mutation.
-                if std::mem::take(&mut self.schedules.loading) {
-                    if let Some(tx) = self.event_tx.clone() {
-                        self.load_schedule_catalog(self.client.clone(), tx);
-                    }
-                }
+                self.refresh_schedule_catalog_after_change();
             }
             Err(error) if row.is_some() => {
                 self.schedules.toggle_error = Some((schedule_id, error));
@@ -15541,7 +16456,7 @@ impl App {
                     tokio::spawn(async move {
                         let outcome = match client.create_schedule(req).await {
                             Ok(()) => Ok("Schedule created".to_string()),
-                            Err(e) => Err(format!("Create failed: {e}")),
+                            Err(error) => Err(error.to_string()),
                         };
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
@@ -15773,7 +16688,7 @@ impl App {
     }
 
     fn open_permission_policy(&mut self) {
-        self.tab = Tab::Config;
+        self.set_tab(Tab::Config);
         self.config.view = ConfigView::Permissions;
         self.load_permission_policy();
     }
@@ -17533,7 +18448,7 @@ impl App {
             draft.push_str(arguments);
         }
         self.install_command_draft(draft);
-        self.tab = Tab::Chat;
+        self.set_tab(Tab::Chat);
         self.close_command_palette();
         let kind = match command.command_type.to_ascii_lowercase().as_str() {
             "skill" => "Skill",
@@ -23044,9 +23959,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    15_697_706_785_549_981_363
+                    14_204_012_440_519_388_443
                 } else {
-                    6_997_252_207_367_741_014
+                    1_476_286_688_018_062_438
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -23870,6 +24785,301 @@ mod question_tests {
         }
     }
 
+    async fn expect_selected_loop_get(
+        listener: &tokio::net::TcpListener,
+        encoded_id: &str,
+    ) -> tokio::net::TcpStream {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut stream).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next().unwrap(),
+                format!("GET /api/v1/sessions/{encoded_id}/loop HTTP/1.1")
+            );
+            assert!(headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("cache-control: no-store")));
+            assert!(body.is_empty());
+            stream
+        })
+        .await
+        .expect("selected Session Loop GET")
+    }
+
+    async fn finish_selected_loop_get(app: &mut App, rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("selected Session Loop response")
+            .unwrap();
+        assert!(matches!(
+            event,
+            AppEvent::SelectedSessionLoopStatusLoaded { .. }
+        ));
+        app.handle_event(event).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_key_queries_only_selected_row_and_renders() {
+        use crossterm::event::KeyEventKind;
+        use ratatui::backend::TestBackend;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = App::new(BambooClient::new(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Sessions;
+        app.connected = true;
+        app.chat.session_id = Some("unchanged-chat".into());
+        app.sessions.sessions = vec![bare_session("project/review"), bare_session("build")];
+        app.sessions.sessions[0].title = "Deployment review".into();
+        app.sessions.sessions[1].title = "Build check".into();
+        app.sessions.total = 2;
+        app.sessions.page_limit = 200;
+        let chat_status = app.status_message.clone();
+
+        let render = |app: &App, width: u16| {
+            let height = if width == crate::ui::MIN_TERMINAL_WIDTH {
+                crate::ui::MIN_TERMINAL_HEIGHT
+            } else {
+                40
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, app))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(usize::from(width))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let initially = render(&app, 60);
+        assert!(initially.contains("l loop status"), "{initially}");
+        assert!(!initially.contains("Checking loop status"));
+        app.handle_key(key(KeyCode::Char('l'))).await.unwrap();
+        let mut first = expect_selected_loop_get(&listener, "project%2Freview").await;
+        for width in [60, 80, 120] {
+            assert!(render(&app, width).contains("Checking loop status…"));
+        }
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ] {
+            app.handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('l'),
+                KeyModifiers::empty(),
+                kind,
+            ))
+            .await
+            .unwrap();
+        }
+        respond_test_http(
+            &mut first,
+            "application/json",
+            r#"{"session_id":"project/review","loop":{"state":"scheduled","next_fire_at":"2030-01-02T12:34:56Z","mode":"fixed","interval_seconds":90,"iteration":12,"prompt":"fixture prompt stays hidden"}}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        for width in [60, 80, 120] {
+            let frame = render(&app, width);
+            for text in [
+                "Selected · Loop scheduled · next 2030-01-02 12:34:56 UTC",
+                "Fixed · every 90s · Iteration 12",
+                "Deployment review",
+                "Build check",
+                "Enter open · d delete · r refresh · l loop status",
+            ] {
+                assert!(
+                    frame.contains(text),
+                    "{width} columns missing {text:?}\n{frame}"
+                );
+            }
+            assert!(!frame.contains("fixture prompt stays hidden"));
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_SELECTED_SESSION_LOOP").is_some()
+            {
+                eprintln!(
+                    "SELECTED SESSION LOOP PREVIEW\n{frame}\nEND SELECTED SESSION LOOP PREVIEW"
+                );
+            }
+        }
+
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        assert!(app.selected_session_loop_status().is_none());
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[{"context":"sessions","action":"inspect-selected-session-loop","keys":["F8"]}]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        assert!(render(&app, 60).contains("F8 loop status"));
+        app.handle_key(key(KeyCode::Char('l'))).await.unwrap();
+        assert!(app.selected_session_loop_status().is_none());
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        let mut second = expect_selected_loop_get(&listener, "build").await;
+        respond_test_http(
+            &mut second,
+            "application/json",
+            r#"{"session_id":"build","loop":{"state":"scheduled","next_fire_at":"2030-02-03T04:05:06Z","mode":"adaptive","interval_seconds":1200,"iteration":2,"next_wakeup_reason":"fixture reason stays hidden"}}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        for width in [60, 80, 120] {
+            let frame = render(&app, width);
+            assert!(frame.contains("Loop scheduled · next 2030-02-03 04:05:06 UTC"));
+            assert!(frame.contains("Adaptive · Iteration 2"), "{frame}");
+            assert!(!frame.contains("every") && !frame.contains("fixture reason stays hidden"));
+            assert!(!frame.contains("Iteration 12"));
+        }
+
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        let mut legacy = expect_selected_loop_get(&listener, "build").await;
+        respond_test_http(
+            &mut legacy,
+            "application/json",
+            r#"{"session_id":"build","loop":{"state":"paused","next_fire_at":null}}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        let frame = render(&app, 60);
+        assert!(frame.contains("Selected · Loop paused"));
+        assert!(!frame.contains("Adaptive") && !frame.contains("Iteration"));
+
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        let mut absent = expect_selected_loop_get(&listener, "build").await;
+        respond_test_http(
+            &mut absent,
+            "application/json",
+            r#"{"session_id":"build","loop":null}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        assert!(render(&app, 60).contains("No session loop"));
+
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        let mut third = expect_selected_loop_get(&listener, "build").await;
+        let body = "fixture error must remain hidden";
+        third
+            .write_all(
+                format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        third.shutdown().await.unwrap();
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        let frame = render(&app, 60);
+        assert!(frame.contains("Loop status unavailable"));
+        assert!(!frame.contains(body));
+        assert!(!frame.contains("No session loop"));
+
+        assert_eq!(app.tab, Tab::Sessions);
+        assert_eq!(app.sessions.selected_id(), Some("build"));
+        assert_eq!(app.chat.session_id.as_deref(), Some("unchanged-chat"));
+        assert_eq!(app.status_message, chat_status);
+        assert!(app.chat.loop_watch.is_none());
+        assert!(app.sse_task.is_none());
+        assert!(app.opening_session_id.is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "unexpected extra Host request"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_discards_out_of_order_same_row_after_navigation() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = App::new(BambooClient::new(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Sessions;
+        app.sessions.sessions = vec![bare_session("first"), bare_session("second")];
+        app.sessions.page_limit = 2;
+        app.sessions.next_offset = Some(2);
+
+        app.handle_key(key(KeyCode::Char('l'))).await.unwrap();
+        let mut stale = expect_selected_loop_get(&listener, "first").await;
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.sessions.selected_id(), Some("second"));
+        assert!(app.selected_session_loop_status().is_none());
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.sessions.selected_id(), Some("first"));
+        assert!(app.selected_session_loop_status().is_none());
+
+        app.handle_key(key(KeyCode::Char('l'))).await.unwrap();
+        let mut fresh = expect_selected_loop_get(&listener, "first").await;
+        respond_test_http(
+            &mut stale,
+            "application/json",
+            r#"{"session_id":"first","loop":{"state":"scheduled","mode":"fixed","interval_seconds":3600,"iteration":999}}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        assert!(matches!(
+            app.selected_session_loop_status(),
+            Some(SessionListLoopStatus::Loading)
+        ));
+        respond_test_http(
+            &mut fresh,
+            "application/json",
+            r#"{"session_id":"first","loop":{"state":"paused","next_fire_at":null,"mode":"adaptive","iteration":3}}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        app.handle_key(key(KeyCode::Up)).await.unwrap();
+        let confirmed = app.sessions.loop_lookup.take().unwrap();
+        assert!(matches!(
+            confirmed.status,
+            SessionListLoopStatus::Available(Some(SessionLoopPreview {
+                state: crate::api::SessionLoopPreviewState::Paused,
+                next_fire_at: None,
+                mode: Some(crate::api::SessionLoopPreviewMode::Adaptive),
+                iteration: Some(3),
+            }))
+        ));
+
+        // Exercise the real commands without initiating unrelated catalog requests.
+        app.event_tx = None;
+        for code in [KeyCode::Char('r'), KeyCode::Char(']'), KeyCode::Char('1')] {
+            app.sessions.loop_lookup = Some(SessionLoopLookup {
+                session_id: confirmed.session_id.clone(),
+                status: SessionListLoopStatus::Available(None),
+            });
+            assert!(app.selected_session_loop_status().is_some());
+            app.handle_key(key(code)).await.unwrap();
+            assert!(
+                app.sessions.loop_lookup.is_none(),
+                "lookup survived {code:?}"
+            );
+        }
+        assert_eq!(app.sessions.offset, 2);
+        assert_eq!(app.tab, Tab::Chat);
+    }
+
     #[tokio::test]
     async fn loaded_event_applies_to_state_and_clears_loading() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
@@ -24412,6 +25622,57 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn schedule_run_now_shows_an_unconfirmed_outcome_without_resubmitting() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("POST /api/v1/schedules/review/run HTTP/1.1")
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.schedules.schedules.push(Schedule::from_view(
+            serde_json::from_value(serde_json::json!({"id":"review","name":"Review"})).unwrap(),
+        ));
+        app.handle_key(key(KeyCode::Char('r'))).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(outcome).await.unwrap();
+        assert_eq!(
+            app.status_message,
+            "Could not confirm Run Now. Check Recent runs before trying again."
+        );
+        let notice = app.notifications.last().unwrap();
+        assert_eq!(notice.text, app.status_message);
+        assert!(matches!(notice.level, NoticeLevel::Error));
+        assert_eq!(app.schedules.schedules[app.schedules.selected].id, "review");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn schedule_form_posts_weekly_schedule_from_keyboard_input() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
@@ -24476,11 +25737,1747 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn schedule_form_previews_and_posts_the_same_once_utc_instant() {
+        use chrono::Datelike;
+
+        const LATE_PICKUP: &str = "If picked up late, the Host can run it once.";
+        const NAME: &str = "Deployment review";
+        const PROMPT: &str = "Review the deployment report";
+        const PROJECT_ID: &str = "project-release";
+
+        async fn type_field(app: &mut App, text: &str) {
+            for character in text.chars() {
+                app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+            }
+        }
+
+        let year = Utc::now().year();
+        let past = format!("{}-12-31T23:30:00Z", year - 1);
+        let local = format!("{}-12-31T23:30:00.123456789-02:00", year + 1);
+        let utc_at = format!("{}-01-01T01:30:00.123456789Z", year + 2);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = App::new(BambooClient::new(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        let mut selected = bare_session("selected-session");
+        selected.project_id = Some(PROJECT_ID.into());
+        app.sessions.sessions.push(selected);
+
+        app.handle_key(key(KeyCode::Char('n'))).await.unwrap();
+        let cron = schedule_editor_preview_at_width(&app, "ONCE_CREATE", "CRON", 60);
+        assert!(!cron.contains("UTC trigger"));
+        assert!(!cron.contains(LATE_PICKUP));
+        type_field(&mut app, NAME).await;
+        app.handle_key(key(KeyCode::Tab)).await.unwrap();
+        app.handle_key(key(KeyCode::Right)).await.unwrap();
+        app.handle_key(key(KeyCode::Tab)).await.unwrap();
+        type_field(&mut app, &past).await;
+        app.handle_key(key(KeyCode::Tab)).await.unwrap();
+        type_field(&mut app, PROMPT).await;
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert_eq!(
+            app.schedule_form.as_ref().unwrap().error.as_deref(),
+            Some("Once must be scheduled for a future time")
+        );
+        let expired = schedule_editor_preview_at_width(&app, "ONCE_CREATE", "PAST", 60);
+        assert!(!expired.contains("UTC trigger"));
+        assert!(expired.contains(LATE_PICKUP));
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        for _ in past.chars() {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        type_field(&mut app, &local).await;
+        for width in [60, 120] {
+            let preview = schedule_editor_preview_at_width(&app, "ONCE_CREATE", "READY", width);
+            for expected in [
+                "Run at",
+                local.as_str(),
+                &format!("UTC trigger  {utc_at}"),
+                LATE_PICKUP,
+                "Enter create",
+                "Esc cancel",
+            ] {
+                assert!(
+                    preview.contains(expected),
+                    "{width} columns missing {expected:?}\n{preview}"
+                );
+            }
+        }
+
+        // Invalid typed input hides a previously visible preview immediately.
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        let invalid = schedule_editor_preview_at_width(&app, "ONCE_CREATE", "INVALID", 60);
+        assert!(!invalid.contains("UTC trigger"));
+        assert!(invalid.contains(LATE_PICKUP));
+        app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "preview and invalid/past input should send no request"
+        );
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let request =
+            tokio::time::timeout(Duration::from_secs(5), read_test_http_request(&mut socket))
+                .await
+                .unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            headers.lines().next(),
+            Some("POST /api/v1/schedules HTTP/1.1")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({
+                "name": NAME,
+                "trigger": {"type": "once", "at": utc_at},
+                "enabled": true,
+                "run_config": {"project_id": PROJECT_ID, "task_message": PROMPT, "auto_execute": true},
+            })
+        );
+        respond_test_http(&mut socket, "application/json", "{}").await;
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            AppEvent::ActionDone { outcome: Ok(ref note), reload_tab: true, .. }
+                if note == "Schedule created"
+        ));
+        assert!(app.schedule_form.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "save should issue a single create request before catalog refresh"
+        );
+    }
+
+    fn schedule_rename_preview(app: &App, phase: &str) -> String {
+        schedule_editor_preview(app, "RENAME", phase)
+    }
+
+    fn schedule_editor_preview(app: &App, editor: &str, phase: &str) -> String {
+        schedule_editor_preview_at_width(app, editor, phase, 60)
+    }
+
+    fn schedule_editor_preview_at_width(
+        app: &App,
+        editor: &str,
+        phase: &str,
+        width: u16,
+    ) -> String {
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if width == 60
+            && std::env::var_os(format!("BAMBOO_TUI_CAPTURE_SCHEDULE_{editor}")).is_some()
+        {
+            eprintln!(
+                "SCHEDULE {editor} {phase} PREVIEW\n{text}\nEND SCHEDULE {editor} {phase} PREVIEW"
+            );
+        }
+        text
+    }
+
+    #[tokio::test]
+    async fn schedule_rename_uses_the_dedicated_keyboard_path_and_fences_catalogs() {
+        use tokio::sync::oneshot;
+
+        const ID: &str = "ship/review?weekly";
+        const ORIGINAL: &str = r#"{"schedules":[
+            {"id":"ship/review?weekly","name":"Weekly review","enabled":true,
+             "trigger":{"type":"interval","every_seconds":90},
+             "state":{"next_fire_at":"2028-01-26T09:10:00Z"},
+             "run_config":{"task_message":"Check the release"}},
+            {"id":"other","name":"Weekly review","enabled":false}
+        ]}"#;
+        let confirmed_catalog = ORIGINAL.replacen("Weekly review", "Weekly plan", 1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (old_seen, old_started) = oneshot::channel();
+        let (rename_seen, rename_started) = oneshot::channel();
+        let (allow_rename, wait_rename) = oneshot::channel();
+        let (allow_fresh, wait_fresh) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut initial, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut initial).await, "/api/v1/schedules");
+            respond_test_http(&mut initial, "application/json", ORIGINAL).await;
+
+            let (mut stale, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut stale).await, "/api/v1/schedules");
+            old_seen.send(()).unwrap();
+            let (mut patch, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut patch).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next(),
+                Some("PATCH /api/v1/schedules/ship%2Freview%3Fweekly/name HTTP/1.1")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({"name": "Weekly plan"})
+            );
+            rename_seen.send(()).unwrap();
+            wait_rename.await.unwrap();
+            respond_test_http(
+                &mut patch,
+                "application/json",
+                r#"{"id":"ship/review?weekly","name":"Weekly plan"}"#,
+            )
+            .await;
+
+            let (mut fresh, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut fresh).await.lines().next(),
+                Some("GET /api/v1/schedules HTTP/1.1")
+            );
+            respond_test_http(&mut stale, "application/json", ORIGINAL).await;
+            wait_fresh.await.unwrap();
+            respond_test_http(&mut fresh, "application/json", &confirmed_catalog).await;
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Mcp;
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[{"context":"schedules","action":"rename-schedule","keys":["/"]}]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        let budget = Duration::from_secs(5);
+        async fn event(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        let next_run = app.schedules.schedules[0].next_run;
+        app.handle_key(key(KeyCode::Char('e'))).await.unwrap();
+        assert!(app.schedule_rename.is_none());
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        tokio::time::timeout(budget, old_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        assert_eq!(app.schedule_rename.as_ref().unwrap().draft, "Weekly review");
+        for _ in 0.."review".len() {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "plan  ".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        let before = schedule_rename_preview(&app, "EDITING");
+        assert!(before.contains("Rename schedule") && before.contains("Name: Weekly plan"));
+        assert!(before.contains("Enter save") && before.contains("Esc cancel"));
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        tokio::time::timeout(budget, rename_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_event(AppEvent::ScheduleRenameFinished {
+            generation: app.schedule_rename_generation,
+            schedule_id: "other".into(),
+            result: Ok("Weekly plan".into()),
+        })
+        .await
+        .unwrap();
+        assert!(app.schedule_rename_is_saving());
+        assert_eq!(
+            app.schedules.schedules[0].name.as_deref(),
+            Some("Weekly review")
+        );
+        assert!(schedule_rename_preview(&app, "PENDING").contains("Saving…"));
+
+        allow_rename.send(()).unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert!(app.schedule_rename.is_none());
+        let assert_saved = |app: &App| {
+            let selected = &app.schedules.schedules[app.schedules.selected];
+            assert_eq!(selected.id, ID);
+            assert_eq!(selected.name.as_deref(), Some("Weekly plan"));
+            assert_eq!(selected.enabled, Some(true));
+            assert_eq!(selected.next_run, next_run);
+            assert_eq!(selected.prompt.as_deref(), Some("Check the release"));
+            assert_eq!(
+                app.schedules.schedules[1].name.as_deref(),
+                Some("Weekly review")
+            );
+        };
+        assert_saved(&app);
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert_saved(&app);
+        allow_fresh.send(()).unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert_saved(&app);
+        assert!(schedule_rename_preview(&app, "SAVED").contains("Weekly plan"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_rename_keeps_the_draft_on_an_older_host() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut stream).await.lines().next(),
+                Some("PATCH /api/v1/schedules/selected/name HTTP/1.1")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(120), listener.accept())
+                    .await
+                    .is_err(),
+                "the older Host received a second request"
+            );
+        });
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        let view = serde_json::from_str(r#"{"id":"selected","name":"Original"}"#).unwrap();
+        app.schedules.schedules = vec![Schedule::from_view(view)];
+        app.handle_key(key(KeyCode::Char('e'))).await.unwrap();
+        for _ in 0.."Original".len() {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let rename = app.schedule_rename.as_ref().unwrap();
+        assert_eq!(rename.error.as_deref(), Some("Enter a schedule name"));
+        assert!(!app.schedule_rename_is_saving());
+        for character in "New title".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(event).await.unwrap();
+        let rename = app.schedule_rename.as_ref().unwrap();
+        assert_eq!(rename.draft, "New title");
+        assert_eq!(
+            rename.error.as_deref(),
+            Some("Renaming requires a newer Host")
+        );
+        assert!(!app.schedule_rename_is_saving());
+        let visible = schedule_rename_preview(&app, "UNSUPPORTED");
+        assert!(visible.contains("Name: New title"));
+        assert!(visible.contains("Renaming requires a newer Host"));
+        assert_eq!(app.schedules.schedules[0].name.as_deref(), Some("Original"));
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_rename.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_rename_closes_on_a_session_switch_and_reconciles_an_inflight_save() {
+        let client = BambooClient::new("http://127.0.0.1:0");
+        for submitted in [false, true] {
+            let mut app = schedule_run_session_test_app(client.clone());
+            app.handle_key(key(KeyCode::Char('e'))).await.unwrap();
+            assert!(app.schedule_rename.is_some());
+            let schedule_id = app.schedules.schedules[0].id.clone();
+            if submitted {
+                app.pending_schedule_rename = Some(PendingScheduleRename {
+                    generation: 2,
+                    schedule_id: schedule_id.clone(),
+                    name: "Saved after switching".into(),
+                });
+            }
+
+            app.handle_event(AppEvent::SessionDeleted {
+                session_id: "current-session".into(),
+                result: Ok(()),
+                session_picker_epoch: None,
+            })
+            .await
+            .unwrap();
+            assert_eq!(app.tab, Tab::Chat);
+            assert!(app.schedule_rename.is_none());
+            assert_eq!(app.schedule_rename_is_saving(), submitted);
+            let chat_status = app.status_message.clone();
+            for (generation, title) in [(1, "Earlier rename"), (2, "Saved after switching")] {
+                app.handle_event(AppEvent::ScheduleRenameFinished {
+                    generation,
+                    schedule_id: schedule_id.clone(),
+                    result: Ok(title.into()),
+                })
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                app.schedules.schedules[0].name.as_deref() == Some("Saved after switching"),
+                submitted
+            );
+            assert_eq!(app.status_message, chat_status);
+            assert!(app.schedule_rename.is_none());
+            assert!(!app.schedule_rename_is_saving());
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_prompt_editor_saves_exact_multiline_text_and_fences_catalogs() {
+        use tokio::sync::oneshot;
+
+        const ID: &str = "release-review";
+        const SAVED: &str = "  Draft 🧭  \ncheck release\n";
+        const EDITED: &str = "  Draft 🧭  \ncheck release\n下一步 🧪\n";
+        let catalog = |task_message: &str| {
+            serde_json::json!({"schedules": [
+                {"id": ID, "name": "Release review", "enabled": false,
+                    "trigger": {"type": "interval", "every_seconds": 90},
+                    "state": {"next_fire_at": "2028-01-26T09:10:00Z"},
+                    "run_config": {"task_message": task_message}},
+                {"id": "workflow", "name": "Workflow schedule",
+                    "trigger": {"type": "once"}, "run_config": {
+                        "workflow_target": {"workflow_id": "review", "revision": 1, "args": {}},
+                        "task_message": "Old compatibility prompt"
+                    }},
+            ]})
+            .to_string()
+        };
+        let original = catalog(SAVED);
+        let confirmed = catalog(EDITED);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (stale_seen, stale_started) = oneshot::channel();
+        let (patch_seen, patch_started) = oneshot::channel();
+        let (allow_patch, wait_patch) = oneshot::channel();
+        let (allow_fresh, wait_fresh) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut initial, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut initial).await, "/api/v1/schedules");
+            respond_test_http(&mut initial, "application/json", &original).await;
+
+            let (mut stale, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut stale).await, "/api/v1/schedules");
+            stale_seen.send(()).unwrap();
+
+            let (mut patch, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut patch).await;
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.lines().next(),
+                Some("PATCH /api/v1/schedules/release-review/prompt HTTP/1.1")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({"task_message": EDITED})
+            );
+            patch_seen.send(()).unwrap();
+            wait_patch.await.unwrap();
+            let response = serde_json::json!({"id": ID, "name": "Other name", "enabled": true,
+                "trigger": {"type": "interval", "every_seconds": 120},
+                "run_config": {"task_message": EDITED}});
+            respond_test_http(&mut patch, "application/json", &response.to_string()).await;
+
+            let (mut fresh, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut fresh).await, "/api/v1/schedules");
+            respond_test_http(&mut stale, "application/json", &original).await;
+            wait_fresh.await.unwrap();
+            respond_test_http(&mut fresh, "application/json", &confirmed).await;
+        });
+
+        async fn event(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        let mut app = App::new(client.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx.clone());
+        app.tab = Tab::Schedules;
+        app.load_schedule_catalog(client.clone(), tx.clone());
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert!(schedule_editor_preview(&app, "PROMPT", "READY").contains("p edit prompt"));
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('p'))).await.unwrap();
+        assert!(app.schedule_prompt.is_none());
+        assert!(!schedule_editor_preview(&app, "PROMPT", "WORKFLOW").contains("edit prompt"));
+        app.handle_key(key(KeyCode::Up)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('p'))).await.unwrap();
+        let preview = schedule_editor_preview(&app, "PROMPT", "EDITING");
+        assert!(preview.contains("Edit task prompt") && preview.contains("F2 save"));
+        assert_eq!(
+            app.schedule_prompt
+                .as_ref()
+                .unwrap()
+                .textarea
+                .lines()
+                .join("\n"),
+            SAVED
+        );
+        app.handle_event(AppEvent::Paste("下一步 🧪".into()))
+            .await
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_prompt_is_saving());
+        assert_eq!(
+            app.schedule_prompt
+                .as_ref()
+                .unwrap()
+                .textarea
+                .lines()
+                .join("\n"),
+            EDITED
+        );
+
+        app.load_schedule_catalog(client, tx);
+        let budget = Duration::from_secs(5);
+        tokio::time::timeout(budget, stale_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::F(2))).await.unwrap();
+        tokio::time::timeout(budget, patch_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(AppEvent::SchedulePromptFinished {
+            generation: app.schedule_prompt_generation,
+            schedule_id: "workflow".into(),
+            result: Ok(EDITED.into()),
+        })
+        .await
+        .unwrap();
+        assert!(app.schedule_prompt_is_saving());
+        assert!(schedule_editor_preview(&app, "PROMPT", "PENDING").contains("Saving…"));
+        assert_eq!(app.schedules.schedules[0].prompt.as_deref(), Some(SAVED));
+
+        allow_patch.send(()).unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert!(app.schedule_prompt.is_none());
+        let assert_saved = |app: &App| {
+            let selected = &app.schedules.schedules[app.schedules.selected];
+            assert_eq!(selected.id, ID);
+            assert_eq!(selected.prompt.as_deref(), Some(EDITED));
+            assert_eq!(selected.name.as_deref(), Some("Release review"));
+            assert_eq!(selected.enabled, Some(false));
+            assert_eq!(selected.interval_seconds, Some(90));
+            assert_eq!(app.schedules.schedules[1].prompt, None);
+        };
+        assert_saved(&app);
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert_saved(&app);
+        allow_fresh.send(()).unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert_saved(&app);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_prompt_editor_keeps_blank_input_local_and_escape_preserves_the_saved_task() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:1"));
+        app.tab = Tab::Schedules;
+        let view = serde_json::from_value(serde_json::json!({
+            "id": "task", "name": "Task",
+            "trigger": {"type": "once"}, "run_config": {"task_message": "  Keep 🧭\n "}
+        }))
+        .unwrap();
+        app.schedules.schedules.push(Schedule::from_view(view));
+        app.handle_key(key(KeyCode::Char('p'))).await.unwrap();
+        let edit = app.schedule_prompt.as_mut().unwrap();
+        edit.textarea = TextArea::new(vec!["  ".into(), " ".into()]);
+        app.handle_key(key(KeyCode::F(2))).await.unwrap();
+        assert!(!app.schedule_prompt_is_saving());
+        assert_eq!(
+            app.schedule_prompt.as_ref().unwrap().error.as_deref(),
+            Some("Enter a task prompt")
+        );
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_prompt.is_none());
+        assert_eq!(
+            app.schedules.schedules[0].prompt.as_deref(),
+            Some("  Keep 🧭\n ")
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_daily_time_edits_the_selected_clock_and_preserves_a_refused_draft() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        const ORIGINAL: &str = r#"{
+            "id":"daily/review","name":"Daily review","enabled":false,"timezone":"Asia/Shanghai",
+            "trigger":{"type":"daily","hour":9,"minute":15},
+            "run_config":{"task_message":"Review the report"},
+            "state":{"next_fire_at":"2028-01-26T01:15:00Z"}
+        }"#;
+        const CONFIRMED: &str = r#"{
+            "id":"daily/review","name":"Unrelated name","enabled":true,"timezone":"Asia/Shanghai",
+            "trigger":{"type":"daily","hour":16,"minute":30,"second":45},
+            "run_config":{"task_message":"Unrelated prompt"},
+            "state":{"next_fire_at":"2028-01-26T08:30:45Z"}
+        }"#;
+        let time = ScheduleClockTime {
+            hour: 16,
+            minute: 30,
+            second: 45,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (catalog_seen, old_catalog_started) = oneshot::channel();
+        let (seen, request_seen) = oneshot::channel();
+        let (allow, resume) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let read_patch = |request: &str| {
+                let (head, body) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    head.lines().next(),
+                    Some("PATCH /api/v1/schedules/daily%2Freview/daily-time HTTP/1.1")
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    serde_json::json!({"hour": 16, "minute": 30, "second": 45}),
+                );
+            };
+            let (mut old_catalog, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut old_catalog).await,
+                "/api/v1/schedules"
+            );
+            catalog_seen.send(()).unwrap();
+
+            let (mut older_host, _) = listener.accept().await.unwrap();
+            read_patch(&read_test_http_request(&mut older_host).await);
+            older_host
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            older_host.shutdown().await.unwrap();
+
+            let (mut patch, _) = listener.accept().await.unwrap();
+            read_patch(&read_test_http_request(&mut patch).await);
+            seen.send(()).unwrap();
+            resume.await.unwrap();
+            respond_test_http(&mut patch, "application/json", CONFIRMED).await;
+
+            let (mut catalog, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut catalog).await, "/api/v1/schedules");
+            respond_test_http(
+                &mut old_catalog,
+                "application/json",
+                &format!(r#"{{"schedules":[{ORIGINAL}]}}"#),
+            )
+            .await;
+            let mut updated: serde_json::Value = serde_json::from_str(ORIGINAL).unwrap();
+            let confirmed: serde_json::Value = serde_json::from_str(CONFIRMED).unwrap();
+            updated["trigger"] = confirmed["trigger"].clone();
+            updated["state"] = confirmed["state"].clone();
+            let catalog_body = serde_json::json!({"schedules": [updated, {
+                "id":"interval","name":"Interval","trigger":{"type":"interval","every_seconds":60}
+            }]})
+            .to_string();
+            respond_test_http(&mut catalog, "application/json", &catalog_body).await;
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx.clone());
+        app.tab = Tab::Schedules;
+        let original = Schedule::from_view(serde_json::from_str(ORIGINAL).unwrap());
+        let interval = Schedule::from_view(
+            serde_json::from_str(
+                r#"{"id":"interval","name":"Interval","trigger":{"type":"interval","every_seconds":60}}"#,
+            )
+            .unwrap(),
+        );
+        app.schedules.schedules = vec![original.clone(), interval];
+
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('c'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert!(!schedule_editor_preview(&app, "DAILY", "OTHER").contains("edit daily time"));
+        app.handle_key(key(KeyCode::Up)).await.unwrap();
+        assert!(schedule_editor_preview(&app, "DAILY", "READY").contains("c edit daily time"));
+        app.handle_key(key(KeyCode::Char('c'))).await.unwrap();
+        let opened = schedule_editor_preview(&app, "DAILY", "EDITING");
+        assert!(opened.contains("Edit daily time") && opened.contains("Time: 09:15"));
+        assert!(opened.contains("Time zone  Asia/Shanghai"));
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "25:00".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_cadence_is_saving());
+        assert_eq!(
+            app.schedule_cadence.as_ref().unwrap().error.as_deref(),
+            Some(SCHEDULE_CLOCK_INPUT_ERROR)
+        );
+
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "16:30:45".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        let budget = Duration::from_secs(5);
+        app.load_schedule_catalog(app.client.clone(), tx);
+        tokio::time::timeout(budget, old_catalog_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let refused = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(refused).await.unwrap();
+        let edit = app.schedule_cadence.as_ref().unwrap();
+        assert_eq!(edit.draft, "16:30:45");
+        assert_eq!(
+            edit.error.as_deref(),
+            Some("Editing Daily time requires a newer Host")
+        );
+        assert_eq!(app.schedules.schedules[0].daily_time, original.daily_time);
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        tokio::time::timeout(budget, request_seen)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(schedule_editor_preview(&app, "DAILY", "PENDING").contains("Saving…"));
+        app.handle_event(AppEvent::ScheduleCadenceFinished {
+            generation: app.schedule_cadence_generation,
+            schedule_id: "interval".into(),
+            result: Err("Unrelated reply".into()),
+        })
+        .await
+        .unwrap();
+        assert!(app.schedule_cadence_is_saving());
+        allow.send(()).unwrap();
+        let saved = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(saved).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        let row = &app.schedules.schedules[0];
+        assert_eq!(row.daily_time, Some(time));
+        assert_eq!(row.timezone, original.timezone);
+        assert_eq!(row.name, original.name);
+        assert_eq!(row.enabled, Some(false));
+        assert_eq!(row.prompt, original.prompt);
+        assert_eq!(row.next_run, Some("2028-01-26T08:30:45Z".parse().unwrap()));
+        assert_eq!(app.schedules.schedules[1].interval_seconds, Some(60));
+        for _ in 0..2 {
+            let catalog = tokio::time::timeout(budget, rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_event(catalog).await.unwrap();
+            assert_eq!(app.schedules.schedules[0].daily_time, Some(time));
+            assert_eq!(app.schedules.schedules[1].interval_seconds, Some(60));
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_weekly_time_uses_the_confirmed_clock_and_retains_a_refused_draft() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        const ID: &str = "weekly/review";
+        const ZONE: &str = "America/Argentina/ComodRivadavia";
+        let original = serde_json::json!({
+            "id": ID, "name": "Weekly review", "enabled": false, "timezone": ZONE,
+            "trigger": {"type": "weekly", "weekdays": ["thu", "mon", "thu"], "hour": 9, "minute": 15},
+            "run_config": {"task_message": "Review the report"},
+            "state": {"next_fire_at": "2028-01-27T12:15:00Z"},
+        });
+        let confirmed = serde_json::json!({
+            "id": ID, "name": "Unrelated name", "enabled": true, "timezone": "Asia/Shanghai",
+            "trigger": {"type": "weekly", "weekdays": ["fri", "mon", "fri"], "hour": 16, "minute": 30, "second": 45},
+            "run_config": {"task_message": "Unrelated prompt"},
+            "state": {"next_fire_at": "2028-01-28T08:30:45Z"},
+        });
+        let mut workflow = original.clone();
+        workflow["id"] = serde_json::json!("workflow");
+        workflow["run_config"] =
+            serde_json::json!({"workflow_target": {"workflow_id": "weekly-workflow"}});
+        let mut updated = original.clone();
+        for key in ["trigger", "timezone", "state"] {
+            updated[key] = confirmed[key].clone();
+        }
+        let stale_catalog =
+            serde_json::json!({"schedules": [original.clone(), workflow.clone()]}).to_string();
+        let catalog = serde_json::json!({"schedules": [updated, workflow.clone()]}).to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (catalog_seen, catalog_started) = oneshot::channel();
+        let (patch_seen, patch_started) = oneshot::channel();
+        let (allow_save, wait_for_save) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let read_patch = |request: &str| {
+                let (head, body) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    head.lines().next(),
+                    Some("PATCH /api/v1/schedules/weekly%2Freview/weekly-time HTTP/1.1")
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    serde_json::json!({"hour": 16, "minute": 30, "second": 45}),
+                );
+            };
+            let (mut old_host, _) = listener.accept().await.unwrap();
+            read_patch(&read_test_http_request(&mut old_host).await);
+            old_host
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            old_host.shutdown().await.unwrap();
+
+            let (mut old_list, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut old_list).await,
+                "/api/v1/schedules"
+            );
+            catalog_seen.send(()).unwrap();
+
+            let (mut patch, _) = listener.accept().await.unwrap();
+            read_patch(&read_test_http_request(&mut patch).await);
+            patch_seen.send(()).unwrap();
+            wait_for_save.await.unwrap();
+            respond_test_http(&mut patch, "application/json", &confirmed.to_string()).await;
+
+            let (mut list, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut list).await, "/api/v1/schedules");
+            respond_test_http(&mut old_list, "application/json", &stale_catalog).await;
+            respond_test_http(&mut list, "application/json", &catalog).await;
+        });
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx.clone());
+        app.tab = Tab::Schedules;
+        let project = |value| Schedule::from_view(serde_json::from_value(value).unwrap());
+        app.schedules.schedules = vec![project(original), project(workflow)];
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('w'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        app.handle_key(key(KeyCode::Up)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('c'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert!(schedule_editor_preview(&app, "WEEKLY", "READY").contains("w edit weekly time"));
+        app.handle_key(key(KeyCode::Char('w'))).await.unwrap();
+        for width in [60, 120] {
+            let opened = schedule_editor_preview_at_width(&app, "WEEKLY", "EDITING", width);
+            assert!(opened.contains("Edit weekly time"));
+            assert!(opened.contains("Time: 09:15"));
+            assert!(opened.contains("Weekdays  Mon, Thu"));
+            assert!(opened.contains(&format!("Time zone  {ZONE}")));
+        }
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "24:00".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_cadence_is_saving());
+        assert_eq!(
+            app.schedule_cadence.as_ref().unwrap().error.as_deref(),
+            Some(SCHEDULE_CLOCK_INPUT_ERROR)
+        );
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "16:30:45".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        let budget = Duration::from_secs(5);
+        async fn next_event(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        let edit = app.schedule_cadence.as_ref().unwrap();
+        assert_eq!(edit.draft, "16:30:45");
+        assert_eq!(
+            edit.error.as_deref(),
+            Some("Editing Weekly time requires a newer Host")
+        );
+        assert_eq!(
+            app.schedules.schedules[0].clock_time(ScheduleClockKind::Weekly),
+            ScheduleClockTime::new(9, 15, 0)
+        );
+        app.load_schedule_catalog(app.client.clone(), tx);
+        tokio::time::timeout(budget, catalog_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        tokio::time::timeout(budget, patch_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(AppEvent::ScheduleCadenceFinished {
+            generation: app.schedule_cadence_generation.wrapping_sub(1),
+            schedule_id: ID.into(),
+            result: Err("Stale result".into()),
+        })
+        .await
+        .unwrap();
+        assert!(app.schedule_cadence_is_saving());
+        assert!(schedule_editor_preview(&app, "WEEKLY", "PENDING").contains("Saving…"));
+        allow_save.send(()).unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert_eq!(app.status_message, "Weekly schedule time saved");
+        let assert_saved = |app: &App| {
+            let schedule = &app.schedules.schedules[0];
+            let weekly = schedule.weekly_time.as_ref().unwrap();
+            assert_eq!(schedule.id, ID);
+            assert_eq!(Some(weekly.time), ScheduleClockTime::new(16, 30, 45));
+            assert_eq!(
+                weekly.weekdays,
+                [
+                    ScheduleWeekdayReq::Fri,
+                    ScheduleWeekdayReq::Mon,
+                    ScheduleWeekdayReq::Fri
+                ]
+            );
+            assert_eq!(schedule.timezone.as_deref(), Some("Asia/Shanghai"));
+            assert_eq!(
+                schedule.next_run,
+                Some("2028-01-28T08:30:45Z".parse().unwrap())
+            );
+            assert_eq!(schedule.name.as_deref(), Some("Weekly review"));
+            assert_eq!(schedule.prompt.as_deref(), Some("Review the report"));
+            assert_eq!(schedule.enabled, Some(false));
+            assert!(app.schedules.schedules[1].weekly_time.is_none());
+        };
+        assert_saved(&app);
+        for width in [60, 120] {
+            let saved = schedule_editor_preview_at_width(&app, "WEEKLY", "SAVED", width);
+            assert!(saved.contains("Weekly Mon, Fri at 16:30:45 Asia/Shanghai"));
+            assert!(!saved.contains("Edit weekly time"));
+        }
+        for _ in 0..2 {
+            app.handle_event(next_event(&mut rx).await).await.unwrap();
+            assert_saved(&app);
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_monthly_time_shows_all_saved_days_and_retains_a_refused_draft() {
+        use tokio::io::AsyncWriteExt;
+
+        const ID: &str = "monthly/review";
+        const ZONE: &str = "America/Argentina/ComodRivadavia";
+        let days: Vec<u8> = std::iter::once(31).chain((1..=31).step_by(2)).collect();
+        let original = serde_json::json!({
+            "id": ID, "name": "Monthly review", "enabled": false, "timezone": ZONE,
+            "trigger": {"type": "monthly", "days": days, "hour": 9, "minute": 15},
+            "run_config": {"task_message": "Review the report"},
+            "state": {"next_fire_at": "2028-03-31T12:15:00Z"},
+        });
+        let mut confirmed = original.clone();
+        confirmed["trigger"] = serde_json::json!({
+            "type": "monthly", "days": days, "hour": 18, "minute": 42, "second": 17,
+        });
+        confirmed["state"]["next_fire_at"] = serde_json::json!("2028-03-31T21:42:17Z");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for fail in [true, false] {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut connection).await;
+                let (head, body) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    head.lines().next(),
+                    Some("PATCH /api/v1/schedules/monthly%2Freview/monthly-time HTTP/1.1")
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    serde_json::json!({"hour": 18, "minute": 42, "second": 17})
+                );
+                if fail {
+                    connection
+                        .write_all(
+                            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    connection.shutdown().await.unwrap();
+                } else {
+                    respond_test_http(&mut connection, "application/json", &confirmed.to_string())
+                        .await;
+                }
+            }
+        });
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = vec![Schedule::from_view(
+            serde_json::from_value(original).unwrap(),
+        )];
+        app.handle_key(key(KeyCode::Char('w'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert!(schedule_editor_preview(&app, "MONTHLY", "READY").contains("m edit monthly time"));
+        app.handle_key(key(KeyCode::Char('m'))).await.unwrap();
+        let expected_days =
+            "Days of month  1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31";
+        for width in [60, 120] {
+            let opened = schedule_editor_preview_at_width(&app, "MONTHLY", "EDITING", width);
+            assert!(opened.contains("Edit monthly time") && opened.contains("Time: 09:15"));
+            assert!(opened.contains(&format!("Time zone  {ZONE}")));
+            let lines: Vec<_> = opened.lines().collect();
+            let start = lines
+                .iter()
+                .position(|line| line.contains("Days of month"))
+                .unwrap();
+            let end = lines
+                .iter()
+                .position(|line| line.contains("Time zone  "))
+                .unwrap();
+            let shown = lines[start..end]
+                .iter()
+                .map(|line| line.trim().trim_matches('│').trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(shown, expected_days);
+            assert!(opened.contains("Enter save") && opened.contains("Esc cancel"));
+        }
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "24:00".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_cadence_is_saving());
+        assert_eq!(
+            app.schedule_cadence.as_ref().unwrap().error.as_deref(),
+            Some(SCHEDULE_CLOCK_INPUT_ERROR)
+        );
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in "18:42:17".chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        let budget = Duration::from_secs(5);
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let refused = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(refused).await.unwrap();
+        let edit = app.schedule_cadence.as_ref().unwrap();
+        assert_eq!(edit.draft, "18:42:17");
+        assert_eq!(
+            edit.error.as_deref(),
+            Some("Editing Monthly time requires a newer Host")
+        );
+        assert_eq!(
+            app.schedules.schedules[0].clock_time(ScheduleClockKind::Monthly),
+            ScheduleClockTime::new(9, 15, 0)
+        );
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let saved = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(saved).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert_eq!(app.status_message, "Monthly schedule time saved");
+        let row = &app.schedules.schedules[0];
+        let monthly = row.monthly_time.as_ref().unwrap();
+        assert_eq!(monthly.days, days);
+        assert_eq!(Some(monthly.time), ScheduleClockTime::new(18, 42, 17));
+        assert_eq!(row.timezone.as_deref(), Some(ZONE));
+        assert_eq!(row.next_run, Some("2028-03-31T21:42:17Z".parse().unwrap()));
+        assert_eq!(row.name.as_deref(), Some("Monthly review"));
+        assert_eq!(row.enabled, Some(false));
+        assert_eq!(row.prompt.as_deref(), Some("Review the report"));
+        for width in [60, 120] {
+            let saved = schedule_editor_preview_at_width(&app, "MONTHLY", "SAVED", width);
+            assert!(saved.contains("18:42:17"));
+            assert!(!saved.contains("Edit monthly time"));
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_once_time_edits_only_pending_tasks_and_keeps_the_refused_draft() {
+        use chrono::Datelike;
+        use tokio::io::AsyncWriteExt;
+
+        const ID: &str = "once/review";
+        let year = Utc::now().year() + 1;
+        let old_at = format!("{year}-03-30T09:15:00Z");
+        let entered = format!("{year}-04-30T18:42:17.250+08:00");
+        let canonical = format!("{year}-04-30T10:42:17.250Z");
+        let original = serde_json::json!({
+            "id": ID, "name": "Once review", "enabled": false, "timezone": "Asia/Shanghai",
+            "trigger": {"type": "once", "at": old_at},
+            "run_config": {"task_message": "Review the report"},
+            "state": {"next_fire_at": old_at},
+        });
+        let mut consumed = original.clone();
+        consumed["id"] = serde_json::json!("consumed");
+        consumed["name"] = serde_json::json!("Consumed review");
+        consumed["state"] = serde_json::json!({"next_fire_at": null});
+        let mut confirmed = original.clone();
+        confirmed["trigger"]["at"] = serde_json::json!(canonical);
+        confirmed["state"]["next_fire_at"] = serde_json::json!(canonical);
+        let expected_body = serde_json::json!({"at": canonical});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for refuse in [true, false] {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut connection).await;
+                let (head, body) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    head.lines().next(),
+                    Some("PATCH /api/v1/schedules/once%2Freview/once-at HTTP/1.1")
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    expected_body
+                );
+                if refuse {
+                    connection
+                        .write_all(
+                            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    connection.shutdown().await.unwrap();
+                } else {
+                    respond_test_http(&mut connection, "application/json", &confirmed.to_string())
+                        .await;
+                }
+            }
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = [consumed, original]
+            .into_iter()
+            .map(|view| Schedule::from_view(serde_json::from_value(view).unwrap()))
+            .collect();
+
+        assert!(!schedule_editor_preview(&app, "ONCE", "CONSUMED").contains("o edit once time"));
+        app.handle_key(key(KeyCode::Char('o'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        assert!(schedule_editor_preview(&app, "ONCE", "READY").contains("o edit once time"));
+        app.handle_key(key(KeyCode::Char('o'))).await.unwrap();
+        assert_eq!(app.schedule_cadence.as_ref().unwrap().draft, old_at);
+        for width in [60, 120] {
+            let opened = schedule_editor_preview_at_width(&app, "ONCE", "EDITING", width);
+            assert!(opened.contains("Edit once time") && opened.contains(&format!("At: {old_at}")));
+            assert!(opened.contains("Include Z or an offset such as +08:00."));
+            assert!(opened.contains("Enter save") && opened.contains("Esc cancel"));
+        }
+
+        for _ in 0..old_at.len() {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        let without_offset = format!("{year}-04-30T18:42:17");
+        for character in without_offset.chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_cadence_is_saving());
+        assert_eq!(
+            app.schedule_cadence.as_ref().unwrap().error.as_deref(),
+            Some(SCHEDULE_ONCE_AT_INPUT_ERROR)
+        );
+        for _ in 0..without_offset.len() {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for character in entered.chars() {
+            app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+        }
+
+        let budget = Duration::from_secs(5);
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let refused = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(refused).await.unwrap();
+        let editor = app.schedule_cadence.as_ref().unwrap();
+        assert_eq!(editor.draft, entered);
+        assert_eq!(
+            editor.error.as_deref(),
+            Some("Editing Once time requires a newer Host")
+        );
+        for width in [60, 120] {
+            let refused = schedule_editor_preview_at_width(&app, "ONCE", "REFUSED", width);
+            assert!(refused.contains(&entered));
+            assert!(refused.contains("Editing Once time requires a newer Host"));
+        }
+        assert_eq!(
+            app.schedules.schedules[1].next_run,
+            Some(old_at.parse().unwrap())
+        );
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let saved = tokio::time::timeout(budget, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(saved).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert_eq!(app.status_message, "Once schedule time saved");
+        assert!(app.schedules.schedules[0].once_at.is_none());
+        assert!(app.schedules.schedules[0].next_run.is_none());
+        let row = &app.schedules.schedules[1];
+        assert_eq!(row.once_at, Some(canonical.parse().unwrap()));
+        assert_eq!(row.next_run, row.once_at);
+        assert_eq!(row.name.as_deref(), Some("Once review"));
+        assert_eq!(row.enabled, Some(false));
+        assert_eq!(row.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(row.prompt.as_deref(), Some("Review the report"));
+        for width in [60, 120] {
+            let saved = schedule_editor_preview_at_width(&app, "ONCE", "SAVED", width);
+            assert!(saved.contains(&canonical));
+            assert!(!saved.contains("Edit once time"));
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_cron_expression_edits_only_ordinary_tasks_and_keeps_the_refused_draft() {
+        use tokio::io::AsyncWriteExt;
+
+        const ID: &str = "cron/review";
+        const SAVED: &str = "0\t15\n4 * * MON-FRI";
+        const ENTERED: &str = "7\t45\n9 * * MON-FRI";
+        const PREVIOUS_NEXT: &str = "2035-07-02T20:15:00Z";
+        const CONFIRMED_NEXT: &str = "2035-07-03T01:45:07Z";
+        let original = serde_json::json!({
+            "id": ID, "name": "Cron review", "enabled": false, "timezone": "Asia/Shanghai",
+            "trigger": {"type": "cron", "expr": SAVED},
+            "run_config": {"task_message": "Review the report"},
+            "state": {"next_fire_at": PREVIOUS_NEXT},
+        });
+        let mut workflow = original.clone();
+        workflow["id"] = serde_json::json!("workflow");
+        workflow["name"] = serde_json::json!("Managed review");
+        workflow["run_config"]["workflow_target"] = serde_json::json!({"workflow_id": "managed"});
+        let mut confirmed = original.clone();
+        confirmed["trigger"]["expr"] = serde_json::json!(ENTERED);
+        confirmed["state"]["next_fire_at"] = serde_json::json!(CONFIRMED_NEXT);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for refuse in [true, false] {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut connection).await;
+                let (head, body) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    head.lines().next(),
+                    Some("PATCH /api/v1/schedules/cron%2Freview/cron-expression HTTP/1.1")
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                    serde_json::json!({"expr": ENTERED})
+                );
+                if refuse {
+                    connection
+                        .write_all(
+                            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    connection.shutdown().await.unwrap();
+                } else {
+                    respond_test_http(&mut connection, "application/json", &confirmed.to_string())
+                        .await;
+                }
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = [workflow, original]
+            .into_iter()
+            .map(|view| Schedule::from_view(serde_json::from_value(view).unwrap()))
+            .collect();
+        let shows_hint = |app: &App, phase: &str, hint: &str| {
+            schedule_editor_preview(app, "CRON", phase)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(hint)
+        };
+        assert!(!shows_hint(&app, "WORKFLOW", "x edit Cron expression"));
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert!(!app.wants_bracketed_paste());
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        assert!(shows_hint(&app, "READY", "x edit Cron expression"));
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        assert_eq!(app.schedule_cadence.as_ref().unwrap().draft, SAVED);
+        assert!(app.wants_bracketed_paste());
+        for width in [60, 120] {
+            let opened = schedule_editor_preview_at_width(&app, "CRON", "EDITING", width);
+            for expected in [
+                "Edit Cron expression",
+                "Expression 0 15 4 * * MON-FRI",
+                "Time zone  Asia/Shanghai",
+                "sec min hour day month weekday [year]",
+                "Enter save",
+                "Esc cancel",
+                "Ctrl+U clear",
+            ] {
+                assert!(opened.contains(expected), "{expected:?}\n{opened}");
+            }
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.schedule_cadence_is_saving());
+        assert_eq!(
+            app.schedule_cadence.as_ref().unwrap().error.as_deref(),
+            Some(SCHEDULE_CRON_INPUT_ERROR)
+        );
+        app.handle_key(key(KeyCode::Char('7'))).await.unwrap();
+        app.handle_event(AppEvent::Paste("\t45\n9 * * MON-FRI".into()))
+            .await
+            .unwrap();
+        assert_eq!(app.schedule_cadence.as_ref().unwrap().draft, ENTERED);
+        assert!(!app.schedule_cadence_is_saving());
+        for refuse in [true, false] {
+            app.handle_key(key(KeyCode::Enter)).await.unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(event, AppEvent::ScheduleCadenceFinished { .. }));
+            app.handle_event(event).await.unwrap();
+            if refuse {
+                let editor = app.schedule_cadence.as_ref().unwrap();
+                assert_eq!(editor.draft, ENTERED);
+                assert_eq!(
+                    editor.error.as_deref(),
+                    Some("Editing a Cron expression requires a newer Host")
+                );
+                assert_eq!(
+                    app.schedules.schedules[1].next_run,
+                    Some(PREVIOUS_NEXT.parse().unwrap())
+                );
+                let refused = schedule_editor_preview(&app, "CRON", "REFUSED");
+                assert!(refused.contains("Editing a Cron expression requires a newer Host"));
+                assert!(refused.contains("7 45 9 * * MON-FRI"));
+            }
+        }
+        assert!(app.schedule_cadence.is_none());
+        assert_eq!(app.status_message, "Cron schedule expression saved");
+        assert!(!app.wants_bracketed_paste());
+        assert!(app.schedules.schedules[0].cron_expression.is_none());
+        let row = &app.schedules.schedules[1];
+        assert_eq!(row.cron_expression.as_deref(), Some(ENTERED));
+        assert_eq!(row.next_run, Some(CONFIRMED_NEXT.parse().unwrap()));
+        assert_eq!(row.name.as_deref(), Some("Cron review"));
+        assert_eq!(row.enabled, Some(false));
+        assert_eq!(row.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(row.prompt.as_deref(), Some("Review the report"));
+        for width in [60, 120] {
+            let saved = schedule_editor_preview_at_width(&app, "CRON", "SAVED", width);
+            assert!(
+                saved.lines().any(|line| {
+                    line.contains("› Cron review") && line.contains("7 45 9 * * MON-FRI")
+                }),
+                "{saved}"
+            );
+        }
+
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[{"context":"schedules","action":"edit-schedule-cron-expression","keys":["F8"]}]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        assert!(shows_hint(&app, "REMAPPED", "F8 edit Cron expression"));
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        assert_eq!(app.schedule_cadence.as_ref().unwrap().draft, ENTERED);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_interval_updates_one_row_through_the_host_and_fences_catalogs() {
+        use tokio::sync::oneshot;
+
+        const ID: &str = "release/review";
+        const ORIGINAL: &str = r#"{"schedules":[
+            {"id":"release/review","name":"Release review","enabled":true,
+             "trigger":{"type":"interval","every_seconds":90},
+             "state":{"next_fire_at":"2028-01-26T09:10:00Z"},
+             "run_config":{"task_message":"Check the release"}},
+            {"id":"other","name":"Future schedule","trigger":{"type":"future"}}
+        ]}"#;
+        let confirmed_catalog = ORIGINAL
+            .replace("\"every_seconds\":90", "\"every_seconds\":120")
+            .replace("09:10:00Z", "09:12:00Z");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (old_seen, old_started) = oneshot::channel();
+        let (edit_seen, edit_started) = oneshot::channel();
+        let (allow_edit, wait_edit) = oneshot::channel();
+        let (allow_fresh, wait_fresh) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut initial, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut initial).await, "/api/v1/schedules");
+            respond_test_http(&mut initial, "application/json", ORIGINAL).await;
+
+            let (mut stale, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut stale).await, "/api/v1/schedules");
+            old_seen.send(()).unwrap();
+
+            let (mut patch, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut patch).await;
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                head.lines().next(),
+                Some("PATCH /api/v1/schedules/release%2Freview/interval HTTP/1.1")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({"every_seconds": 120})
+            );
+            edit_seen.send(()).unwrap();
+            wait_edit.await.unwrap();
+            respond_test_http(
+                &mut patch,
+                "application/json",
+                r#"{"id":"release/review","name":"Unrelated name","enabled":false,
+                    "trigger":{"type":"interval","every_seconds":120},
+                    "state":{"next_fire_at":"2028-01-26T09:12:00Z"},
+                    "run_config":{"task_message":"Unrelated task"}}"#,
+            )
+            .await;
+
+            let (mut fresh, _) = listener.accept().await.unwrap();
+            assert_eq!(read_test_http_path(&mut fresh).await, "/api/v1/schedules");
+            respond_test_http(&mut stale, "application/json", ORIGINAL).await;
+            wait_fresh.await.unwrap();
+            respond_test_http(&mut fresh, "application/json", &confirmed_catalog).await;
+        });
+
+        async fn event(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        let mut app = App::new(client.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx.clone());
+        app.tab = Tab::Schedules;
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[{"context":"schedules","action":"edit-schedule-interval","keys":["/"]}]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        app.load_schedule_catalog(client.clone(), tx.clone());
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert!(schedule_editor_preview(&app, "INTERVAL", "READY").contains("/ edit interval"));
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert!(!schedule_editor_preview(&app, "INTERVAL", "UNKNOWN").contains("edit interval"));
+        app.handle_key(key(KeyCode::Up)).await.unwrap();
+        app.handle_key(key(KeyCode::Char('i'))).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+
+        app.load_schedule_catalog(client, tx);
+        let budget = Duration::from_secs(5);
+        tokio::time::timeout(budget, old_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).await.unwrap();
+        let edit = schedule_editor_preview(&app, "INTERVAL", "EDITING");
+        assert!(edit.contains("Edit interval") && edit.contains("Every (seconds): 90"));
+        assert!(edit.contains("Enter save") && edit.contains("Esc cancel"));
+        for code in [
+            KeyCode::Backspace,
+            KeyCode::Backspace,
+            KeyCode::Char('1'),
+            KeyCode::Char('2'),
+            KeyCode::Char('0'),
+            KeyCode::Enter,
+        ] {
+            app.handle_key(key(code)).await.unwrap();
+        }
+        tokio::time::timeout(budget, edit_started)
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_event(AppEvent::ScheduleCadenceFinished {
+            generation: app.schedule_cadence_generation,
+            schedule_id: "other".into(),
+            result: Err("Stale acknowledgement".into()),
+        })
+        .await
+        .unwrap();
+        assert!(app.schedule_cadence_is_saving());
+        assert_eq!(app.schedules.schedules[0].interval_seconds, Some(90));
+        assert!(schedule_editor_preview(&app, "INTERVAL", "PENDING").contains("Saving…"));
+
+        allow_edit.send(()).unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        let assert_saved = |app: &App| {
+            let selected = &app.schedules.schedules[app.schedules.selected];
+            assert_eq!(selected.id, ID);
+            assert_eq!(selected.name.as_deref(), Some("Release review"));
+            assert_eq!(selected.prompt.as_deref(), Some("Check the release"));
+            assert_eq!(selected.enabled, Some(true));
+            assert_eq!(selected.interval_seconds, Some(120));
+            assert_eq!(
+                selected.cadence_detail.as_deref(),
+                Some("Every 120 seconds")
+            );
+            assert_eq!(
+                selected.next_run,
+                Some("2028-01-26T09:12:00Z".parse().unwrap())
+            );
+            assert_eq!(
+                app.schedules.schedules[1].name.as_deref(),
+                Some("Future schedule")
+            );
+        };
+        assert_saved(&app);
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert_saved(&app);
+        allow_fresh.send(()).unwrap();
+        app.handle_event(event(&mut rx).await).await.unwrap();
+        assert_saved(&app);
+        assert!(schedule_editor_preview(&app, "INTERVAL", "SAVED").contains("Every 120 seconds"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_interval_keeps_draft_after_refusal_and_on_an_older_host() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                (
+                    "409 Conflict",
+                    r#"{"error":{"code":"schedule_no_future_occurrence","message":"internal details"}}"#,
+                ),
+                ("404 Not Found", ""),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut stream).await;
+                let (headers, payload) = request.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    headers.lines().next(),
+                    Some("PATCH /api/v1/schedules/selected/interval HTTP/1.1")
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(payload).unwrap(),
+                    serde_json::json!({"every_seconds": 60})
+                );
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(120), listener.accept())
+                    .await
+                    .is_err(),
+                "the older Host received a fallback request"
+            );
+        });
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        let view = serde_json::from_str(
+            r#"{"id":"selected","name":"Original","trigger":{"type":"interval","every_seconds":15}}"#,
+        )
+        .unwrap();
+        app.schedules.schedules = vec![Schedule::from_view(view)];
+        for code in [
+            KeyCode::Char('i'),
+            KeyCode::Backspace,
+            KeyCode::Backspace,
+            KeyCode::Char('0'),
+            KeyCode::Enter,
+        ] {
+            app.handle_key(key(code)).await.unwrap();
+        }
+        let invalid = schedule_editor_preview(&app, "INTERVAL", "INVALID");
+        assert!(invalid.contains("Enter a positive whole number of seconds"));
+        assert!(!app.schedule_cadence_is_saving());
+        app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        for _ in 0..21 {
+            app.handle_key(key(KeyCode::Char('9'))).await.unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let draft = app.schedule_cadence.as_ref().unwrap();
+        assert_eq!(draft.draft.len(), 20);
+        assert_eq!(draft.error.as_deref(), Some("Interval is too large"));
+        for _ in 0..20 {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        for code in [KeyCode::Char('6'), KeyCode::Char('0')] {
+            app.handle_key(key(code)).await.unwrap();
+        }
+        for (phase, error) in [
+            ("REFUSED", "Schedule has no future occurrence"),
+            ("UNSUPPORTED", "Editing the interval requires a newer Host"),
+        ] {
+            app.handle_key(key(KeyCode::Enter)).await.unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_event(event).await.unwrap();
+            let edit = app.schedule_cadence.as_ref().unwrap();
+            assert_eq!(edit.draft, "60");
+            assert_eq!(edit.error.as_deref(), Some(error));
+            assert!(!app.schedule_cadence_is_saving());
+            assert_eq!(app.schedules.schedules[0].interval_seconds, Some(15));
+            let visible = schedule_editor_preview(&app, "INTERVAL", phase);
+            assert!(visible.contains("Every (seconds): 60") && visible.contains(error));
+            assert!(!visible.contains("internal details"));
+        }
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_cadence.is_none());
+        assert_eq!(
+            app.schedules.schedules[app.schedules.selected].id,
+            "selected"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedule_interval_closes_on_chat_departure_and_reconciles_the_exact_pending_save() {
+        let mut app = schedule_run_session_test_app(BambooClient::new("http://127.0.0.1:0"));
+        let view = serde_json::from_str(
+            r#"{"id":"schedule","name":"Interval","trigger":{"type":"interval","every_seconds":90}}"#,
+        )
+        .unwrap();
+        app.schedules.schedules[0] = Schedule::from_view(view);
+        app.handle_key(key(KeyCode::Char('i'))).await.unwrap();
+        assert!(app.schedule_cadence.is_some());
+        app.pending_schedule_cadence = Some(PendingScheduleCadence {
+            generation: 2,
+            schedule_id: "schedule".into(),
+            value: ScheduleCadenceValue::Interval(120),
+        });
+
+        app.handle_event(AppEvent::SessionDeleted {
+            session_id: "current-session".into(),
+            result: Ok(()),
+            session_picker_epoch: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.tab, Tab::Chat);
+        assert!(app.schedule_cadence.is_none());
+        assert!(app.schedule_cadence_is_saving());
+        let chat_status = app.status_message.clone();
+        let mut confirmed = app.schedules.schedules[0].clone();
+        confirmed.interval_seconds = Some(120);
+        confirmed.cadence_detail = Some("Every 120 seconds".into());
+        for generation in [1, 2] {
+            app.handle_event(AppEvent::ScheduleCadenceFinished {
+                generation,
+                schedule_id: "schedule".into(),
+                result: Ok(confirmed.clone()),
+            })
+            .await
+            .unwrap();
+            assert_eq!(app.schedule_cadence_is_saving(), generation == 1);
+        }
+        assert_eq!(app.schedules.schedules[0].interval_seconds, Some(120));
+        assert_eq!(app.status_message, chat_status);
+        assert!(app.schedule_cadence.is_none());
+    }
+
+    #[tokio::test]
     async fn schedule_toggle_key_updates_only_its_row_and_fences_an_older_catalog() {
         use ratatui::backend::TestBackend;
         use tokio::io::AsyncWriteExt;
         use tokio::sync::oneshot;
 
+        const LIST_ERROR: &str = "Could not load schedules. Reopen Schedules to try again.";
         const ORIGINAL: &str = r#"{"schedules":[
             {"id":"first","name":"First review","enabled":true,"trigger":{"type":"interval","every_seconds":90}},
             {"id":"second","name":"Second review","enabled":true}
@@ -24536,6 +27533,13 @@ mod question_tests {
             }
             text
         };
+        let shows_catalog_error = |frame: &str| {
+            frame
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(LIST_ERROR)
+        };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
@@ -24544,6 +27548,13 @@ mod question_tests {
         let (allow_patch, wait_patch) = oneshot::channel();
         let (allow_refresh, wait_refresh) = oneshot::channel();
         let server = tokio::spawn(async move {
+            let (mut cold, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut cold).await.lines().next(),
+                Some("GET /api/v1/schedules HTTP/1.1")
+            );
+            reply_error(&mut cold, "503 Service Unavailable", "RAW_COLD_CATALOG").await;
+
             let (mut first, _) = listener.accept().await.unwrap();
             assert_eq!(read_test_http_path(&mut first).await, "/api/v1/schedules");
             respond_test_http(&mut first, "application/json", ORIGINAL).await;
@@ -24585,6 +27596,27 @@ mod question_tests {
                 r#"{"error":{"message":"RAW_REFRESH_DIAGNOSTIC"}}"#,
             )
             .await;
+
+            let (mut runs, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut runs).await.lines().next(),
+                Some("GET /api/v1/schedules/first/runs HTTP/1.1")
+            );
+            respond_test_http(
+                &mut runs,
+                "application/json",
+                r#"{"schedule_id":"first","runs":[]}"#,
+            )
+            .await;
+
+            let (mut recovered, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut recovered).await.lines().next(),
+                Some("GET /api/v1/schedules HTTP/1.1")
+            );
+            let mut catalog: serde_json::Value = serde_json::from_str(REORDERED).unwrap();
+            catalog["schedules"].as_array_mut().unwrap().reverse();
+            respond_test_http(&mut recovered, "application/json", &catalog.to_string()).await;
         });
 
         let mut app = App::new(client);
@@ -24611,6 +27643,14 @@ mod question_tests {
         app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
         app.handle_event(next_event(&mut rx).await).await.unwrap();
         assert_eq!(app.tab, Tab::Schedules);
+        assert!(app.schedules.schedules.is_empty());
+        assert_eq!(app.schedules.error.as_deref(), Some(LIST_ERROR));
+        let cold = preview(&app, "COLD CATALOG FAILURE");
+        assert!(shows_catalog_error(&cold), "{cold}");
+        assert!(!cold.contains("RAW_COLD_CATALOG"), "{cold}");
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(app.schedules.error.is_none());
         app.handle_key(key(KeyCode::Char('t'))).await.unwrap();
         assert!(!app.schedules.has_pending_toggle());
         app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
@@ -24693,6 +27733,7 @@ mod question_tests {
         assert!(app.schedules.loading);
         app.handle_event(next_event(&mut rx).await).await.unwrap();
         assert!(!app.schedules.loading);
+        assert_eq!(app.schedules.error.as_deref(), Some(LIST_ERROR));
         let selected = &app.schedules.schedules[app.schedules.selected];
         assert_eq!(selected.id, "first");
         assert_eq!(selected.enabled, Some(false));
@@ -24702,16 +27743,29 @@ mod question_tests {
             .find(|row| row.contains("› First review"))
             .unwrap();
         assert!(row.contains("disabled"), "{cached}");
-        for expected in [
-            "Refresh failed",
-            "Every 90 seconds",
-            "/ Enable",
-            "Enter runs",
-            "r run now",
-        ] {
+        assert!(shows_catalog_error(&cached), "{cached}");
+        for expected in ["Every 90 seconds", "/ Enable", "Enter runs", "r run now"] {
             assert!(cached.contains(expected), "missing {expected:?}\n{cached}");
         }
         assert!(!cached.contains("RAW_REFRESH_DIAGNOSTIC"), "{cached}");
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        let runs = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(runs.schedule_id, "first");
+        assert!(matches!(&runs.content, ScheduleRunsContent::Loaded(rows) if rows.is_empty()));
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_runs.is_none());
+
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(app.schedules.error.is_none());
+        assert_eq!(
+            app.schedules.selected, 0,
+            "selection follows the retained ID"
+        );
+        assert_eq!(app.schedules.schedules[0].id, "first");
+        assert_eq!(app.schedules.schedules[0].enabled, Some(false));
         tokio::time::timeout(budget, server).await.unwrap().unwrap();
     }
 
@@ -25181,7 +28235,14 @@ mod question_tests {
                 id: id.to_owned(),
                 name: Some(format!("{id} schedule")),
                 cron: None,
+                cron_expression: None,
                 cadence_detail: None,
+                interval_seconds: None,
+                daily_time: None,
+                weekly_time: None,
+                monthly_time: None,
+                once_at: None,
+                timezone: None,
                 enabled: Some(true),
                 prompt: None,
                 last_run: None,
@@ -25272,7 +28333,14 @@ mod question_tests {
             id: "schedule".to_owned(),
             name: Some("Schedule".to_owned()),
             cron: None,
+            cron_expression: None,
             cadence_detail: None,
+            interval_seconds: None,
+            daily_time: None,
+            weekly_time: None,
+            monthly_time: None,
+            once_at: None,
+            timezone: None,
             enabled: Some(true),
             prompt: None,
             last_run: None,
@@ -25811,7 +28879,14 @@ mod question_tests {
             id: format!("schedule-{index}"),
             name: Some(format!("计划 {index} 🧭")),
             cron: Some("0 * * * *".to_string()),
+            cron_expression: None,
             cadence_detail: None,
+            interval_seconds: None,
+            daily_time: None,
+            weekly_time: None,
+            monthly_time: None,
+            once_at: None,
+            timezone: None,
             enabled: Some(true),
             prompt: None,
             last_run: None,
@@ -33259,6 +36334,329 @@ mod run_status_tests {
         );
         if std::env::var_os("BAMBOO_TUI_CAPTURE_ATX_OPENER").is_some() {
             eprintln!("ATX OPENER PREVIEW\n{restored}\nEND ATX OPENER PREVIEW");
+        }
+    }
+
+    fn assert_focused_assistant_copy_source(app: &mut App, source: &str) {
+        // Resolve the focused Copy payload before it reaches the host clipboard.
+        app.focus_conversation_block_at(0);
+        let focused = app.chat.focused_block.as_deref().unwrap();
+        let block = app
+            .conversation_blocks()
+            .into_iter()
+            .find(|block| block.id == focused)
+            .unwrap();
+        assert!(matches!(
+            block.kind,
+            ConversationBlockKind::AssistantMarkdown { .. }
+        ));
+        assert_eq!(block.copy_text().as_bytes(), source.as_bytes());
+    }
+
+    #[test]
+    fn compact_blockquotes_render_in_live_and_saved_replies_and_copy_exact_source() {
+        use crate::api::types::HistoryMessage;
+        use ratatui::style::Modifier;
+
+        let deltas = [
+            ">",
+            "**Reviewed** 界\r\n>",
+            "\tNext `plan` 🚀\r\n> Same quote\r\n\r\nOutside the quote.",
+        ];
+        let assert_quotes =
+            |terminal: &Terminal<TestBackend>| {
+                let text = terminal_text(terminal);
+                let rows: Vec<_> = text.lines().map(str::trim).collect();
+                let first = rows
+                    .iter()
+                    .position(|row| row.starts_with("│ Reviewed") && row.contains('界'))
+                    .unwrap_or_else(|| panic!("missing compact quote\n{text}"));
+                let second = rows
+                    .iter()
+                    .position(|row| row.starts_with("│ Next plan") && row.contains('🚀'))
+                    .unwrap_or_else(|| panic!("missing tab-separated quote\n{text}"));
+                assert_eq!(second, first + 1, "{text}");
+                assert_eq!(rows.get(second + 1), Some(&"│ Same quote"), "{text}");
+                assert!(rows.contains(&"Outside the quote."), "{text}");
+                assert!(!rows.contains(&">"), "{text}");
+
+                let buffer = terminal.backend().buffer();
+                let cells = buffer.content();
+                let width = usize::from(buffer.area.width);
+                assert!(cells.chunks(width).nth(first).unwrap().iter().any(|cell| {
+                    cell.symbol() == "R" && cell.modifier.contains(Modifier::BOLD)
+                }));
+                assert!(cells.chunks(width).nth(second).unwrap().iter().any(|cell| {
+                    cell.symbol() == "p" && cell.modifier.contains(Modifier::REVERSED)
+                }));
+            };
+        let source = deltas.concat();
+        for width in [60, 80, 120] {
+            let mut app = running_app("session-compact-quote", "run-compact-quote");
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            for (index, delta) in deltas.into_iter().enumerate() {
+                app.handle_sse_event(AgentEvent::Token {
+                    content: delta.to_owned(),
+                })
+                .unwrap();
+                terminal
+                    .draw(|frame| crate::ui::render(frame, &app))
+                    .unwrap();
+                if index < 2 {
+                    let text = terminal_text(&terminal);
+                    assert!(text.lines().any(|row| row.trim() == ">"), "{text}");
+                }
+            }
+            assert!(app.chat.streaming);
+            assert_quotes(&terminal);
+            assert_focused_assistant_copy_source(&mut app, &source);
+
+            app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+                .unwrap();
+            assert!(!app.chat.streaming);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            assert_quotes(&terminal);
+            assert_focused_assistant_copy_source(&mut app, &source);
+
+            let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+            saved.chat.history_loaded = true;
+            saved.connected = true;
+            saved.chat.messages = crate::history::map_history(vec![HistoryMessage {
+                id: "history-compact-quote".into(),
+                role: "assistant".into(),
+                content: source.clone(),
+                ..Default::default()
+            }]);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &saved))
+                .unwrap();
+            assert_quotes(&terminal);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_COMPACT_BLOCKQUOTE").is_some() {
+                let preview = terminal_text(&terminal);
+                eprintln!("COMPACT BLOCKQUOTE PREVIEW\n{preview}\nEND COMPACT BLOCKQUOTE PREVIEW");
+            }
+            assert_focused_assistant_copy_source(&mut saved, &source);
+        }
+    }
+
+    #[test]
+    fn nested_blockquotes_render_in_live_and_saved_replies_and_copy_exact_source() {
+        use crate::api::types::HistoryMessage;
+        use crate::theme::ColorRole;
+        use ratatui::style::Modifier;
+
+        let deltas = [
+            ">>",
+            "**Reviewed** 界\r\n> > Check `plan` 🚀\r\n>\t>\tNext step\r\n> Same quote\r\n\r\nOutside the quote.",
+        ];
+        let source = deltas.concat();
+        let assert_quotes = |terminal: &Terminal<TestBackend>, app: &App| {
+            let text = terminal_text(terminal);
+            let rows: Vec<_> = text.lines().map(str::trim).collect();
+            let first = rows
+                .iter()
+                .position(|row| *row == "│ │ Reviewed 界")
+                .unwrap_or_else(|| panic!("missing compact nested quote\n{text}"));
+            assert_eq!(
+                rows.get(first..first + 4),
+                Some(
+                    &[
+                        "│ │ Reviewed 界",
+                        "│ │ Check plan 🚀",
+                        "│ │ Next step",
+                        "│ Same quote"
+                    ][..]
+                ),
+                "{text}"
+            );
+            assert!(rows.contains(&"Outside the quote."), "{text}");
+            assert!(!rows.contains(&">>"), "{text}");
+
+            let buffer = terminal.backend().buffer();
+            let mut quote_rows = buffer
+                .content()
+                .chunks(usize::from(buffer.area.width))
+                .skip(first);
+            let compact = quote_rows.next().unwrap();
+            let spaced = quote_rows.next().unwrap();
+            let tabbed = quote_rows.next().unwrap();
+            for row in [compact, spaced, tabbed] {
+                let bars: Vec<_> = row.iter().filter(|cell| cell.symbol() == "│").collect();
+                assert_eq!(bars.len(), 2, "{text}");
+                assert!(bars
+                    .iter()
+                    .all(|cell| cell.fg == app.theme.color(ColorRole::Thinking)));
+            }
+            assert!(compact
+                .iter()
+                .any(|cell| { cell.symbol() == "R" && cell.modifier.contains(Modifier::BOLD) }));
+            assert!(spaced.iter().any(|cell| {
+                cell.symbol() == "p" && cell.modifier.contains(Modifier::REVERSED)
+            }));
+        };
+
+        for width in [60, 80, 120] {
+            let mut app = running_app("session-nested-quote", "run-nested-quote");
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            for (index, delta) in deltas.into_iter().enumerate() {
+                app.handle_sse_event(AgentEvent::Token {
+                    content: delta.to_owned(),
+                })
+                .unwrap();
+                terminal
+                    .draw(|frame| crate::ui::render(frame, &app))
+                    .unwrap();
+                if index == 0 {
+                    let text = terminal_text(&terminal);
+                    assert!(text.lines().any(|row| row.trim() == ">>"), "{text}");
+                }
+            }
+            assert!(app.chat.streaming);
+            assert_quotes(&terminal, &app);
+            assert_focused_assistant_copy_source(&mut app, &source);
+
+            app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+                .unwrap();
+            assert!(!app.chat.streaming);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            assert_quotes(&terminal, &app);
+            assert_focused_assistant_copy_source(&mut app, &source);
+
+            let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+            saved.chat.history_loaded = true;
+            saved.connected = true;
+            saved.chat.messages = crate::history::map_history(vec![HistoryMessage {
+                id: "history-nested-quote".into(),
+                role: "assistant".into(),
+                content: source.clone(),
+                ..Default::default()
+            }]);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &saved))
+                .unwrap();
+            assert_quotes(&terminal, &saved);
+            assert_focused_assistant_copy_source(&mut saved, &source);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_NESTED_BLOCKQUOTE").is_some() {
+                let preview = terminal_text(&terminal);
+                eprintln!("NESTED BLOCKQUOTE PREVIEW\n{preview}\nEND NESTED BLOCKQUOTE PREVIEW");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_settings_switch_mermaid_glyphs_in_the_transcript() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        const SOURCE: &str = concat!(
+            "**Mermaid preview**\r\n\r\n```mermaid\r\n",
+            "flowchart LR\r\nA[界] -->|ready| B(🚀)\r\n```\r\n",
+        );
+        const SETTING: &str = "Mermaid diagrams";
+        for width in [60, 80, 120] {
+            let mut app = running_app("session-mermaid-glyphs", "run-mermaid-glyphs");
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            assert_eq!(app.mermaid_glyphs, MermaidGlyphs::Unicode);
+            app.handle_sse_event(AgentEvent::Token {
+                content: SOURCE.to_owned(),
+            })
+            .unwrap();
+
+            app.handle_global_action(ActionId::OpenTerminalSettings);
+            for _ in 0..3 {
+                app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+                    .await
+                    .unwrap();
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+                .await
+                .unwrap();
+            assert_eq!(app.mermaid_glyphs, MermaidGlyphs::Ascii);
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+                .await
+                .unwrap();
+            assert_focused_assistant_copy_source(&mut app, SOURCE);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let streaming = terminal_text(&terminal);
+            assert!(streaming.contains("flowchart LR"), "{streaming}");
+            assert!(streaming.contains("-->|ready|"), "{streaming}");
+
+            app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+                .unwrap();
+            assert_focused_assistant_copy_source(&mut app, SOURCE);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let ascii = terminal_text(&terminal);
+            assert!(
+                ascii.lines().any(|line| {
+                    line.contains("| 界") && line.contains("-->") && line.contains('🚀')
+                }),
+                "{ascii}"
+            );
+            assert!(ascii.contains("ready"), "{ascii}");
+            assert!(!ascii.contains("flowchart LR"), "{ascii}");
+            let ascii_scroll = app.chat.max_scroll.get();
+
+            app.handle_global_action(ActionId::OpenTerminalSettings);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let menu = terminal_text(&terminal);
+            let row = menu
+                .lines()
+                .position(|line| line.contains(SETTING) && line.contains("ASCII"))
+                .unwrap_or_else(|| panic!("Mermaid setting missing\n{menu}"));
+            let buffer = terminal.backend().buffer();
+            let column = buffer
+                .content()
+                .chunks(usize::from(width))
+                .nth(row)
+                .unwrap()
+                .windows(SETTING.len())
+                .position(|cells| {
+                    cells
+                        .iter()
+                        .zip(SETTING.bytes())
+                        .all(|(cell, byte)| cell.symbol().as_bytes() == [byte])
+                })
+                .unwrap();
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.handle_mouse(MouseEvent {
+                    kind,
+                    column: column as u16,
+                    row: row as u16,
+                    modifiers: KeyModifiers::empty(),
+                });
+            }
+            assert_eq!(app.mermaid_glyphs, MermaidGlyphs::Unicode);
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+                .await
+                .unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let unicode = terminal_text(&terminal);
+            assert!(
+                unicode.lines().any(|line| {
+                    line.contains("│ 界") && line.contains('→') && line.contains('🚀')
+                }),
+                "{unicode}"
+            );
+            assert_eq!(app.chat.max_scroll.get(), ascii_scroll);
+            assert_focused_assistant_copy_source(&mut app, SOURCE);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_ASCII").is_some() {
+                eprintln!("MERMAID ASCII PREVIEW\n{ascii}\nEND MERMAID ASCII PREVIEW");
+                eprintln!("MERMAID ASCII SETTINGS\n{menu}\nEND MERMAID ASCII SETTINGS");
+            }
         }
     }
 

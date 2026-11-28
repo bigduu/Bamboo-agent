@@ -5,6 +5,7 @@ use crate::text::{clip_cells, display_width, truncate_cells};
 use crate::theme::colors;
 
 mod fence;
+mod mermaid;
 mod table;
 
 use fence::FencedBlock;
@@ -13,6 +14,13 @@ const MAX_PREVIEW_BYTES: usize = 128 * 1024;
 const MAX_PREVIEW_SOURCE_LINES: usize = 2_048;
 const MAX_FENCE_PREVIEW_ROWS: usize = 64;
 const MAX_FENCE_LABEL_CELLS: usize = 24;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MermaidGlyphs {
+    #[default]
+    Unicode,
+    Ascii,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CopyableFence<'a> {
@@ -27,7 +35,7 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
     let mut fences = Vec::new();
     while let Some(line) = input.next() {
         if let Some(block) =
-            fence::take_fence(source, line, &mut input).filter(|block| block.closed)
+            fence::take_fence(source, line, &mut input).filter(|block| block.closing_line.is_some())
         {
             fences.push(CopyableFence {
                 language: block.kind.language(),
@@ -42,15 +50,31 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
 /// Handles: backtick and tilde fences, inline `code`, **bold**, _italic_,
 /// links, image descriptions, ATX and single-line Setext headings, nested
 /// bullet and ordered lists, task lists, thematic breaks, quotes and tables.
-pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
-    render_markdown_preview(text, width, false)
+/// Top-level quote paragraphs can have two explicit quote markers.
+/// Completed top-level Mermaid fences can preview a short vertical or horizontal path.
+pub(crate) fn render_markdown_with_mermaid_glyphs(
+    text: &str,
+    width: u16,
+    mermaid_glyphs: MermaidGlyphs,
+) -> Vec<Line<'static>> {
+    render_markdown_preview(text, width, false, mermaid_glyphs)
+}
+
+#[cfg(test)]
+pub(crate) fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
+    render_markdown_with_mermaid_glyphs(text, width, MermaidGlyphs::Unicode)
 }
 
 pub(crate) fn render_streaming_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
-    render_markdown_preview(text, width, true)
+    render_markdown_preview(text, width, true, MermaidGlyphs::Unicode)
 }
 
-fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<'static>> {
+fn render_markdown_preview(
+    text: &str,
+    width: u16,
+    streaming: bool,
+    mermaid_glyphs: MermaidGlyphs,
+) -> Vec<Line<'static>> {
     let width = width as usize;
     if width == 0 {
         return Vec::new();
@@ -72,8 +96,35 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
         let indentation = column_after(0, raw_indent);
         let block_container = previous_container.after_indented_block(indentation);
         if let Some(block) = fence::take_fence(source, line, &mut input) {
-            render_code_block(&mut lines, block, width);
             container = block_container;
+            let diagram = match block.kind {
+                fence::FenceKind::Mermaid { has_options, .. }
+                    if !streaming
+                        && block_container == ParagraphContainer::None
+                        && is_top_level_fence(raw_line)
+                        && block.closing_line.is_some_and(is_top_level_closing_fence) =>
+                {
+                    Some(if has_options {
+                        Err(mermaid::Unavailable::Unsupported)
+                    } else {
+                        mermaid::render(block.source, width, mermaid_glyphs)
+                    })
+                }
+                _ => None,
+            };
+            if let Some(diagram) = diagram {
+                match diagram {
+                    Ok(rows) => {
+                        lines.extend(rows);
+                        continue;
+                    }
+                    Err(reason) => lines.push(Line::styled(
+                        clip_cells(reason.status(), width),
+                        Style::default().fg(colors::subtle()),
+                    )),
+                }
+            }
+            render_code_block(&mut lines, block, width);
             continue;
         }
 
@@ -138,12 +189,43 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
         // Blockquote.
         let quote = body.strip_prefix('>');
         let quote_can_continue = quote.is_some_and(paragraph_can_be_lazy);
-        if let Some(content) = body
-            .strip_prefix("> ")
-            .or_else(|| body.eq("> ").then_some(""))
-        {
+        let top_level_quote = quote.is_some()
+            && block_container == ParagraphContainer::None
+            && top_level_body(raw_line) == Some(body);
+        let nested_quote = if top_level_quote {
+            nested_quote_paragraph(body).filter(|content| {
+                // Keep a potential nested Setext heading on the previous path.
+                setext_title(content).is_none()
+                    || !input.peek().is_some_and(|next| {
+                        top_level_body(next.text)
+                            .and_then(two_quote_markers)
+                            .and_then(setext_level)
+                            .is_some()
+                    })
+            })
+        } else {
+            None
+        };
+        let quote_content = nested_quote
+            .or_else(|| body.strip_prefix("> "))
+            .or_else(|| {
+                let content = quote?;
+                if !top_level_quote {
+                    return None;
+                }
+                let content = content.strip_prefix('\t').unwrap_or(content);
+                (!content.is_empty()
+                    && !content.starts_with(|ch: char| ch == '>' || ch.is_whitespace()))
+                .then_some(content)
+            });
+        if let Some(content) = quote_content {
+            let markers = if nested_quote.is_some() {
+                "│ │ "
+            } else {
+                "│ "
+            };
             let mut spans = vec![Span::styled(
-                format!("{indent}│ "),
+                format!("{indent}{markers}"),
                 Style::default().fg(colors::thinking()),
             )];
             spans.extend(parse_inline(content));
@@ -273,6 +355,36 @@ impl ParagraphContainer {
 fn top_level_body(line: &str) -> Option<&str> {
     let body = line.trim_start_matches(' ');
     (line.len() - body.len() <= 3 && !body.starts_with('\t')).then_some(body)
+}
+
+fn two_quote_markers(mut body: &str) -> Option<&str> {
+    for _ in 0..2 {
+        let tail = body.strip_prefix('>')?;
+        body = tail.strip_prefix([' ', '\t']).unwrap_or(tail);
+    }
+    (!body.is_empty() && !body.starts_with(|ch: char| ch == '>' || ch.is_whitespace()))
+        .then_some(body)
+}
+
+fn nested_quote_paragraph(body: &str) -> Option<&str> {
+    let body = two_quote_markers(body)?;
+    if is_atx_heading_anchor(body)
+        || list_anchor(body).is_some()
+        || rule_markers(body).is_some_and(|markers| markers.forms_break())
+        || setext_level(body).is_some()
+        || fence::opening_prefix(body).is_some()
+    {
+        return None;
+    }
+    Some(body)
+}
+
+fn is_top_level_fence(line: &str) -> bool {
+    top_level_body(line).is_some_and(|body| body.starts_with(['`', '~']))
+}
+
+fn is_top_level_closing_fence(line: &str) -> bool {
+    is_top_level_fence(line) && line.trim_end_matches([' ', '\t']).ends_with(['`', '~'])
 }
 
 fn setext_title(line: &str) -> Option<&str> {
@@ -684,24 +796,25 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
 
         // Link: [text](url) — show the text (underlined) then the url dimmed.
         if ch == '[' {
-            if let Some((label, url)) = parse_link(&mut chars) {
-                flush!();
-                spans.push(Span::styled(
-                    label,
-                    Style::default()
-                        .fg(colors::brand())
-                        .add_modifier(Modifier::UNDERLINED),
-                ));
-                if !url.is_empty() {
+            match parse_link(&mut chars) {
+                Some(InlineLink::Complete { label, url }) => {
+                    flush!();
                     spans.push(Span::styled(
-                        format!(" ({url})"),
-                        Style::default().fg(colors::subtle()),
+                        label,
+                        Style::default()
+                            .fg(colors::brand())
+                            .add_modifier(Modifier::UNDERLINED),
                     ));
+                    if !url.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" ({url})"),
+                            Style::default().fg(colors::subtle()),
+                        ));
+                    }
                 }
-                continue;
+                Some(InlineLink::Unfinished(literal)) => current.push_str(&literal),
+                None => current.push('['),
             }
-            // Not a link — treat '[' as literal (the rest re-parses normally).
-            current.push('[');
             continue;
         }
 
@@ -845,18 +958,12 @@ fn take_image_label<'a>(chars: &mut InlineChars<'a>, literal: &mut String) -> Im
 }
 
 fn take_image_target(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
-    take_image_spaces(chars, literal);
-    let complete = if chars.next_if_eq(&'<').is_some() {
-        literal.push('<');
-        take_image_delimited(chars, literal, '<', '>')
-    } else {
-        take_image_bare_destination(chars, literal)
-    };
-    if !complete {
+    take_target_spaces(chars, literal);
+    if !take_destination(chars, literal) {
         return false;
     }
 
-    if !take_image_spaces(chars, literal) {
+    if !take_target_spaces(chars, literal) {
         return true;
     }
     // A title is optional. Leave other bytes for the surrounding inline scan.
@@ -865,14 +972,14 @@ fn take_image_target(chars: &mut InlineChars<'_>, literal: &mut String) -> bool 
     };
     literal.push(open);
     let close = if open == '(' { ')' } else { open };
-    if !take_image_delimited(chars, literal, open, close) {
+    if !take_target_delimited(chars, literal, open, close) {
         return false;
     }
-    take_image_spaces(chars, literal);
+    take_target_spaces(chars, literal);
     true
 }
 
-fn take_image_spaces(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
+fn take_target_spaces(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
     let start = literal.len();
     literal.extend(std::iter::from_fn(|| {
         chars.next_if(|ch| matches!(ch, ' ' | '\t'))
@@ -880,7 +987,12 @@ fn take_image_spaces(chars: &mut InlineChars<'_>, literal: &mut String) -> bool 
     literal.len() > start
 }
 
-fn take_image_bare_destination(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
+fn take_destination(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
+    if chars.next_if_eq(&'<').is_some() {
+        literal.push('<');
+        return take_target_delimited(chars, literal, '<', '>');
+    }
+
     let mut depth = 0;
     while let Some(ch) = chars.next_if(|ch| !matches!(ch, ' ' | '\t') && (*ch != ')' || depth > 0))
     {
@@ -895,7 +1007,7 @@ fn take_image_bare_destination(chars: &mut InlineChars<'_>, literal: &mut String
     depth == 0
 }
 
-fn take_image_delimited(
+fn take_target_delimited(
     chars: &mut InlineChars<'_>,
     literal: &mut String,
     open: char,
@@ -945,10 +1057,14 @@ fn take_until_pair(chars: &mut std::iter::Peekable<std::str::Chars>, marker: cha
     out
 }
 
-/// Parse the remainder of a link after the opening `[`: `text](url)`. Probes on
-/// a clone and only advances `chars` on a full match, so a bare `[` is left
-/// intact for literal rendering.
-fn parse_link(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<(String, String)> {
+enum InlineLink {
+    Complete { label: String, url: String },
+    Unfinished(String),
+}
+
+/// Parse a direct link following the opening `[`. An unfinished destination
+/// stays literal while any text after it keeps its surrounding inline styles.
+fn parse_link(chars: &mut InlineChars<'_>) -> Option<InlineLink> {
     let mut probe = chars.clone();
     let mut label = String::new();
     let mut closed = false;
@@ -964,19 +1080,22 @@ fn parse_link(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<(Strin
     }
     probe.next(); // consume '('
     let mut url = String::new();
-    let mut url_closed = false;
-    for c in probe.by_ref() {
-        if c == ')' {
-            url_closed = true;
-            break;
+    take_target_spaces(&mut probe, &mut url);
+    if take_destination(&mut probe, &mut url) {
+        let mut closing = probe.clone();
+        let destination_end = url.len();
+        // Preserve the existing display of text after the destination.
+        url.extend(std::iter::from_fn(|| closing.next_if(|ch| *ch != ')')));
+        if closing.next_if_eq(&')').is_some() {
+            *chars = closing;
+            return Some(InlineLink::Complete { label, url });
         }
-        url.push(c);
-    }
-    if !url_closed {
+        url.truncate(destination_end);
+    } else if probe.peek().is_some() {
         return None;
     }
-    *chars = probe; // commit only on success
-    Some((label, url))
+    *chars = probe;
+    Some(InlineLink::Unfinished(format!("[{label}]({url}")))
 }
 
 #[cfg(test)]
@@ -1617,6 +1736,56 @@ mod tests {
     }
 
     #[test]
+    fn links_keep_parenthesized_destinations_in_the_destination_span() {
+        for width in [60, 80, 120] {
+            for destination in [
+                "pages/词条(指南(v2))",
+                r"pages/guide\).html",
+                " <pages/带空格 (草稿> ",
+                "guide/folder(v2) \"Title\"",
+            ] {
+                let source = format!("看 [手册 🧭]({destination}) 再读");
+                let rows = render_markdown(&source, width);
+                assert_eq!(rows.len(), 1, "{source}");
+                assert_eq!(
+                    text_of(&rows[0]),
+                    format!("看 手册 🧭 ({destination}) 再读")
+                );
+                assert!(rows[0].spans.iter().any(|span| {
+                    span.content == "手册 🧭"
+                        && span.style.add_modifier.contains(Modifier::UNDERLINED)
+                }));
+                let destination_span = format!(" ({destination})");
+                assert!(rows[0].spans.iter().any(|span| {
+                    span.content == destination_span && span.style.fg == Some(colors::subtle())
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_link_waits_for_the_outer_close_after_a_balanced_destination() {
+        let destination = "pages/词条_手册(指南(v2))";
+        let link = format!("[手册 🧭]({destination})");
+        for (end, _) in link.char_indices().skip(1) {
+            let partial = &link[..end];
+            let rows = render_streaming_markdown(partial, 60);
+            assert_eq!(rows.iter().map(text_of).collect::<Vec<_>>(), [partial]);
+        }
+        let rows = render_streaming_markdown(&link, 60);
+        assert_eq!(
+            rows.iter().map(text_of).collect::<Vec<_>>(),
+            [format!("手册 🧭 ({destination})")]
+        );
+        let surrounding = format!("[手册 🧭]({destination} **next**");
+        let rows = render_streaming_markdown(&surrounding, 60);
+        assert_eq!(text_of(&rows[0]), format!("[手册 🧭]({destination} next"));
+        assert!(rows[0].spans.iter().any(|span| {
+            span.content == "next" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
     fn inline_images_render_plain_alt_without_destinations() {
         let out = render(concat!(
             "see ![build_route *完成* 🧭](assets/chart(1).png) and ",
@@ -1756,6 +1925,176 @@ mod tests {
     }
 
     #[test]
+    fn compact_and_tab_blockquotes_match_spaced_styled_text_at_each_width() {
+        const CONTENT: &str = "复核 **重点** 🧭 and `code`";
+        for width in [60, 80, 120] {
+            for spaces in 0..=3 {
+                let indent = " ".repeat(spaces);
+                let spaced = format!("{indent}> {CONTENT}");
+                let expected = render_markdown(&spaced, width);
+                assert_eq!(
+                    text_of(&expected[0]),
+                    format!("{indent}│ 复核 重点 🧭 and code")
+                );
+                assert!(expected[0].spans.iter().any(|span| {
+                    span.content == "重点" && span.style.add_modifier.contains(Modifier::BOLD)
+                }));
+                for marker in [">", ">\t"] {
+                    let source = format!("{indent}{marker}{CONTENT}");
+                    assert_eq!(render_markdown(&source, width), expected);
+                    assert_eq!(render_streaming_markdown(&source, width), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_blockquotes_keep_table_cells_and_following_breaks_independent() {
+        const TABLE: &str = "| Notes | State |\n| --- | --- |\n| >cell | Ready |\n";
+        for marker in [">", ">\t"] {
+            let source = format!("{TABLE}{marker}quote | text\n---");
+            let expected = render_markdown(&format!("{TABLE}> quote | text\n---"), 60);
+            let rows = render_markdown(&source, 60);
+            assert_eq!(rows, expected);
+            assert_eq!(rows.len(), 5);
+            assert!(text_of(&rows[2]).contains(">cell"));
+            assert_eq!(text_of(&rows[3]), "│ quote | text");
+            assert_eq!(text_of(&rows[4]), "─".repeat(60));
+
+            let source = format!("{marker}first\n{marker}second\ncontinued\n---");
+            assert_eq!(
+                render_markdown(&source, 60),
+                render_markdown("> first\n> second\ncontinued\n---", 60)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_blockquotes_keep_existing_literal_contexts() {
+        for (source, expected) in [
+            (">", ">"),
+            (">\t", ">\t"),
+            (">\t\ttwo tabs", ">\t\ttwo tabs"),
+            (">\t extra whitespace", ">\t extra whitespace"),
+            ("    >indented", "    >indented"),
+            ("\t>indented", "  >indented"),
+        ] {
+            assert_eq!(render(source), [expected]);
+            assert_eq!(
+                render_streaming_markdown(source, 60)
+                    .iter()
+                    .map(text_of)
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+        }
+        assert_eq!(render("- item\n  >inside"), ["  • item", "  >inside"]);
+        let fenced = render("~~~text\n>compact\n>\ttab\n~~~");
+        assert!(fenced[1].contains(">compact"));
+        assert!(fenced[2].contains(">"));
+        assert!(fenced[2].contains("tab"));
+    }
+
+    #[test]
+    fn nested_blockquotes_recognize_two_top_level_markers_and_keep_inline_styles() {
+        const CONTENT: &str = "**复核** `plan` 🚀";
+        for width in [60, 80, 120] {
+            for spaces in 0..=3 {
+                let indent = " ".repeat(spaces);
+                let expected = render_markdown(&format!("{indent}> > {CONTENT}"), width);
+                assert_eq!(text_of(&expected[0]), format!("{indent}│ │ 复核 plan 🚀"));
+                assert_eq!(expected[0].spans[0].style.fg, Some(colors::thinking()));
+                assert!(expected[0].spans.iter().any(|span| {
+                    span.content == "复核" && span.style.add_modifier.contains(Modifier::BOLD)
+                }));
+                assert!(expected[0].spans.iter().any(|span| {
+                    span.content == "plan" && span.style.add_modifier.contains(Modifier::REVERSED)
+                }));
+
+                for first_gap in ["", " ", "\t"] {
+                    for second_gap in ["", " ", "\t"] {
+                        let source = format!("{indent}>{first_gap}>{second_gap}{CONTENT}");
+                        assert_eq!(render_markdown(&source, width), expected, "{source:?}");
+                        assert_eq!(
+                            render_streaming_markdown(&source, width),
+                            expected,
+                            "{source:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_blockquotes_keep_existing_marker_and_container_fallbacks() {
+        for (source, expected) in [
+            (">>", ">>"),
+            ("> >", "│ >"),
+            (">\t>\t", ">\t>\t"),
+            (">>>third level", ">>>third level"),
+            ("> > > third level", "│ > > third level"),
+            (">  >extra space", "│  >extra space"),
+            (">\t>  extra space", ">\t>  extra space"),
+            (">># Heading", ">># Heading"),
+            (">>- list item", ">>- list item"),
+            (">>1. list item", ">>1. list item"),
+            (">>---", ">>---"),
+            (">>~~~rust", ">>~~~rust"),
+            ("    >>indented", "    >>indented"),
+            ("\t>>indented", "  >>indented"),
+        ] {
+            assert_eq!(render(source), [expected], "{source:?}");
+            assert_eq!(
+                render_streaming_markdown(source, 60)
+                    .iter()
+                    .map(text_of)
+                    .collect::<Vec<_>>(),
+                [expected],
+                "{source:?}"
+            );
+        }
+        assert_eq!(render("- item\n  >>inside"), ["  • item", "  >>inside"]);
+        assert_eq!(
+            render(">>first\n> > second\ncontinued"),
+            ["│ │ first", "│ │ second", "continued"]
+        );
+        for (source, expected) in [
+            (">>Title\r\n>>===", [">>Title", ">>==="]),
+            ("> > Title\n> > ---", ["│ > Title", "│ > ---"]),
+            (">\t>Title\n>>-", [">\t>Title", ">>-"]),
+            (">>Title\n-", ["│ │ Title", "-"]),
+            (">>Title\n>>=written", ["│ │ Title", "│ │ =written"]),
+        ] {
+            assert_eq!(render(source), expected, "{source:?}");
+            assert_eq!(
+                render_streaming_markdown(source, 60)
+                    .iter()
+                    .map(text_of)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_blockquotes_keep_tables_fences_and_following_rules_independent() {
+        let table = render("| Notes | State |\n| --- | --- |\n| >>cell | Ready |\n>>outside\n---");
+        assert_eq!(table.len(), 5);
+        assert!(table[2].contains(">>cell"), "{table:?}");
+        assert_eq!(table[3], "│ │ outside");
+        assert_eq!(table[4], "─".repeat(80));
+
+        let fence = render("~~~text\n>>fenced\n~~~\n>>outside");
+        assert_eq!(fence.len(), 4);
+        assert!(fence[0].starts_with("┌ text "), "{fence:?}");
+        assert_eq!(fence[1], format!("│ {:<76} │", ">>fenced"));
+        assert!(fence[2].starts_with('└'), "{fence:?}");
+        assert_eq!(fence[3], "│ │ outside");
+    }
+
+    #[test]
     fn italic_and_bold_distinct() {
         let out = render("_em_ and **strong** and `code`");
         assert_eq!(out[0], "em and strong and code");
@@ -1842,6 +2181,148 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(widths.iter().all(|width| *width == widths[0]), "{widths:?}");
         assert_eq!(widths[0], 18);
+    }
+
+    #[test]
+    fn settled_mermaid_preview_keeps_exact_copy_bytes_and_requires_top_level_closure() {
+        let body = "graph TD\r\n\tA[计划 🧭] --> B[完成]\r\n";
+        let source = format!("  ~~~ Mermaid\r\n{body}   ~~~");
+        let preview = render_markdown(&source, 80);
+        assert_eq!(preview.len(), 7);
+        assert!(text_of(&preview[3]).ends_with('↓'));
+        assert_eq!(
+            copyable_fences(&source).1,
+            [CopyableFence {
+                language: Some("Mermaid"),
+                source: body,
+            }]
+        );
+
+        for source in [
+            format!("~~~mermaid\r\n{body}"),
+            format!("~~~mermaid\r\n{body}    ~~~"),
+            format!("~~~mermaid\r\n{body}~~~\u{a0}"),
+            format!("  - Chart\n    ~~~mermaid\r\n{body}    ~~~"),
+        ] {
+            assert_eq!(
+                render_markdown(&source, 80),
+                render_streaming_markdown(&source, 80)
+            );
+        }
+    }
+
+    #[test]
+    fn settled_unsupported_mermaid_adds_status_and_keeps_the_code_preview() {
+        for source in [
+            "```mermaid\nflowchart RL\nA --> B\n```",
+            "~~~mermaid theme=neutral\nflowchart TD\nA --> B\n~~~",
+            "~~~mermaid\r\nflowchart LR\r\nA-->B-->\r\n~~~",
+        ] {
+            let settled = render_markdown(source, 80);
+            assert_eq!(text_of(&settled[0]), "Mermaid source · unsupported diagram");
+            assert_eq!(settled[1..], render_streaming_markdown(source, 80));
+        }
+    }
+
+    #[test]
+    fn ascii_mermaid_glyphs_keep_source_fallbacks_and_other_markdown() {
+        for (source, width) in [
+            ("```mermaid\nflowchart RL\nA --> B\n```", 60),
+            ("```mermaid\nflowchart LR\nA[Wide] --> B[Long]\n```", 18),
+            ("```mermaid\nflowchart LR\nA --> B\n", 60),
+            ("## Notes\n\n```text\n┌─┐ →\n```", 60),
+        ] {
+            assert_eq!(
+                render_markdown_with_mermaid_glyphs(source, width, MermaidGlyphs::Ascii),
+                render_markdown(source, width),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_mermaid_picks_the_original_fence_source() {
+        let body = "flowchart LR\r\n\tA[计划 🧭] --> B[完成]\r\n";
+        let source = format!("~~~mermaid\r\n{body}~~~");
+        let lines = render_markdown(&source, 60);
+        assert_eq!(lines.len(), 3);
+        assert!(text_of(&lines[1]).contains("├──→┤"));
+        assert_eq!(
+            copyable_fences(&source).1,
+            [CopyableFence {
+                language: Some("mermaid"),
+                source: body,
+            }]
+        );
+    }
+
+    #[test]
+    fn mermaid_decision_preview_keeps_exact_fence_source_in_both_glyph_modes() {
+        let body = concat!(
+            "flowchart TD\r\n",
+            "A[准备] -->|ready| B{\"审查 {UTC} (QA) | 🚀?\"}\r\n",
+            "B --> C(Done)\r\n",
+        );
+        let source = format!("~~~mermaid\r\n{body}~~~\r\n");
+        for (glyphs, corner) in [(MermaidGlyphs::Unicode, '╱'), (MermaidGlyphs::Ascii, '/')] {
+            let rows = render_markdown_with_mermaid_glyphs(&source, 60, glyphs);
+            assert_eq!(rows.len(), 11);
+            assert!(text_of(&rows[4]).starts_with(corner));
+            assert!(text_of(&rows[5]).contains("审查 {UTC} (QA) | 🚀?"));
+            assert_eq!(
+                copyable_fences(&source).1,
+                [CopyableFence {
+                    language: Some("mermaid"),
+                    source: body,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn settled_mermaid_chains_match_separate_edges_and_keep_raw_copy_source() {
+        let chain = "\tA(Plan)-->|复核 🧭|B[Run]-->C(Done);\r\n";
+        let separate = "\tA(Plan)-->|复核 🧭|B[Run];\r\n\tB-->C(Done);\r\n";
+        let fenced = |body: &str| {
+            format!("Before the diagram.\r\n\r\n~~~ mermaid\r\n{body}~~~\r\n\r\nAfter the diagram.")
+        };
+
+        for (direction, arrow) in [("TD", '↓'), ("LR", '→')] {
+            let body = format!("flowchart {direction}\r\n{chain}");
+            let source = fenced(&body);
+            let equivalent = fenced(&format!("flowchart {direction}\r\n{separate}"));
+            let settled = render_markdown(&source, 60);
+            assert_eq!(settled, render_markdown(&equivalent, 60));
+
+            let rows: Vec<_> = settled.iter().map(text_of).collect();
+            assert_eq!(
+                rows.first().map(String::as_str),
+                Some("Before the diagram.")
+            );
+            assert_eq!(rows.last().map(String::as_str), Some("After the diagram."));
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.matches(arrow).count())
+                    .sum::<usize>(),
+                2
+            );
+            assert!(rows.iter().any(|row| row.contains("复核 🧭")));
+            assert!(rows.iter().any(|row| row.contains('╭')));
+            assert!(rows.iter().any(|row| row.contains('┌')));
+
+            let streaming = render_streaming_markdown(&source, 60);
+            assert!(streaming
+                .iter()
+                .any(|row| text_of(row).contains(chain.trim())));
+            assert!(streaming.iter().all(|row| !text_of(row).contains(arrow)));
+            assert_eq!(
+                copyable_fences(&source).1,
+                [CopyableFence {
+                    language: Some("mermaid"),
+                    source: &body,
+                }]
+            );
+        }
     }
 
     #[test]

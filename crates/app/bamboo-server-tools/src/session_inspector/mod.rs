@@ -180,6 +180,9 @@ impl Tool for SessionInspectorTool {
 
     fn description(&self) -> &str {
         match self.access {
+            SessionHistoryAccess::SelfOnly if self.tool_name == SESSION_HISTORY_CURRENT_TOOL_NAME => {
+                "Read-only search and bounded retrieval over the current Bamboo Session's own stored messages, including compressed history. Use search_current, then read_around or read_current for complete turns, or read_slice for character pages of one oversized message. Scope comes from the runtime."
+            }
             SessionHistoryAccess::SelfOnly => {
                 "Read-only search and bounded exact-turn retrieval over the current Bamboo Session's own stored messages, including compressed history. Scope is derived from trusted runtime context; no Session ID or compressed-state recovery is accepted from the caller. Use search_current, then read_around or read_current; raw Session history is transcript authority while memory is selective and may be stale."
             }
@@ -237,7 +240,7 @@ impl Tool for SessionInspectorTool {
             });
         }
         if self.access == SessionHistoryAccess::SelfOnly {
-            return json!({
+            let mut schema = json!({
                 "type": "object",
                 "properties": {
                     "action": {
@@ -263,6 +266,28 @@ impl Tool for SessionInspectorTool {
                 "required": ["action"],
                 "additionalProperties": false
             });
+            if self.tool_name == SESSION_HISTORY_CURRENT_TOOL_NAME {
+                let properties = &mut schema["properties"];
+                properties["action"]["enum"] = json!([
+                    "search_current",
+                    "read_current",
+                    "read_around",
+                    "read_slice"
+                ]);
+                properties["action"]["description"] = json!(
+                    "Search or page current Session history. Use read_slice for bounded text from one message."
+                );
+                properties["message_id"]["description"] =
+                    json!("Current-Session message ID for read_around or read_slice.");
+                properties["offset"] = json!({
+                    "type": "integer", "minimum": 0,
+                    "description": "For read_slice, zero-based Unicode scalar offset (default 0). Use next_offset to continue."
+                });
+                properties["max_chars"]["description"] = json!(
+                    "Hard character budget. read_current/read_around default to 12000; read_slice defaults to 2000 and pages saved text plus additional user multipart text joined with blank lines."
+                );
+            }
+            return schema;
         }
 
         // Keep schema permissive; Rust parsing enforces action-specific requirements.
@@ -439,18 +464,36 @@ impl Tool for SessionInspectorTool {
                 "authorized list accepts only action/query/limit/cursor; inspect accepts only action/session_id/max_chars".into(),
             ));
         }
+        if action == Some("read_slice") {
+            if self.tool_name != SESSION_HISTORY_CURRENT_TOOL_NAME {
+                return Err(ToolError::InvalidArguments(
+                    "read_slice requires the session_history_current tool".into(),
+                ));
+            }
+            if args.as_object().is_some_and(|fields| {
+                fields.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "action" | "message_id" | "offset" | "max_chars"
+                    )
+                })
+            }) {
+                return Err(ToolError::InvalidArguments(
+                    "read_slice only accepts action, message_id, offset, and max_chars; Session scope and history boundary are runtime-derived"
+                        .into(),
+                ));
+            }
+        }
         if self.access == SessionHistoryAccess::SelfOnly
             && !matches!(
                 action,
-                Some("search_current" | "read_current" | "read_around")
+                Some("search_current" | "read_current" | "read_around" | "read_slice")
             )
         {
-            return Err(ToolError::InvalidArguments(
-                format!(
-                    "this {} surface only permits search_current, read_current, and read_around for the caller's own Session",
-                    self.name()
-                ),
-            ));
+            return Err(ToolError::InvalidArguments(format!(
+                "this {} surface only permits history operations for the caller's own Session",
+                self.name()
+            )));
         }
         if action == Some("search_current")
             && args.as_object().is_some_and(|fields| {
@@ -695,6 +738,21 @@ impl Tool for SessionInspectorTool {
                     message_id,
                     before_turns,
                     after_turns,
+                    max_chars,
+                )
+                .await
+            }
+            SessionInspectorArgs::ReadSlice {
+                message_id,
+                offset,
+                max_chars,
+            } => {
+                self_history::handle_read_slice(
+                    self,
+                    caller_session_id,
+                    ctx.tool_call_id.as_ref(),
+                    &message_id,
+                    offset,
                     max_chars,
                 )
                 .await

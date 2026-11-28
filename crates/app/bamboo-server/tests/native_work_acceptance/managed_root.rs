@@ -787,3 +787,882 @@ async fn supervisor_cancels_managed_root_before_work_admission_and_releases_its_
     }
     state.shutdown().await;
 }
+
+// Use the same executor and verified caller envelope as a normal model turn.
+async fn project_tool(
+    state: &AppState,
+    caller: &Session,
+    name: &str,
+    args: Value,
+    success: bool,
+) -> Value {
+    let call = ToolCall {
+        id: format!("fixture-{name}"),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: name.into(),
+            arguments: args.to_string(),
+        },
+    };
+    let tools = state.tools_for(ToolSurface::Root);
+    let schemas = tools.list_tools();
+    let (tx, _rx) = mpsc::channel(16);
+    let ctx = ToolExecutionContext::for_dispatch(
+        &caller.id,
+        &caller.root_session_id,
+        &call.id,
+        &tx,
+        &schemas,
+        ToolExecutionSessionFlags::from_session(caller),
+        false,
+        None,
+        None,
+    )
+    .with_executing_supervisor(
+        ExecutingSupervisorObservation::capture_from_executing_session(caller),
+    );
+    let result = with_executing_session_caller(
+        Some(Arc::new(SessionCallerReference::from(caller))),
+        tools.execute_with_context_outcome(&call, ctx),
+    )
+    .await
+    .unwrap();
+    let ToolOutcome::Completed(result) = result else {
+        panic!("expected a tool result")
+    };
+    assert_eq!(result.success, success, "{}", result.result);
+    serde_json::from_str(&result.result).unwrap()
+}
+
+fn model_tool(request: native_work::ModelRequest, id: &str, name: &str, arguments: Value) {
+    assert!(
+        request.tools.iter().any(|tool| tool.function.name == name),
+        "model is missing {name}"
+    );
+    request
+        .reply
+        .send(LLMChunk::ToolCalls(vec![ToolCall {
+            id: id.into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.to_string(),
+            },
+        }]))
+        .unwrap();
+}
+
+async fn discover_project_tool(
+    requests: &mut mpsc::UnboundedReceiver<native_work::ModelRequest>,
+    request: native_work::ModelRequest,
+    name: &str,
+) -> native_work::ModelRequest {
+    if request.tools.iter().any(|tool| tool.function.name == name) {
+        return request;
+    }
+    model_tool(
+        request,
+        "discover-project-tool",
+        "discover_capabilities",
+        json!({"query": name}),
+    );
+    tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("follow-up model request after discovery")
+        .unwrap()
+}
+
+fn model_tool_result(request: &native_work::ModelRequest, id: &str) -> Value {
+    let result = request
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("missing model Tool result for {id}"));
+    assert_eq!(result.tool_success, Some(true), "{}", result.content);
+    serde_json::from_str(&result.content).unwrap()
+}
+
+#[actix_web::test]
+async fn supervisor_can_discover_projects_beyond_the_first_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (requests, _received) = mpsc::unbounded_channel();
+    let state = Box::pin(host(
+        &root,
+        Arc::new(LocalProvider {
+            requests,
+            calls: AtomicUsize::new(0),
+            max_requests: 0,
+        }),
+    ))
+    .await;
+    for index in 0..33 {
+        state
+            .project_store
+            .create(format!("Route fixture #{index:02}"), None)
+            .unwrap();
+    }
+    let supervisor = state
+        .storage
+        .load_root_authority(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    let first = project_tool(
+        &state,
+        &supervisor,
+        "work_project_manager",
+        json!({"action":"projects", "query":"ROUTE FIXTURE"}),
+        true,
+    )
+    .await;
+    assert_eq!(first["projects"].as_array().unwrap().len(), 32);
+    assert_eq!(first["next_offset"], 32);
+    let last = project_tool(
+        &state,
+        &supervisor,
+        "work_project_manager",
+        json!({"action":"projects", "query":"ROUTE FIXTURE", "offset":first["next_offset"]}),
+        true,
+    )
+    .await;
+    assert_eq!(last["projects"].as_array().unwrap().len(), 1);
+    assert!(last["next_offset"].is_null());
+    let unseen = &last["projects"][0];
+    assert!(!first["projects"].as_array().unwrap().contains(unseen));
+    let found = project_tool(
+        &state,
+        &supervisor,
+        "work_project_manager",
+        json!({"action":"projects", "query":unseen["name"]}),
+        true,
+    )
+    .await;
+    assert_eq!(found["projects"], json!([unseen]));
+    state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn existing_project_work_survives_restart_and_dispatches_into_section() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().canonicalize().unwrap();
+    let workspace = execution_workspace(&path);
+    let (send, mut requests) = mpsc::unbounded_channel();
+    let provider = Arc::new(LocalProvider {
+        requests: send,
+        calls: AtomicUsize::new(0),
+        max_requests: 8,
+    });
+    let section = format!("section:{}", uuid::Uuid::new_v4());
+    let source_pins = BTreeMap::from([("installation-requirements".into(), "revision-1".into())]);
+    let (project_id, manager_id, work_id) = {
+        let state = web::Data::new(Box::pin(host(&path, provider.clone())).await);
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Project Manager acceptance",
+                Some("Project description fixture for the installation project".into()),
+                workspace.repo.clone(),
+                vec![WorkspaceBinding {
+                    path: workspace.worktree.clone(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .unwrap();
+        state
+            .project_store
+            .update(&project.id, project.revision, |project| {
+                project.sidebar = Some(bamboo_domain::ProjectSidebar {
+                    sections: vec![
+                        bamboo_domain::ProjectSidebarSection {
+                            id: format!("section:{}", uuid::Uuid::new_v4()),
+                            name: "Testing".into(),
+                            description: Some("Unrelated Section description fixture".into()),
+                        },
+                        bamboo_domain::ProjectSidebarSection {
+                            id: section.clone(),
+                            name: "Documentation".into(),
+                            description: Some("Documentation Section description fixture".into()),
+                        },
+                    ],
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .unwrap();
+        let (service, owner) = state
+            .tickets
+            .authority(Principal::User {
+                user_id: "host-owner".into(),
+            })
+            .await
+            .unwrap();
+        let command = service
+            .prepare_command(
+                &owner,
+                "manager-existing-work",
+                vec![
+                    Operation::Create {
+                        temp_id: "work".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: Contract {
+                            title: "Installation documentation".into(),
+                            objective: "Prepare an installation acceptance checklist.".into(),
+                            constraints: vec!["Cover a fresh installation on macOS ARM64.".into()],
+                            acceptance: vec!["List the proposed installation checks.".into()],
+                            allowed_tools: BTreeSet::from(["Task".into()]),
+                            user_acceptance_required: true,
+                        },
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::AssociateProject {
+                        ticket_id: "work".into(),
+                        project_id: project.id.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        let work_id = service.work_update(&owner, &command).unwrap().ids["work"].clone();
+        let current_project = state.project_store.get(&project.id).unwrap();
+        let work = service.published().unwrap().1.tickets[&work_id].clone();
+        let adopt_context = service
+            .prepare_command(
+                &owner,
+                "project-manager-initial-adopted-context",
+                vec![Operation::SetProjectContext {
+                    work_id: work_id.clone(),
+                    context: ProjectContextSnapshot {
+                        project_id: project.id.clone(),
+                        project_revision: current_project.revision,
+                        resource_revision: current_project.resource_revision,
+                        workspace_binding: current_project.workspace_bindings[0].clone(),
+                        contract_revision: work.contract_revision,
+                        contract: work.contract,
+                        sources: source_pins.clone(),
+                    },
+                }],
+            )
+            .unwrap();
+        state
+            .tickets
+            .update(owner.principal().clone(), &adopt_context)
+            .await
+            .unwrap();
+        let mut ordinary = Session::new("ordinary-project-session", native_work::MODEL);
+        ordinary.set_project_id_meta(project.id.to_string());
+        state.storage.save_session(&ordinary).await.unwrap();
+        let ordinary = state
+            .storage
+            .load_session(&ordinary.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!ordinary.allows_model_tool_execution("project_manager_work"));
+        assert!(!ordinary.allows_model_tool_execution("work_project_manager"));
+        project_tool(
+            &state,
+            &ordinary,
+            "project_manager_work",
+            json!({"action":"list"}),
+            false,
+        )
+        .await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(bamboo_server::configure_routes),
+        )
+        .await;
+        let manager = owner_post!(
+            app,
+            &format!("/api/v1/projects/{}/manager", project.id),
+            &json!({}),
+            StatusCode::OK
+        );
+        let manager_id = manager["session_id"].as_str().unwrap().to_owned();
+        let other = state.project_store.create("Other Project", None).unwrap();
+        let manager_session = state
+            .storage
+            .load_root_authority(&manager_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for project_id in [Value::Null, json!(other.id)] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{manager_id}"))
+                    .insert_header(("If-Match", manager_session.metadata_version.to_string()))
+                    .set_json(json!({ "project_id": project_id }))
+                    .peer_addr("127.0.0.1:5700".parse().unwrap())
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"]["code"], "project_manager_membership_fixed");
+        }
+        drop(app);
+        state.shutdown().await;
+        (project.id, manager_id, work_id)
+    };
+    let state = web::Data::new(Box::pin(host(&path, provider.clone())).await);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes),
+    )
+    .await;
+    let manager = owner_post!(
+        app,
+        &format!("/api/v1/projects/{project_id}/manager"),
+        &json!({}),
+        StatusCode::OK
+    );
+    assert_eq!(manager["session_id"], manager_id);
+    let manager = state
+        .storage
+        .load_session(&manager_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(manager.messages.iter().any(|message| message
+        .content
+        .contains("You are this Project's Project Manager")));
+    let view = project_tool(
+        &state,
+        &manager,
+        "project_manager_work",
+        json!({"action":"list"}),
+        true,
+    )
+    .await;
+    assert_eq!(view["board"]["data"]["rows"][0]["ticket"]["id"], work_id);
+    assert_eq!(view["sections"][1]["id"], section);
+    let start = json!({
+        "action": "start",
+        "operation_id": uuid::Uuid::new_v4(),
+        "work_id": work_id,
+        "section_id": section,
+    });
+    let mut outside = start.clone();
+    outside["work_id"] = json!("another-project-ticket");
+    project_tool(&state, &manager, "project_manager_work", outside, false).await;
+    let mut ungrouped = start.clone();
+    ungrouped["section_id"] = Value::Null;
+    let refused = project_tool(&state, &manager, "project_manager_work", ungrouped, false).await;
+    assert!(refused["error"]
+        .as_str()
+        .unwrap()
+        .contains("Project Section"));
+    owner_post!(
+        app,
+        "/api/v1/chat",
+        &json!({
+            "session_id": manager.id,
+            "message": format!("Start Work {work_id}. Choose an existing Section based on the card."),
+            "model": native_work::MODEL,
+        }),
+        StatusCode::CREATED
+    );
+    owner_post!(
+        app,
+        &format!("/api/v1/execute/{}", manager.id),
+        &json!({ "model": native_work::MODEL }),
+        StatusCode::ACCEPTED
+    );
+    let intake = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("Project Manager model request")
+        .unwrap();
+    assert!(intake.messages.iter().any(|message| message
+        .content
+        .contains("You are this Project's Project Manager")));
+    assert!(!intake
+        .tools
+        .iter()
+        .any(|tool| matches!(tool.function.name.as_str(), "Bash" | "work_dispatch")));
+    let intake = discover_project_tool(&mut requests, intake, "project_manager_work").await;
+    model_tool(
+        intake,
+        "inspect-project-ticket",
+        "project_manager_work",
+        json!({"action":"inspect", "work_id":work_id}),
+    );
+    let routing = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("Project Manager model request with the original Work")
+        .unwrap();
+    let details = model_tool_result(&routing, "inspect-project-ticket");
+    assert_eq!(details["ticket"]["id"], work_id);
+    assert_eq!(
+        details["ticket"]["contract"]["title"],
+        "Installation documentation"
+    );
+    assert!(details["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|choice| choice["id"] == section && choice["name"] == "Documentation"));
+    model_tool(
+        routing,
+        "start-project-ticket",
+        "project_manager_work",
+        start.clone(),
+    );
+    let first = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("first dispatch model request")
+        .unwrap();
+    let second = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("second dispatch model request")
+        .unwrap();
+    let (routed, worker) = if first
+        .messages
+        .iter()
+        .any(|message| message.tool_call_id.as_deref() == Some("start-project-ticket"))
+    {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let launch = model_tool_result(&routed, "start-project-ticket");
+    assert_eq!(launch["errors"], json!([]));
+    routed
+        .reply
+        .send(LLMChunk::Token("The original Work is dispatched.".into()))
+        .unwrap();
+    let manager = state
+        .storage
+        .load_session(&manager_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let replay = project_tool(&state, &manager, "project_manager_work", start, true).await;
+    assert_eq!(launch["receipt"], replay["receipt"]);
+    let assignment_id = launch["receipt"]["ids"]["assignment"].as_str().unwrap();
+    let (service, owner) = state
+        .tickets
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        worker
+            .tools
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Task"]
+    );
+    assert!(!worker.messages.iter().any(|message| message
+        .content
+        .contains("You are this Project's Project Manager")));
+    for expected in [
+        "Project description fixture for the installation project",
+        "Current Section: Documentation",
+        "Documentation Section description fixture",
+    ] {
+        assert!(
+            worker
+                .messages
+                .iter()
+                .any(|message| message.content.contains(expected)),
+            "{expected}"
+        );
+    }
+    assert!(!worker.messages.iter().any(|message| message
+        .content
+        .contains("Unrelated Section description fixture")));
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.assignments.len(), 1);
+    let adopted = &snapshot.project.contexts[&snapshot.project.assignment_contexts[assignment_id]];
+    assert_eq!(adopted.sources, source_pins);
+    let receipt = snapshot.assignments[assignment_id]
+        .runtime
+        .as_ref()
+        .unwrap();
+    let session = state
+        .storage
+        .load_session(&receipt.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.kind, SessionKind::Root);
+    assert_eq!(
+        session.project_id_meta().as_deref(),
+        Some(project_id.as_str())
+    );
+    let manifest = state.project_store.get(&project_id).unwrap();
+    assert_eq!(
+        manifest.sidebar.unwrap().session_sections[&session.id].as_deref(),
+        Some(section.as_str())
+    );
+    assert_eq!(
+        manifest.sidebar_section_bindings[&session.id].root_birth_token,
+        session.root_mode_birth_token()
+    );
+    worker.reply.send(LLMChunk::ToolCalls(vec![ToolCall {
+        id: "project-worker-task".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "Task".into(),
+            arguments: json!({"tasks":[{"id":"done","content":"Prepare installation checks","status":"completed"}]}).to_string(),
+        },
+    }])).unwrap();
+    let completion = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(completion
+        .messages
+        .iter()
+        .any(
+            |message| message.tool_call_id.as_deref() == Some("project-worker-task")
+                && message.tool_success == Some(true)
+        ));
+    completion
+        .reply
+        .send(LLMChunk::Token(RESULT.into()))
+        .unwrap();
+
+    let submission_id = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(id) = &service.published().unwrap().1.tickets[&work_id].current_submission {
+                break id.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("result published to the original Work");
+    let facts = service
+        .work_submission_facts(&owner, &work_id, &submission_id, None)
+        .unwrap()
+        .data;
+    assert_eq!(facts.assignment.id, assignment_id);
+    assert_eq!(
+        service.published().unwrap().1.tickets[&work_id].state,
+        WorkState::Submitted
+    );
+    assert_eq!(
+        facts.submission.artifacts[0].sha256,
+        content_hash(RESULT.as_bytes())
+    );
+    let card = owner_post!(
+        app,
+        "/api/v1/tickets/inspect",
+        &json!({"ids":[work_id],"sections":["submissions"],"depth":0,"budget_bytes":65536,"fixed_commit":null}),
+        StatusCode::OK
+    );
+    assert_eq!(card["data"][0]["ticket"]["id"], work_id);
+    assert_eq!(card["data"][0]["submissions"][0]["id"], submission_id);
+    let base_contract = service.published().unwrap().1.tickets[&work_id]
+        .contract
+        .clone();
+    let populate = service
+        .prepare_command(
+            &owner,
+            "project-manager-paginated-board",
+            (0..24)
+                .flat_map(|index| {
+                    let temp = format!("paged-{index}");
+                    let mut contract = base_contract.clone();
+                    contract.title = format!("Paged Work {index}");
+                    [
+                        Operation::Create {
+                            temp_id: temp.clone(),
+                            kind: TicketKind::Work,
+                            parent: None,
+                            contract,
+                            depends_on: BTreeSet::new(),
+                        },
+                        Operation::AssociateProject {
+                            ticket_id: temp,
+                            project_id: project_id.clone(),
+                        },
+                    ]
+                })
+                .collect(),
+        )
+        .unwrap();
+    service.work_update(&owner, &populate).unwrap();
+    let first = project_tool(
+        &state,
+        &manager,
+        "project_manager_work",
+        json!({"action":"list"}),
+        true,
+    )
+    .await;
+    assert_eq!(first["board"]["data"]["rows"].as_array().unwrap().len(), 24);
+    let next = project_tool(&state, &manager, "project_manager_work",
+        json!({"action":"list", "cursor":first["board"]["next_cursor"], "fixed_commit":first["board"]["snapshot"]["commit"]}), true).await;
+    assert_eq!(next["board"]["data"]["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(next["board"]["snapshot"], first["board"]["snapshot"]);
+    assert!(next["board"]["next_cursor"].is_null());
+    let supervisor = state
+        .storage
+        .load_root_authority(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    let inspected = project_tool(
+        &state,
+        &supervisor,
+        "work_project_manager",
+        json!({"action":"inspect","project_id":project_id,"cursor":first["board"]["next_cursor"],
+             "fixed_commit":first["board"]["snapshot"]["commit"]}),
+        true,
+    )
+    .await;
+    assert_eq!(inspected["board"], next["board"]);
+
+    let deleted = test::call_service(
+        &app,
+        test::TestRequest::delete()
+            .uri(&format!("/api/v1/sessions/{manager_id}"))
+            .peer_addr("127.0.0.1:5700".parse().unwrap())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let uri = format!("/api/v1/projects/{project_id}/manager");
+    let (left, right) = tokio::join!(
+        async { owner_post!(app, &uri, &json!({}), StatusCode::OK) },
+        async { owner_post!(app, &uri, &json!({}), StatusCode::OK) },
+    );
+    assert_eq!(left["session_id"], right["session_id"]);
+    assert_ne!(left["session_id"], manager_id);
+    assert!(state
+        .storage
+        .load_root_authority(&manager_id)
+        .await
+        .unwrap()
+        .is_none());
+    let replacement = state
+        .storage
+        .load_root_authority(left["session_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        replacement.project_id_meta().as_deref(),
+        Some(project_id.as_str())
+    );
+    drop(app);
+    state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn ordinary_project_session_drafts_work_through_the_named_ticket_creator() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().canonicalize().unwrap();
+    let workspace = execution_workspace(&path);
+    let (send, mut requests) = mpsc::unbounded_channel();
+    let provider = Arc::new(LocalProvider {
+        requests: send,
+        calls: AtomicUsize::new(0),
+        max_requests: 8,
+    });
+    let draft_report = json!({
+        "status": "draft",
+        "title": "Installation documentation",
+        "objective": "Prepare an installation acceptance checklist",
+        "acceptance": ["List the proposed installation checks"],
+        "facts": ["The target is macOS ARM64."],
+        "decisions": ["Cover fresh installations."],
+        "open_questions": [],
+    });
+    let state = web::Data::new(Box::pin(host(&path, provider.clone())).await);
+    let project = state
+        .project_store
+        .create_with_project_path(
+            "Project Manager acceptance",
+            Some("Project description fixture for the installation project".into()),
+            workspace.repo.clone(),
+            vec![WorkspaceBinding {
+                path: workspace.worktree.clone(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .unwrap();
+    let mut ordinary = Session::new("reporter", native_work::MODEL);
+    ordinary.title = "Installation planning".into();
+    ordinary.title_generated = true;
+    ordinary.set_project_id_meta(project.id.to_string());
+    ordinary.set_workspace_path_meta(workspace.repo.clone());
+    ordinary.add_message(Message::user(
+        "Use macOS ARM64 and cover a fresh installation.",
+    ));
+    ordinary.add_message(Message::assistant("I will use that scope.", None));
+    state.storage.save_session(&ordinary).await.unwrap();
+    let ordinary = state
+        .storage
+        .load_session(&ordinary.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!ordinary
+        .messages
+        .iter()
+        .any(|message| message.content.contains("Project Manager")));
+    assert!(!ordinary.allows_model_tool_execution("project_manager_work"));
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes),
+    )
+    .await;
+    owner_post!(
+        app,
+        "/api/v1/chat",
+        &json!({"session_id": ordinary.id, "message":"We should follow up separately on the installation acceptance checklist.", "model":native_work::MODEL}),
+        StatusCode::CREATED
+    );
+    owner_post!(
+        app,
+        &format!("/api/v1/execute/{}", ordinary.id),
+        &json!({ "model": native_work::MODEL }),
+        StatusCode::ACCEPTED
+    );
+    let admission = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("ordinary Project model request")
+        .unwrap();
+    assert!(admission.messages.iter().any(|message| message
+        .content
+        .contains("Project description fixture for the installation project")));
+    assert!(!admission
+        .messages
+        .iter()
+        .any(|message| message.content.contains("Section description fixture")));
+    assert!(!admission.messages.iter().any(|message| message
+        .content
+        .contains("You are this Project's Project Manager")));
+    assert_eq!(
+        admission
+            .messages
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .contains("For work needing separate tracking")
+            })
+            .count(),
+        1,
+        "the ordinary Project turn gets one concise Ticket Creator cue"
+    );
+    assert!(!admission.tools.iter().any(|tool| matches!(
+        tool.function.name.as_str(),
+        "project_manager_work" | "project_ticket_create"
+    )));
+    let admission = discover_project_tool(&mut requests, admission, "SubAgent").await;
+    model_tool(
+        admission,
+        "launch-ticket-creator",
+        "SubAgent",
+        json!({"role":"ticket-creator","message":"Draft the installation acceptance checklist follow-up."}),
+    );
+    let first = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("SubAgent launch or Child request")
+        .unwrap();
+    let second = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("SubAgent launch and Child request")
+        .unwrap();
+    let (launched, creator) = if first
+        .messages
+        .iter()
+        .any(|message| message.tool_call_id.as_deref() == Some("launch-ticket-creator"))
+    {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let launch = model_tool_result(&launched, "launch-ticket-creator");
+    let child_id = launch["actor_id"].as_str().expect("creator actor");
+    assert!(creator.messages.iter().any(|message| {
+        message.role == Role::System && message.content.contains("Create one Work draft")
+    }));
+    assert!(creator
+        .messages
+        .iter()
+        .any(|message| message.content.contains("macOS ARM64")));
+    assert!(!creator
+        .messages
+        .iter()
+        .any(|message| message.content.contains("description fixture")));
+    assert!(
+        creator.tools.is_empty(),
+        "Creator receives only drafting context"
+    );
+    model_tool(
+        launched,
+        "await-ticket-creator",
+        "SubAgent",
+        json!({"intent":"wait","target":child_id}),
+    );
+    creator
+        .reply
+        .send(LLMChunk::Token(draft_report.to_string()))
+        .unwrap();
+    let drafted = tokio::time::timeout(WAIT, requests.recv())
+        .await
+        .expect("Project model request after the Host saves the draft")
+        .unwrap();
+    assert!(drafted
+        .messages
+        .iter()
+        .any(|message| message.content.contains("ticket_draft")));
+    drafted
+        .reply
+        .send(LLMChunk::Token("Draft recorded.".into()))
+        .unwrap();
+    let ordinary = state
+        .storage
+        .load_session(&ordinary.id)
+        .await
+        .unwrap()
+        .unwrap();
+    project_tool(
+        &state,
+        &ordinary,
+        "project_manager_work",
+        json!({"action":"list"}),
+        false,
+    )
+    .await;
+    let (service, _) = state
+        .tickets
+        .authority(Principal::User {
+            user_id: "host-owner".into(),
+        })
+        .await
+        .unwrap();
+    let snapshot = service.published().unwrap().1;
+    assert_eq!(snapshot.tickets.len(), 1);
+    let work_id = snapshot.tickets.keys().next().unwrap().clone();
+    assert_eq!(snapshot.project.links[&work_id], project.id);
+    assert_eq!(snapshot.tickets[&work_id].state, WorkState::Draft);
+    let brief = snapshot.tickets[&work_id].draft_brief.as_ref().unwrap();
+    assert_eq!(brief.source_session_id, ordinary.id);
+    assert!(brief.sources.len() >= 2);
+    assert!(snapshot.assignments.is_empty());
+    drop(app);
+    state.shutdown().await;
+}

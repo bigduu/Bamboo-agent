@@ -369,10 +369,12 @@ async fn native_section_memory_follows_server_assignment_and_keeps_other_scopes_
                     ProjectSidebarSection {
                         id: FIRST.into(),
                         name: "First".into(),
+                        description: None,
                     },
                     ProjectSidebarSection {
                         id: SECOND.into(),
                         name: "Second".into(),
+                        description: None,
                     },
                 ],
                 session_sections: BTreeMap::from([
@@ -604,6 +606,7 @@ async fn recreated_supervisor_requires_explicit_section_reassignment() {
         sections: vec![ProjectSidebarSection {
             id: FIRST.into(),
             name: name.into(),
+            description: None,
         }],
         session_sections: BTreeMap::from([(supervisor.into(), section_id.map(str::to_owned))]),
         hidden_legacy: false,

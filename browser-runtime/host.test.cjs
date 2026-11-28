@@ -8,7 +8,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 const { chromium } = require('playwright-core');
-const { installScriptBlobCapture, installDownloadLinkInspector } = require('./host.cjs');
+const { installScriptBlobCapture, installDownloadLinkInspector, boundedUnicodeText } = require('./host.cjs');
 const { createHash } = require('node:crypto');
 
 // `close` follows stdout draining; `exit` alone can precede a valid final reply.
@@ -360,6 +360,95 @@ test('download link inspector binds the exact pinned node across a trial', async
       'an alternating eval getter is rejected before Playwright can compile a callback');
     await context.close();
   } finally { await browser.close(); }
+});
+
+test('bounded Unicode text preserves complete pairs and repairs lone code units', () => {
+  assert.deepEqual(boundedUnicodeText('界🧪', 3), { text: '界🧪', truncated: false });
+  assert.deepEqual(boundedUnicodeText('界🧪次', 3), { text: '界🧪', truncated: true });
+  assert.deepEqual(boundedUnicodeText('界🧪次', 2), { text: '界', truncated: true });
+  assert.deepEqual(boundedUnicodeText('\ud800界\udc00🧪', 5), { text: '�界�🧪', truncated: false });
+  assert.deepEqual(boundedUnicodeText('界\ud800次\udc00', 2), { text: '界�', truncated: true });
+});
+
+test('real Chromium DOM replies keep Unicode intact at both output limits', async () => {
+  const snapshotLimit = 80_000;
+  const htmlLimit = 100_000;
+  const snapshotMarker = 'snapshot-boundary';
+  const htmlMarker = 'html-boundary';
+  const page = (visible, hidden) =>
+    `<!doctype html><html lang="en"><meta charset="utf-8"><title>Weekly report</title>` +
+    `<main><h1>週報 café 🪴</h1><p>${visible}</p><div hidden>${hidden}</div></main></html>`;
+  const calibration = page(snapshotMarker, htmlMarker);
+  let expanded;
+  const fixture = http.createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    response.end(request.url === '/expanded' ? expanded :
+      request.url === '/after' ? '<h1>次の報告 🪴</h1>' : calibration);
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const base = `http://127.0.0.1:${fixture.address().port}`;
+  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
+    env: process.env,
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  const hostClosed = once(host, 'close');
+  const call = createHostRpc(host);
+  const get = async (action, args) => {
+    const reply = await call(action, args);
+    assert.equal(reply.ok, true, `${action}: ${reply.error || ''}`);
+    return reply.result;
+  };
+  const crossingText = (offset, limit) => {
+    assert.ok(offset >= 0 && offset < limit - 2, `marker offset ${offset} within ${limit}`);
+    return `${'界'.repeat(limit - 2 - offset)}末🧪 end`;
+  };
+  try {
+    const initial = await get('state');
+    const warmup = await get('navigate', { url: base + '/after', expected_epoch: initial.page_epoch });
+    // Playwright adds a document prefix to snapshot refs after the first observed page.
+    await get('dom');
+    const calibrated = await get('navigate', { url: base, expected_epoch: warmup.page_epoch });
+    const short = await get('dom');
+    assert.equal(short.snapshot_truncated, false);
+    assert.equal(short.html_truncated, false);
+    const visible = crossingText(short.snapshot.indexOf(snapshotMarker), snapshotLimit);
+    const htmlMarkerOffset = short.html.indexOf(htmlMarker);
+    assert.ok(htmlMarkerOffset >= 0);
+    const hidden = crossingText(htmlMarkerOffset + visible.length - snapshotMarker.length, htmlLimit);
+    expanded = page(visible, hidden);
+
+    const navigated = await get('navigate', { url: base + '/expanded', expected_epoch: calibrated.page_epoch });
+    const dom = await get('dom');
+    assert.equal(dom.active_tab_id, navigated.active_tab_id);
+    assert.equal(dom.page_epoch, navigated.page_epoch);
+    assert.equal(dom.title, 'Weekly report');
+    for (const [field, limit] of [['snapshot', snapshotLimit], ['html', htmlLimit]]) {
+      assert.equal(dom[`${field}_truncated`], true);
+      assert.equal(dom[field].length, limit - 1, field);
+      assert.ok(dom[field].includes('週報 café 🪴'), field);
+      assert.ok(dom[field].endsWith('界末'), field);
+      assert.ok(dom[field].isWellFormed(), field);
+    }
+    const after = await get('navigate', { url: base + '/after', expected_epoch: dom.page_epoch });
+    const followUp = await get('dom');
+    assert.equal(followUp.active_tab_id, dom.active_tab_id);
+    assert.equal(followUp.page_epoch, after.page_epoch);
+    assert.notEqual(followUp.page_epoch, dom.page_epoch);
+    assert.ok(followUp.snapshot.includes('次の報告 🪴'), 'follow-up snapshot text');
+    assert.equal(followUp.snapshot_truncated, false);
+    assert.equal(followUp.html_truncated, false);
+  } finally {
+    const stop = setTimeout(() => host.kill('SIGKILL'), 5000);
+    host.stdin.end();
+    const fixtureClosed = once(fixture, 'close');
+    fixture.close();
+    try {
+      await Promise.all([hostClosed, fixtureClosed]);
+    } finally {
+      clearTimeout(stop);
+    }
+  }
 });
 
 test('one isolated page supplies DOM, screenshot, and interactive changes without an iframe', async () => {

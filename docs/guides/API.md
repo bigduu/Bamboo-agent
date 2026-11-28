@@ -455,6 +455,36 @@ eventSource.onmessage = (event) => {
 
 ### Session Management
 
+#### Manual Session Categories
+
+`GET /api/v1/bootstrap` advertises `sessions.manual_categories.v1`.
+Session list and detail entries include `category`, a string or `null`.
+
+```http
+PATCH /api/v1/sessions/{session_id}
+If-Match: "7"
+Content-Type: application/json
+
+{"category":"Support"}
+```
+
+Send a category edit in its own PATCH request. Use `null` to clear it. The name
+is trimmed, preserves spelling and case, and accepts 1–80 Unicode characters
+without control characters. The category belongs to the Root Session and
+follows it across Project and workspace changes. The response returns the
+current Session and ETag. A missing precondition returns `428`, a stale version
+returns `412` with the current ETag, and a Child category edit returns `409`.
+
+`GET /api/v1/projects/{project_id}/session-categories` returns the category
+names in ascending order with Root Session counts from the complete Project
+index. An existing Project with no assignments returns `{"categories":[]}`.
+Each category is shaped as `{"name":"Support","session_count":2}`.
+
+Actual changes publish a durable `SessionCategoryUpdated` account event with
+`session_id`, `project_id`, `category`, `metadata_version`, and `updated_at`.
+Unassigned Projects and cleared categories serialize as `null`. Repeating a
+matching edit retains the current ETag and emits no category event.
+
 #### Copy Session
 
 ```http
@@ -719,6 +749,62 @@ Execute a built-in tool without running the full agent loop.
 
 ---
 
+### Edit a Saved Interval Period
+
+```http
+PATCH /api/v1/schedules/{schedule_id}/interval
+Content-Type: application/json
+```
+
+```json
+{ "every_seconds": 900 }
+```
+
+The body accepts one positive whole-second period representable by the scheduler.
+A successful request returns HTTP 200 with the saved schedule, including its ID,
+Interval trigger, and `state.next_fire_at` when present. Repeating the saved period
+preserves the record and its timestamp. A changed period preserves the effective anchor
+and computes the next occurrence after both the current time and any occurrence
+already handled by the scheduler. The saved window, enabled state, run
+configuration, policies, and existing run records are preserved.
+
+Read the response's `error.code` for these refusals.
+
+| HTTP status | Code | Condition |
+| --- | --- | --- |
+| 400 | `invalid_schedule_interval` | Invalid request body or unrepresentable period |
+| 404 | `schedule_not_found` | The saved schedule is unavailable |
+| 409 | `schedule_trigger_changed` | The saved trigger is no longer Interval |
+| 409 | `schedule_no_future_occurrence` | The new period has no future occurrence within the saved window |
+
+Older Hosts may leave this route unavailable. Keep the pending edit and prompt
+for a Host upgrade in that case.
+
+---
+
+### Skill management availability
+
+```http
+GET /api/v1/skills?include_management=true&include_disabled=true
+```
+
+The response adds `management` with the catalog `revision`, row `total`, and
+`entries` from the same publication. Each winning Skill row contains `id`,
+`name`, `description`, `source`, `revision`, and `availability`.
+
+| Availability | Meaning |
+| --- | --- |
+| `ready` | The current definition is readable. |
+| `retained` | The current source failed to load and the store retained a readable previous definition. |
+| `view_only` | The catalog records the Skill and the store has no readable definition for it. |
+
+The management entries include disabled Skills. `search` and `include_disabled`
+continue to filter `skills` and its top-level `total`. Skill enablement comes
+from the existing configuration. Omitting `include_management` or setting it to
+`false` returns the original list shape.
+
+---
+
 ### Health Check
 
 #### Health Check Endpoint
@@ -914,6 +1000,19 @@ only send the fields you want to change. Two rules:
 See `bamboo_config::patch::deep_merge_json`'s doc comment for the full
 semantics table and the precedence rules against masked-placeholder
 resolution.
+
+### Work review in Config Share
+
+Add `work_review` to `selection.scenarios` in
+`POST /api/v1/bamboo/config/share/export` to include the saved Work review
+model. Use the existing preview and apply steps to confirm the destination
+provider account. An explicit `reasoning_effort` of `"none"` is preserved.
+
+Bundles retain the `BAMBOO-SHARE:1:` format. A bundle containing `work_review`
+requires an updated reader. Earlier Bamboo readers reject that scenario.
+Bundles using the previous scenario set remain compatible with earlier
+readers. Importing a bundle that omits `work_review` preserves the destination's
+saved Work review model.
 
 ---
 

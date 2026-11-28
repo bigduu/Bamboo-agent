@@ -31,6 +31,9 @@ pub(crate) enum ActionContext {
     Mcp,
     Schedules,
     ScheduleForm,
+    ScheduleRename,
+    ScheduleInterval,
+    SchedulePrompt,
     ScheduleRuns,
     ScheduleSessions,
     FenceCopyPicker,
@@ -53,7 +56,7 @@ pub(crate) enum ActionContext {
 }
 
 impl ActionContext {
-    pub(crate) const ALL: [Self; 36] = [
+    pub(crate) const ALL: [Self; 39] = [
         Self::Chat,
         Self::ConversationBlock,
         Self::Global,
@@ -71,6 +74,9 @@ impl ActionContext {
         Self::Mcp,
         Self::Schedules,
         Self::ScheduleForm,
+        Self::ScheduleRename,
+        Self::ScheduleInterval,
+        Self::SchedulePrompt,
         Self::ScheduleRuns,
         Self::ScheduleSessions,
         Self::FenceCopyPicker,
@@ -111,6 +117,9 @@ impl ActionContext {
             Self::Mcp => "MCP",
             Self::Schedules => "Schedules",
             Self::ScheduleForm => "Schedule form",
+            Self::ScheduleRename => "Schedule rename",
+            Self::ScheduleInterval => "Schedule interval",
+            Self::SchedulePrompt => "Schedule prompt",
             Self::ScheduleRuns => "Schedule runs",
             Self::ScheduleSessions => "Schedule Sessions",
             Self::FenceCopyPicker => "Code fence picker",
@@ -231,10 +240,20 @@ pub(crate) enum ActionId {
     #[serde(rename = "quick-answer-9")]
     QuickAnswer9,
     DeleteSelection,
+    InspectSelectedSessionLoop,
     NextPage,
     PreviousPage,
     ShowTools,
     NewSchedule,
+    RenameSchedule,
+    EditScheduleInterval,
+    EditScheduleDailyTime,
+    EditScheduleWeeklyTime,
+    EditScheduleMonthlyTime,
+    EditScheduleOnceTime,
+    EditScheduleCronExpression,
+    EditSchedulePrompt,
+    SaveSchedulePrompt,
     OpenScheduleSessions,
     RunSchedule,
     ToggleScheduleEnabled,
@@ -815,6 +834,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Mcp,
             Schedules,
             ScheduleForm,
+            ScheduleRename,
+            ScheduleInterval,
             ScheduleRuns,
             ScheduleSessions,
             FenceCopyPicker,
@@ -837,6 +858,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Mcp, "Enter"),
             (Schedules, "Enter"),
             (ScheduleForm, "Enter"),
+            (ScheduleRename, "Enter"),
+            (ScheduleInterval, "Enter"),
             (ScheduleRuns, "Enter"),
             (ScheduleSessions, "Enter"),
             (FenceCopyPicker, "Enter"),
@@ -863,6 +886,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionNumber,
             QuestionInspect,
             ScheduleForm,
+            ScheduleRename,
+            ScheduleInterval,
+            SchedulePrompt,
             ScheduleRuns,
             ScheduleSessions,
             FenceCopyPicker,
@@ -886,6 +912,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionNumber, "Esc"),
             (QuestionInspect, "Esc; v"),
             (ScheduleForm, "Esc"),
+            (ScheduleRename, "Esc"),
+            (ScheduleInterval, "Esc"),
+            (SchedulePrompt, "Esc"),
             (ScheduleRuns, "Esc"),
             (ScheduleSessions, "Esc"),
             (FenceCopyPicker, "Esc"),
@@ -911,6 +940,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionCustom,
             QuestionNumber,
             ScheduleForm,
+            ScheduleRename,
+            ScheduleInterval,
             SessionPickerBrowse,
             SessionPickerRename,
             ModelPicker,
@@ -920,6 +951,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionCustom, "Backspace"),
             (QuestionNumber, "Backspace"),
             (ScheduleForm, "Backspace"),
+            (ScheduleRename, "Backspace"),
+            (ScheduleInterval, "Backspace"),
             (SessionPickerBrowse, "Backspace"),
             (SessionPickerRename, "Backspace"),
             (ModelPicker, "Backspace"),
@@ -963,13 +996,19 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
     spec!(
         ClearInput,
         "Clear input",
-        "Clear the focused search query",
+        "Clear the current input",
         false,
-        [SessionPickerBrowse, ModelPicker, CommandPalette],
+        [
+            SessionPickerBrowse,
+            ModelPicker,
+            CommandPalette,
+            ScheduleInterval
+        ],
         [
             (SessionPickerBrowse, "Ctrl+U"),
             (ModelPicker, "Ctrl+U"),
-            (CommandPalette, "Ctrl+U")
+            (CommandPalette, "Ctrl+U"),
+            (ScheduleInterval, "Ctrl+U")
         ]
     ),
     spec!(
@@ -1328,6 +1367,14 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         ]
     ),
     spec!(
+        InspectSelectedSessionLoop,
+        "Check session loop status",
+        "Read the selected session's paced loop status",
+        false,
+        [Sessions],
+        [(Sessions, "l")]
+    ),
+    spec!(
         NextPage,
         "Next page",
         "Load the next page of sessions",
@@ -1358,6 +1405,78 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [Schedules],
         [(Schedules, "n")]
+    ),
+    spec!(
+        RenameSchedule,
+        "Rename schedule",
+        "Change the selected schedule's name",
+        false,
+        [Schedules],
+        [(Schedules, "e")]
+    ),
+    spec!(
+        EditScheduleInterval,
+        "Edit schedule interval",
+        "Change how many seconds pass between runs of the selected Interval schedule",
+        false,
+        [Schedules],
+        [(Schedules, "i")]
+    ),
+    spec!(
+        EditScheduleDailyTime,
+        "Edit Daily schedule time",
+        "Change the selected Daily schedule's saved local clock time",
+        false,
+        [Schedules],
+        [(Schedules, "c")]
+    ),
+    spec!(
+        EditScheduleWeeklyTime,
+        "Edit Weekly schedule time",
+        "Change the selected Weekly Task schedule's saved local clock time",
+        false,
+        [Schedules],
+        [(Schedules, "w")]
+    ),
+    spec!(
+        EditScheduleMonthlyTime,
+        "Edit Monthly schedule time",
+        "Change the selected Monthly Task schedule's saved local clock time",
+        false,
+        [Schedules],
+        [(Schedules, "m")]
+    ),
+    spec!(
+        EditScheduleOnceTime,
+        "Edit Once schedule time",
+        "Move an upcoming Once Task schedule to another date and time",
+        false,
+        [Schedules],
+        [(Schedules, "o")]
+    ),
+    spec!(
+        EditScheduleCronExpression,
+        "Edit Cron schedule expression",
+        "Change the selected Cron Task schedule's saved expression",
+        false,
+        [Schedules],
+        [(Schedules, "x")]
+    ),
+    spec!(
+        EditSchedulePrompt,
+        "Edit task prompt",
+        "Edit the selected Task schedule's saved prompt",
+        false,
+        [Schedules],
+        [(Schedules, "p")]
+    ),
+    spec!(
+        SaveSchedulePrompt,
+        "Save task prompt",
+        "Save the task prompt editor buffer",
+        false,
+        [SchedulePrompt],
+        [(SchedulePrompt, "F2; Ctrl+S")]
     ),
     spec!(
         OpenScheduleSessions,

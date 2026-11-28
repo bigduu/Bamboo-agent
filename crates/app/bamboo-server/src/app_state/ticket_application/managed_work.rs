@@ -17,8 +17,9 @@ use crate::app_state::supervised_root_run::SupervisedRootRunController;
 
 #[derive(Clone)]
 pub(super) struct ManagedWorkHost {
-    creator: Arc<SupervisedRootCreator>,
-    providers: Arc<bamboo_llm::ProviderRegistry>,
+    pub(super) creator: Arc<SupervisedRootCreator>,
+    pub(super) persistence: Arc<bamboo_storage::LockedSessionStore>,
+    pub(super) providers: Arc<bamboo_llm::ProviderRegistry>,
     runs: OnceLock<Arc<SupervisedRootRunController>>,
 }
 
@@ -26,10 +27,12 @@ impl TicketApplication {
     pub(in crate::app_state) fn bind_managed_work_host(
         &self,
         creator: Arc<SupervisedRootCreator>,
+        persistence: Arc<bamboo_storage::LockedSessionStore>,
         providers: Arc<bamboo_llm::ProviderRegistry>,
     ) {
         let _ = self.managed_work_host.set(ManagedWorkHost {
             creator,
+            persistence,
             providers,
             runs: OnceLock::new(),
         });
@@ -56,6 +59,17 @@ impl TicketApplication {
         command: &Command,
         caller: Option<&SessionCallerReference>,
     ) -> Result<Value> {
+        self.dispatch_managed_start(principal, command, caller, None)
+            .await
+    }
+
+    pub(super) async fn dispatch_managed_start(
+        &self,
+        principal: Principal,
+        command: &Command,
+        caller: Option<&SessionCallerReference>,
+        placement: Option<(&bamboo_domain::ProjectId, Option<&str>)>,
+    ) -> Result<Value> {
         let starts: Vec<_> = command
             .operations
             .iter()
@@ -66,7 +80,7 @@ impl TicketApplication {
             .collect();
         // The existing workspace-free Work route also handles legacy rework.
         // An explicit worktree selects the independent Session admission below.
-        if starts.iter().all(|workspace| workspace.is_none()) {
+        if placement.is_none() && starts.iter().all(|workspace| workspace.is_none()) {
             return self.dispatch(principal, command).await;
         }
         if command.operations.len() > 64 {
@@ -136,6 +150,11 @@ impl TicketApplication {
             if path != Path::new(&workspace.worktree) {
                 return Err(Error::ScopeDenied("Worktree path must be canonical".into()));
             }
+            if placement.is_some_and(|(expected, _)| *expected != project.id) {
+                return Err(Error::ScopeDenied(
+                    "Managed Work workspace belongs to another Project".into(),
+                ));
+            }
             projects.insert(workspace.worktree.clone(), project.id);
         }
         self.validate_project_operations(&service, command)?;
@@ -162,6 +181,7 @@ impl TicketApplication {
                     project_id,
                     model: model.clone(),
                     thinking_mode,
+                    section_id: placement.and_then(|(_, section)| section.map(str::to_owned)),
                 })
             },
             &|packet| {
@@ -175,7 +195,7 @@ impl TicketApplication {
         self.enqueue_receipt(&service, command, receipt).await
     }
 
-    async fn require_managed_work_enabled(&self) -> Result<()> {
+    pub(super) async fn require_managed_work_enabled(&self) -> Result<()> {
         let config = self.config.read().await;
         if !config.features.ticket_mutation || !config.features.ticket_dispatch {
             return Err(Error::AuthorityUnavailable(

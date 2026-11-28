@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+
+use chrono::Utc;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -18,23 +21,27 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    if let Some(err) = app
-        .schedules
-        .error
-        .as_ref()
-        .filter(|_| app.schedules.schedules.is_empty())
-    {
-        let error =
-            Paragraph::new(format!("Error: {}", err)).style(Style::default().fg(colors::error()));
-        f.render_widget(error, area);
-        return;
+    let catalog_error = app.schedules.error.as_deref().map(|error| {
+        Paragraph::new(error)
+            .style(Style::default().fg(colors::error()))
+            .wrap(Wrap { trim: true })
+    });
+    if app.schedules.schedules.is_empty() {
+        if let Some(error) = catalog_error {
+            f.render_widget(error, area);
+            return;
+        }
     }
 
     let compact = area.width < 80 || area.height < 18;
+    let error_height = catalog_error
+        .as_ref()
+        .map_or(0, |error| error.line_count(area.width).min(2) as u16);
     let chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
             ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Length(error_height),
             ratatui::layout::Constraint::Min(5),
             ratatui::layout::Constraint::Length(1),
         ])
@@ -82,20 +89,44 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             ),
         ])
     };
-    if app.schedules.error.is_some() {
+    if !app.schedules.schedules.is_empty() {
+        let key = app
+            .keymap
+            .primary_hint(ActionContext::Schedules, ActionId::RenameSchedule);
         header.spans.insert(
             1,
-            Span::styled(" · Refresh failed", Style::default().fg(colors::error())),
+            Span::styled(
+                format!(" · {key} rename"),
+                Style::default().fg(colors::inactive()),
+            ),
         );
     }
-    f.render_widget(Paragraph::new(header), chunks[0]);
-
-    let body = chunks[1];
     let selected = app
         .schedules
         .selected
         .min(app.schedules.schedules.len().saturating_sub(1));
     let selected_schedule = app.schedules.schedules.get(selected);
+    if selected_schedule
+        .and_then(|schedule| schedule.prompt.as_deref())
+        .is_some_and(|prompt| !prompt.trim().is_empty())
+    {
+        let key = app
+            .keymap
+            .primary_hint(ActionContext::Schedules, ActionId::EditSchedulePrompt);
+        header.spans.insert(
+            1,
+            Span::styled(
+                format!(" · {key} edit prompt"),
+                Style::default().fg(colors::inactive()),
+            ),
+        );
+    }
+    f.render_widget(Paragraph::new(header), chunks[0]);
+    if let Some(error) = catalog_error {
+        f.render_widget(error, chunks[1]);
+    }
+
+    let body = chunks[2];
     let detail_width = body.width.saturating_sub(2);
     let toggle = selected_schedule
         .filter(|_| body.height > 2 && detail_width > 0)
@@ -103,15 +134,42 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let toggle_height = u16::from(toggle.is_some());
     let detail_limit = body.height.saturating_sub(2 + toggle_height).min(3);
     let detail = selected_schedule
-        .and_then(|schedule| schedule.cadence_detail.as_deref())
-        .filter(|text| !text.is_empty() && detail_width > 0 && detail_limit > 0)
-        .map(|text| {
+        .filter(|_| detail_width > 0 && detail_limit > 0)
+        .and_then(|schedule| {
+            let text = schedule
+                .cadence_detail
+                .as_deref()
+                .filter(|text| !text.is_empty())?;
             let width = usize::from(detail_width) * usize::from(detail_limit);
-            Paragraph::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled("Cadence  ", Style::default().fg(colors::brand())),
                 Span::raw(clip_schedule_text(text, width.saturating_sub(9))),
-            ]))
-            .wrap(Wrap { trim: true })
+            ];
+            let edit = if schedule.interval_seconds.is_some() {
+                Some((ActionId::EditScheduleInterval, "edit interval"))
+            } else if schedule.daily_time.is_some() {
+                Some((ActionId::EditScheduleDailyTime, "edit daily time"))
+            } else if schedule.weekly_time.is_some() {
+                Some((ActionId::EditScheduleWeeklyTime, "edit weekly time"))
+            } else if schedule.monthly_time.is_some() {
+                Some((ActionId::EditScheduleMonthlyTime, "edit monthly time"))
+            } else if schedule.upcoming_once_at(Utc::now()).is_some() {
+                Some((ActionId::EditScheduleOnceTime, "edit once time"))
+            } else if schedule.cron_expression.is_some() {
+                Some((ActionId::EditScheduleCronExpression, "edit Cron expression"))
+            } else {
+                None
+            };
+            if let Some((action, label)) = edit {
+                let key = app.keymap.primary_hint(ActionContext::Schedules, action);
+                let hint = format!(" · {key} {label}");
+                let remaining = width.saturating_sub(9 + display_width(text));
+                spans.push(Span::styled(
+                    clip_schedule_text(&hint, remaining),
+                    Style::default().fg(colors::inactive()),
+                ));
+            }
+            Some(Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true }))
         });
     let detail_height = detail.as_ref().map_or(0, |paragraph| {
         paragraph
@@ -194,7 +252,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         app.key_hint(ActionContext::Schedules, ActionId::RunSchedule),
     );
     let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
-    f.render_widget(footer, chunks[2]);
+    f.render_widget(footer, chunks[3]);
 }
 
 fn toggle_line(
@@ -410,6 +468,14 @@ pub(super) fn clip_schedule_text(value: &str, width: usize) -> String {
     clip_cells(&text, width)
 }
 
+pub(super) fn cron_expression_line(expression: &str) -> Cow<'_, str> {
+    if expression.contains(char::is_control) {
+        Cow::Owned(expression.replace(char::is_control, " "))
+    } else {
+        Cow::Borrowed(expression)
+    }
+}
+
 fn schedule_row_line(
     schedule: &crate::api::types::Schedule,
     selected: bool,
@@ -434,7 +500,11 @@ fn schedule_row_line(
     };
     let marker = if selected { "›" } else { " " };
     let name = schedule.name.as_deref().unwrap_or(&schedule.id);
-    let cron = schedule.cron.as_deref().unwrap_or("-");
+    let cron = schedule
+        .cron_expression
+        .as_deref()
+        .map(cron_expression_line)
+        .unwrap_or_else(|| Cow::Borrowed(schedule.cron.as_deref().unwrap_or("-")));
 
     if width < 80 {
         // marker + two separators + status consume 16 cells; split the rest
@@ -448,7 +518,7 @@ fn schedule_row_line(
             Span::styled(" · ", row_style),
             Span::styled(truncate_cells(enabled, 8), status_style),
             Span::styled(" · ", row_style),
-            Span::styled(truncate_cells(cron, cron_width), row_style),
+            Span::styled(truncate_cells(&cron, cron_width), row_style),
         ])
     } else {
         let last_run = schedule
@@ -460,7 +530,7 @@ fn schedule_row_line(
             Span::styled(format!("{marker} "), row_style),
             Span::styled(truncate_cells(name, name_width), row_style),
             Span::styled("  ", row_style),
-            Span::styled(truncate_cells(cron, 18), row_style),
+            Span::styled(truncate_cells(&cron, 18), row_style),
             Span::styled("  ", row_style),
             Span::styled(truncate_cells(enabled, 8), status_style),
             Span::styled("  ", row_style),
@@ -486,11 +556,18 @@ mod tests {
             id: format!("schedule-{index}"),
             name: Some(format!("普通计划 {index}")),
             cron: Some("*/15 * * * *".to_string()),
+            cron_expression: None,
             enabled: Some(index.is_multiple_of(2)),
             prompt: None,
             last_run: None,
             next_run: None,
             cadence_detail: None,
+            interval_seconds: None,
+            daily_time: None,
+            weekly_time: None,
+            monthly_time: None,
+            once_at: None,
+            timezone: None,
         }
     }
 
@@ -532,6 +609,7 @@ mod tests {
             "runs action footer missing:\n{text}"
         );
         assert!(text.contains("s sessions"), "{text}");
+        assert!(text.contains("e rename"), "{text}");
         assert!(text.contains('›'), "selected-row glyph missing:\n{text}");
         assert!(!text.contains("Cadence"), "{text}");
     }
@@ -590,11 +668,17 @@ mod tests {
         assert!(disabled.contains("/ Enable"), "{disabled}");
         assert!(!disabled.contains("t Disable"), "{disabled}");
 
-        app.schedules.error = Some("RAW_REFRESH_DIAGNOSTIC".into());
+        let retry_message = "Could not load schedules. Reopen Schedules to try again.";
+        app.schedules.error = Some(retry_message.into());
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
         let stale = terminal_rows(&terminal);
+        if std::env::var_os("BAMBOO_TUI_CAPTURE_SCHEDULE_ERRORS").is_some() {
+            eprintln!(
+                "SCHEDULE CATALOG ERROR PREVIEW\n{stale}\nEND SCHEDULE CATALOG ERROR PREVIEW"
+            );
+        }
         for expected in [
-            "Refresh failed",
+            retry_message,
             "› Weekly archive",
             "/ Enable",
             "Enter runs",
@@ -602,7 +686,6 @@ mod tests {
         ] {
             assert!(stale.contains(expected), "missing {expected:?}\n{stale}");
         }
-        assert!(!stale.contains("RAW_REFRESH_DIAGNOSTIC"), "{stale}");
 
         app.schedules.error = None;
         app.schedules.selected = 2;

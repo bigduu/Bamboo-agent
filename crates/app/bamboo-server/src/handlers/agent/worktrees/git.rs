@@ -198,7 +198,11 @@ fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
 /// Runs one Git command, bounded by `deadline_at`. The effective ceiling is
 /// also capped by the per-command ceiling, so one slow entry can never spend
 /// a whole inventory budget on a single child.
-fn command_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Output, String> {
+pub(super) fn command_by(
+    repo: &Path,
+    args: &[&str],
+    deadline_at: Instant,
+) -> Result<Output, String> {
     let ceiling = Instant::now() + git_command_timeout();
     let deadline_at = deadline_at.min(ceiling);
     let mut command = git_command(repo);
@@ -398,6 +402,9 @@ struct DiscoveryLimits {
     max_entries: usize,
 }
 
+const DISCOVERY_BUDGET_EXHAUSTED: &str =
+    "Discovery budget exhausted; the remaining tree was not inspected";
+
 /// Discover checkouts within one registered Project root without changing Git
 /// or Project state. A directly bound repository subdirectory keeps its exact
 /// path: discovery must not broaden that binding to its ancestor repository.
@@ -423,6 +430,12 @@ pub fn discover_until(root: &Path, deadline_at: Instant) -> Discovery {
 
 fn discover_with_limits(root: &Path, limits: DiscoveryLimits, deadline_at: Instant) -> Discovery {
     let mut result = Discovery::default();
+    if Instant::now() >= deadline_at {
+        result
+            .diagnostics
+            .push((root.to_path_buf(), DISCOVERY_BUDGET_EXHAUSTED.into()));
+        return result;
+    }
     let canonical = match fs::canonicalize(root) {
         Ok(path) if path.is_dir() => path,
         Ok(_) => {
@@ -476,16 +489,17 @@ impl RepositoryScan<'_> {
     /// True once the shared budget is spent. The walk then stops probing and
     /// reports the remainder as uninspected instead of overrunning the
     /// request budget one command timeout per candidate.
-    fn expired(&self) -> bool {
-        Instant::now() >= self.deadline_at
+    fn stop_if_expired(&mut self, path: &Path) -> bool {
+        if Instant::now() < self.deadline_at {
+            return false;
+        }
+        self.exhausted = true;
+        self.diagnostic(path, DISCOVERY_BUDGET_EXHAUSTED);
+        true
     }
 
     fn visit(&mut self, path: &Path, depth: usize) {
-        if self.expired() {
-            self.diagnostic(
-                path,
-                "Discovery budget exhausted; the remaining tree was not inspected",
-            );
+        if self.stop_if_expired(path) {
             return;
         }
         // Recheck each path at use time. Directory symlinks are never followed,
@@ -635,6 +649,9 @@ impl RepositoryScan<'_> {
             self.diagnostic(path, "Directory changed during repository discovery");
             return;
         }
+        if self.stop_if_expired(path) {
+            return;
+        }
         let entries = match fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) => {
@@ -644,6 +661,9 @@ impl RepositoryScan<'_> {
         };
         let mut directories = Vec::new();
         for entry in entries {
+            if self.stop_if_expired(path) {
+                return;
+            }
             if self.remaining_entries == 0 {
                 self.exhausted = true;
                 self.diagnostic(
@@ -770,9 +790,13 @@ fn main_worktree_for_list(repo: &Path, common: &Path) -> Result<PathBuf, String>
     main_worktree_by(repo, common, Instant::now() + git_command_timeout())
 }
 
-/// Deadline-aware variant: called from `list_until`, so its probes must stay
-/// inside the inventory budget instead of restarting the clock per call.
-fn main_worktree_by(repo: &Path, common: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
+/// Verify a main checkout whose native Git list entry names its metadata.
+/// Inventory and merge state share this resolver and pass their scan deadline.
+pub(super) fn main_worktree_by(
+    repo: &Path,
+    common: &Path,
+    deadline_at: Instant,
+) -> Result<PathBuf, String> {
     let verify = |checkout: PathBuf| {
         if repository_by(&checkout, deadline_at)? == common
             && workspace_root_by(&checkout, deadline_at)? == checkout
@@ -2647,7 +2671,9 @@ mod tests {
     fn expired_discovery_budget_stops_probing_and_reports_partial_results() {
         let f = Fixture::new();
         let container = f.roots();
-        for name in ["a", "b", "c", "d"] {
+        let known = container.join("a-known");
+        init_discovery_repo(&known);
+        for name in ["b", "c", "d"] {
             let repo = container.join(name);
             init_discovery_repo(&repo);
             // A FIFO as .git/config stalls every probe that needs config
@@ -2667,6 +2693,7 @@ mod tests {
             elapsed < Duration::from_millis(6000),
             "discovery took {elapsed:?}; the shared deadline must apply to every probe"
         );
+        assert_eq!(discovery.repositories, [known]);
         assert!(
             discovery
                 .diagnostics
@@ -2677,7 +2704,7 @@ mod tests {
         );
         // Unblock teardown: the Fixture drop removes the tree, and an open FIFO
         // reader would otherwise hold the walk.
-        for name in ["a", "b", "c", "d"] {
+        for name in ["b", "c", "d"] {
             let _ = fs::remove_file(container.join(name).join(".git/config"));
         }
     }

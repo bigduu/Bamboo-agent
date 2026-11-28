@@ -1,7 +1,11 @@
 //! Host-selected profile application on the existing strict local Child route.
 //! The persisted selection is an audit/replay binding, not a new storage grant.
-use bamboo_domain::{ProviderModelRef, Role, Session};
-use bamboo_skills::named_agents::{NamedAgentDefinition, NamedAgentProfileIdentity};
+use bamboo_domain::{
+    session::tool_authority::TICKET_CREATOR_ROLE, ProviderModelRef, Role, Session,
+};
+use bamboo_skills::named_agents::{
+    NamedAgentDefinition, NamedAgentProfileIdentity, NamedAgentProfileSource,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -121,6 +125,12 @@ impl ResolvedChildProfile {
             identity.name.as_str(),
             "explorer" | "reviewer" | "independent-reviewer"
         );
+        if identity.name == TICKET_CREATOR_ROLE
+            && (identity.source != NamedAgentProfileSource::Builtin
+                || parent.project_id_meta().is_none())
+        {
+            return Err(rejected());
+        }
         let allowed = definition.tool_allow();
         let denied = definition.tool_deny();
         let foreground_denied = denied.iter().any(|name| name == "bash");
@@ -156,6 +166,10 @@ impl ResolvedChildProfile {
         self.model.as_ref()
     }
 
+    pub(super) fn ticket_creator(&self) -> bool {
+        self.identity.name == TICKET_CREATOR_ROLE
+    }
+
     /// Whether this role can be selected for an explicitly read-only Workflow.
     pub fn is_inspection_role(&self) -> bool {
         self.inspection_role
@@ -163,11 +177,12 @@ impl ResolvedChildProfile {
 
     /// Inspection profiles with reader-only grants use read-only execution.
     pub fn read_only(&self) -> bool {
-        self.inspection_role
-            && self
-                .tools
-                .iter()
-                .all(|tool| matches!(tool.as_str(), "Read" | "Glob"))
+        self.ticket_creator()
+            || self.inspection_role
+                && self
+                    .tools
+                    .iter()
+                    .all(|tool| matches!(tool.as_str(), "Read" | "Glob"))
     }
 
     pub(super) fn append_prompt(&self, base: &str) -> String {
@@ -335,6 +350,18 @@ pub fn named_profile_tool_names(
 
 pub fn has_named_profile(session: &Session) -> bool {
     session.metadata.contains_key(NAMED_PROFILE_BINDING_KEY)
+}
+
+pub(crate) fn is_ticket_creator(session: &Session) -> bool {
+    read_binding(session).is_ok_and(|binding| {
+        binding.is_some_and(|binding| {
+            binding.name == TICKET_CREATOR_ROLE
+                && binding.source == "builtin"
+                && binding.read_only
+                && binding.tools.is_empty()
+                && binding.scope_project_id.is_some()
+        })
+    })
 }
 
 #[cfg(test)]

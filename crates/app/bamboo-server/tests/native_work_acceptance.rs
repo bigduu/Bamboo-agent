@@ -29,6 +29,8 @@ use native_work::{execution_workspace, host, LocalProvider, CALL, RESULT, WAIT};
 mod managed_root;
 #[path = "native_work_acceptance/model_route.rs"]
 mod model_route;
+#[path = "native_work_acceptance/project_scan.rs"]
+mod project_scan;
 
 #[actix_web::test]
 async fn native_task_submission_requires_owner_accept_and_survives_host_restart() {

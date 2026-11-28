@@ -5,8 +5,8 @@ fn builtin_package_has_stable_private_revision_bounded_roles_and_native_declarat
     let limits = NamedAgentLimits::default();
     let catalog = catalog(limits, &mut ScanBudget::default());
     assert!(catalog.metadata().diagnostic_code.is_none());
-    assert_eq!(catalog.metadata().entries.len(), 3);
-    for (name, bytes) in ["explorer", "implementer", "reviewer"]
+    assert_eq!(catalog.metadata().entries.len(), DOCUMENTS.len());
+    for (name, bytes) in ["explorer", "implementer", "reviewer", "ticket-creator"]
         .into_iter()
         .zip(DOCUMENTS)
     {
@@ -18,6 +18,13 @@ fn builtin_package_has_stable_private_revision_bounded_roles_and_native_declarat
         assert_eq!(definition.revision().len(), 64);
         assert_eq!(definition.model_hint(), None);
         assert!(definition.system_prompt().len() <= MAX_BUILTIN_PROMPT_BYTES);
+        if name == "ticket-creator" {
+            assert!(definition.tool_allow().is_empty());
+            assert!(definition
+                .system_prompt()
+                .contains("Return a single JSON object"));
+            continue;
+        }
         for required in ["Responsibility:", "Scope:", "Evidence:", "stop"] {
             assert!(
                 definition.system_prompt().contains(required)

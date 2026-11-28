@@ -44,11 +44,12 @@ use bamboo_agent_core::{
     AgentEvent, BashCompletionInfo, BashCompletionSink, Message, Role, Session, SessionKind,
 };
 use bamboo_domain::session::runtime_state::{
-    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
+    AgentRuntimeState, AgentStatusState, ChildWaitPolicy, WaitingForBashState,
+    WaitingForChildrenState,
 };
 use bamboo_llm::{Config, ProviderModelRouter, ProviderRegistry};
 use bamboo_storage::LockedSessionStore;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, RwLock};
 
@@ -83,6 +84,12 @@ enum ResumeOrigin {
     Configured,
     PacedLoop(PacedLoopTurn),
     RuntimeInbox(bamboo_domain::SessionRuntimeStartup),
+}
+
+enum BashResumeResult {
+    Finished,
+    DeferredForForeground { attempts: u8 },
+    RetryStorage { attempts: u8 },
 }
 
 fn record_paced_loop_outcome(run_id: String, adaptive_wakeup: bool) -> SessionCompletionHook {
@@ -789,6 +796,12 @@ fn typed_child_resume_message(
             completion.child_session_id
         ),
         (Some("planner_artifact"), _) => "The saved planner result is unavailable.".into(),
+        (Some("ticket_draft"), Some(true)) => {
+            "Use the Host-confirmed Work ID and surface any open questions.".into()
+        }
+        (Some("ticket_draft"), _) => {
+            "Report the specific draft blocker or ask the returned question.".into()
+        }
         _ => format!(
             "For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors."
         ),
@@ -934,6 +947,8 @@ pub struct ChildCompletionCoordinator {
     root_account_sink: Option<Arc<crate::events::AccountEventSink>>,
     root_title_context: Arc<OnceLock<Weak<dyn AgentSessionContext>>>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
+    ticket_draft_publisher:
+        Option<Weak<dyn super::child_session::ticket_creator::TicketDraftPublisher>>,
     reserved_root_adapter: Arc<StdRwLock<Option<ReservedRootExecutionAdapter>>>,
     /// Late-bound guardian reviewer spawner, set post-construction by the server
     /// (mirrors `root_tools`). Re-injected into resumed runs so a guardian's
@@ -947,6 +962,14 @@ pub struct ChildCompletionCoordinator {
 }
 
 impl ChildCompletionCoordinator {
+    pub fn with_ticket_draft_publisher(
+        mut self,
+        publisher: Arc<dyn super::child_session::ticket_creator::TicketDraftPublisher>,
+    ) -> Self {
+        self.ticket_draft_publisher = Some(Arc::downgrade(&publisher));
+        self
+    }
+
     pub fn with_root_account_sink(mut self, sink: Arc<crate::events::AccountEventSink>) -> Self {
         self.root_account_sink = Some(sink);
         self
@@ -981,6 +1004,7 @@ impl ChildCompletionCoordinator {
             root_account_sink: None,
             root_title_context: Arc::default(),
             root_tools: Arc::new(RwLock::new(None)),
+            ticket_draft_publisher: None,
             reserved_root_adapter: Arc::new(StdRwLock::new(None)),
             guardian_spawner: Arc::new(RwLock::new(None)),
             spawn_scheduler: Arc::new(RwLock::new(Weak::new())),
@@ -1040,6 +1064,37 @@ impl ChildCompletionCoordinator {
 
     pub async fn set_root_tools(&self, tools: Arc<dyn ToolExecutor>) {
         *self.root_tools.write().await = Some(tools);
+    }
+
+    async fn project_child_completion(
+        &self,
+        completion: &ChildCompletion,
+        child: &Session,
+        parent: &Session,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let publisher = self.ticket_draft_publisher.as_ref().and_then(Weak::upgrade);
+        if let Some(draft) = super::child_session::ticket_creator::publish_completion(
+            publisher.as_deref(),
+            completion,
+            child,
+            parent,
+        )
+        .await?
+        {
+            return Ok(Some(draft));
+        }
+        match super::child_session::planner_artifact::publish_completion(
+            &self.app_data_dir,
+            completion,
+            child,
+            parent,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        {
+            Some(projection) => Ok(Some(projection)),
+            None => Ok(sealed_child_report(completion, child, parent)),
+        }
     }
 
     pub async fn set_spawn_scheduler(&self, scheduler: &Arc<SpawnScheduler>) {
@@ -1966,19 +2021,14 @@ impl ChildCompletionCoordinator {
                 SessionActivationPolicy::InterruptSpecificWait
             };
             let mut typed_result = if let Some(child) = loaded_child.as_ref() {
-                match super::child_session::planner_artifact::publish_completion(
-                    &self.app_data_dir,
-                    &completion,
-                    child,
-                    &parent,
-                )
-                .await
+                match self
+                    .project_child_completion(&completion, child, &parent)
+                    .await
                 {
-                    Ok(Some(projection)) => Some(projection),
-                    Ok(None) => sealed_child_report(&completion, child, &parent),
+                    Ok(projection) => projection,
                     Err(error) => {
                         tracing::warn!(%error, child_session_id = %child.id,
-                            "planner artifact publication failed; leaving wait armed");
+                            "Child result publication failed; leaving wait armed");
                         return;
                     }
                 }
@@ -2214,25 +2264,17 @@ impl ChildCompletionCoordinator {
                             .source
                             .as_ref()
                             .and_then(|source| source.result(&sibling, &parent));
-                        let mut typed_result =
-                            match super::child_session::planner_artifact::publish_completion(
-                                &self.app_data_dir,
-                                &sibling_completion,
-                                &sibling,
-                                &parent,
-                            )
+                        let mut typed_result = match self
+                            .project_child_completion(&sibling_completion, &sibling, &parent)
                             .await
-                            {
-                                Ok(Some(projection)) => Some(projection),
-                                Ok(None) => {
-                                    sealed_child_report(&sibling_completion, &sibling, &parent)
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%error, %child_id,
-                                    "sibling planner artifact publication failed; leaving wait armed");
-                                    return;
-                                }
-                            };
+                        {
+                            Ok(projection) => projection,
+                            Err(error) => {
+                                tracing::warn!(%error, %child_id,
+                                    "Sibling result publication failed; leaving wait armed");
+                                return;
+                            }
+                        };
                         let mut presentation = if let Some(projection) = typed_result.as_ref() {
                             typed_child_resume_message(
                                 &sibling_completion,
@@ -3477,6 +3519,19 @@ fn apply_bash_resume_transition(session: &mut Session, resume_message: &Message)
 
 /// Bash self-resume support (issue #84 Phase 2b; push follow-up).
 impl ChildCompletionCoordinator {
+    // After recovery has pinned a Session, its saved wait authorizes the wake.
+    async fn load_bash_recovery_session(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.storage
+            .load_session(session_id)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%session_id, %error, "failed to load saved bash wait");
+            })
+    }
+
     /// **Backstop** for a session suspended on `waiting_for_bash`. The primary,
     /// event-driven wake is the loop-facing push
     /// ([`BashCompletionSink::on_bash_completed`] → [`Self::deliver_bash_completion`]):
@@ -3492,7 +3547,13 @@ impl ChildCompletionCoordinator {
     /// cheap load with no registry polling at all. It only performs a resume when
     /// the shell(s) have finished but the loop is somehow still suspended, or the
     /// 6 h wait ceiling is reached.
-    async fn bash_self_resume(&self, session_id: String, bash_ids: Vec<String>) {
+    async fn bash_self_resume(
+        &self,
+        session_id: String,
+        bash_ids: Vec<String>,
+        mut expected_created_at: Option<DateTime<Utc>>,
+        mut expected_wait: Option<WaitingForBashState>,
+    ) {
         let mut delay = Duration::from_secs(1);
         let max_delay = Duration::from_secs(30);
         // Hard ceiling: the wait lease (6 h) + the registry GC TTL (5 min) +
@@ -3500,11 +3561,22 @@ impl ChildCompletionCoordinator {
         // so force-resume to avoid stranding the session on a GC edge case.
         let max_poll = Duration::from_secs(6 * 3600 + 600);
         let deadline = tokio::time::Instant::now() + max_poll;
+        let mut attempts = 0;
 
         loop {
             tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(max_delay);
 
-            let Some(session) = self.load_session(&session_id).await else {
+            let session = if expected_created_at.is_some() {
+                match self.load_bash_recovery_session(&session_id).await {
+                    Ok(session) => session,
+                    Err(_) if tokio::time::Instant::now() < deadline => continue,
+                    Err(_) => return,
+                }
+            } else {
+                self.load_session(&session_id).await
+            };
+            let Some(session) = session else {
                 tracing::info!(%session_id, "bash self-resume backstop: session gone; nothing to do");
                 return;
             };
@@ -3513,10 +3585,14 @@ impl ChildCompletionCoordinator {
                 // case — the backstop yields silently after a single load.
                 return;
             };
-            if wait.bash_ids != bash_ids {
-                // A newer Human turn may have installed a different wait.
+            let created_at = *expected_created_at.get_or_insert(session.created_at);
+            if session.created_at != created_at
+                || wait.bash_ids != bash_ids
+                || expected_wait.as_ref().is_some_and(|saved| saved != &wait)
+            {
                 return;
             }
+            let expected_wait = expected_wait.get_or_insert(wait);
             if matches!(bash_ids.as_slice(), [handle] if has_background_exec_stop(&session, handle))
             {
                 return;
@@ -3532,7 +3608,6 @@ impl ChildCompletionCoordinator {
             if session.metadata.contains_key("runtime.background_exec_id")
                 && self.runner_is_running(&session_id).await
             {
-                delay = (delay * 2).min(max_delay);
                 continue;
             }
             if !still_running || timed_out {
@@ -3540,35 +3615,46 @@ impl ChildCompletionCoordinator {
                 // was lost (pre-persist window / no sink), or the ceiling hit.
                 // Resume under the shared per-session lock so we never race the
                 // push or a concurrent child-completion resume.
-                let guard = session_resume_lock(&session_id);
-                let _held = guard.lock().await;
                 tracing::warn!(
                     %session_id,
                     shell_count = bash_ids.len(),
                     timed_out,
                     "bash self-resume backstop engaged (push lost or wait ceiling reached)"
                 );
-                self.perform_bash_resume(
-                    &session_id,
-                    if session.metadata.contains_key("runtime.background_exec_id") {
-                        exec_wait_resume_message(&bash_ids, timed_out)
-                    } else {
-                        bash_completion_resume_message(&bash_ids, timed_out)
-                    },
-                    &bash_ids,
-                )
-                .await;
-                return;
+                let result = {
+                    let guard = session_resume_lock(&session_id);
+                    let _held = guard.lock().await;
+                    self.perform_bash_resume(
+                        &session_id,
+                        if session.metadata.contains_key("runtime.background_exec_id") {
+                            exec_wait_resume_message(&bash_ids, timed_out)
+                        } else {
+                            bash_completion_resume_message(&bash_ids, timed_out)
+                        },
+                        created_at,
+                        expected_wait,
+                        attempts,
+                    )
+                    .await
+                };
+                match result {
+                    BashResumeResult::Finished => return,
+                    BashResumeResult::DeferredForForeground { attempts: used } => {
+                        attempts = used;
+                    }
+                    BashResumeResult::RetryStorage { attempts: used }
+                        if tokio::time::Instant::now() < deadline =>
+                    {
+                        attempts = used;
+                    }
+                    BashResumeResult::RetryStorage { .. } => return,
+                }
             }
-
-            delay = (delay * 2).min(max_delay);
         }
     }
 
-    /// Clear a session's `waiting_for_bash` state, append `resume_message`, and
-    /// drive the parent resume — the shared clear→append→resume used by BOTH the
-    /// event-driven push ([`Self::deliver_bash_completion`]) and the backstop poll
-    /// ([`Self::bash_self_resume`]).
+    /// Clear the saved `waiting_for_bash` state, append `resume_message`, and
+    /// drive the parent resume for the backstop.
     ///
     /// **The caller MUST hold the [`session_resume_lock`] for `session_id`** so the
     /// load-check-clear-resume critical section is serialized against every other
@@ -3589,26 +3675,30 @@ impl ChildCompletionCoordinator {
         &self,
         session_id: &str,
         resume_message: Message,
-        expected_ids: &[String],
-    ) {
+        created_at: DateTime<Utc>,
+        expected_wait: &WaitingForBashState,
+        attempts: u8,
+    ) -> BashResumeResult {
         let retry_backoff = Duration::from_millis(200);
         const MAX_RESUME_ATTEMPTS: u8 = 5;
-        for attempt in 0..MAX_RESUME_ATTEMPTS {
+        for attempt in attempts..MAX_RESUME_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(retry_backoff).await;
             }
 
-            let Some(mut session) = self.load_session(session_id).await else {
-                tracing::warn!(%session_id, "bash resume: session not found; nothing to resume");
-                return;
+            let mut session = match self.load_bash_recovery_session(session_id).await {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    tracing::warn!(%session_id, "bash resume: session not found; nothing to resume");
+                    return BashResumeResult::Finished;
+                }
+                Err(_) => return BashResumeResult::RetryStorage { attempts: attempt },
             };
-            if read_runtime_state(&session)
-                .waiting_for_bash
-                .as_ref()
-                .is_none_or(|wait| wait.bash_ids != expected_ids)
-                || matches!(expected_ids, [handle] if has_background_exec_stop(&session, handle))
+            if session.created_at != created_at
+                || read_runtime_state(&session).waiting_for_bash.as_ref() != Some(expected_wait)
+                || matches!(expected_wait.bash_ids.as_slice(), [handle] if has_background_exec_stop(&session, handle))
             {
-                return;
+                return BashResumeResult::Finished;
             }
 
             // A Human may already be talking in the same session. Let that
@@ -3616,7 +3706,7 @@ impl ChildCompletionCoordinator {
             if session.metadata.contains_key("runtime.background_exec_id")
                 && self.runner_is_running(session_id).await
             {
-                continue;
+                return BashResumeResult::DeferredForForeground { attempts: attempt };
             }
 
             if !apply_bash_resume_transition(&mut session, &resume_message) {
@@ -3627,7 +3717,7 @@ impl ChildCompletionCoordinator {
                     %session_id, attempt,
                     "bash resume: persisted bash wait already cleared; nothing to resume"
                 );
-                return;
+                return BashResumeResult::Finished;
             }
             session.updated_at = Utc::now();
             self.save_and_cache(&mut session).await;
@@ -3640,11 +3730,11 @@ impl ChildCompletionCoordinator {
             match outcome {
                 ResumeOutcome::Started { .. } => {
                     tracing::info!(%session_id, attempt, "bash resume: resume fired");
-                    return;
+                    return BashResumeResult::Finished;
                 }
                 ResumeOutcome::NotFound => {
                     tracing::warn!(%session_id, "bash resume: session vanished during resume");
-                    return;
+                    return BashResumeResult::Finished;
                 }
                 _ => {
                     // Completed (no pending user message ⇒ our resume message was
@@ -3652,11 +3742,20 @@ impl ChildCompletionCoordinator {
                     // Decide via the persisted bash wait: still set ⇒
                     // finalize-clobber ⇒ retry; cleared ⇒ the session is being
                     // handled (by us or a concurrent resume) ⇒ stop.
-                    let clobbered = match self.load_session(session_id).await {
-                        Some(reloaded) => read_runtime_state(&reloaded).waiting_for_bash.is_some(),
-                        None => {
+                    let clobbered = match self.load_bash_recovery_session(session_id).await {
+                        Ok(Some(reloaded)) => {
+                            reloaded.created_at == created_at
+                                && read_runtime_state(&reloaded).waiting_for_bash.as_ref()
+                                    == Some(expected_wait)
+                        }
+                        Ok(None) => {
                             tracing::warn!(%session_id, "bash resume: session vanished after resume");
-                            return;
+                            return BashResumeResult::Finished;
+                        }
+                        Err(_) => {
+                            return BashResumeResult::RetryStorage {
+                                attempts: attempt + 1,
+                            };
                         }
                     };
                     if bash_resume_should_retry(&outcome, clobbered) {
@@ -3670,9 +3769,9 @@ impl ChildCompletionCoordinator {
                     tracing::info!(
                         %session_id, attempt,
                         outcome = outcome.as_str(),
-                        "bash resume: wait cleared and resume handled; stopping"
+                        "bash resume: original wait resolved or replaced; stopping"
                     );
-                    return;
+                    return BashResumeResult::Finished;
                 }
             }
         }
@@ -3682,15 +3781,13 @@ impl ChildCompletionCoordinator {
             attempts = MAX_RESUME_ATTEMPTS,
             "bash resume: exhausted clobber-retry budget without confirming resume; giving up"
         );
+        BashResumeResult::Finished
     }
 }
 
 impl BashResumeHook for ChildCompletionCoordinator {
     fn arrange_bash_self_resume(&self, session_id: String, bash_ids: Vec<String>) {
-        let coordinator = Arc::new(self.clone());
-        tokio::spawn(async move {
-            coordinator.bash_self_resume(session_id, bash_ids).await;
-        });
+        self.spawn_bash_backstop(session_id, bash_ids, None, None);
     }
 
     fn supports_background_exec(&self) -> bool {
@@ -3704,7 +3801,7 @@ impl BashResumeHook for ChildCompletionCoordinator {
         job: bamboo_tools::tools::exec_command::BackgroundExecJob,
         session_created_at: chrono::DateTime<Utc>,
     ) {
-        self.start_exec_completion_monitor(job, session_created_at, None);
+        self.start_exec_completion_monitor(job, session_created_at, None, None);
     }
 
     fn arrange_bound_exec_self_resume(
@@ -3716,16 +3813,37 @@ impl BashResumeHook for ChildCompletionCoordinator {
             tracing::warn!(session_id = %session.id, "background exec has no valid conversation generation");
             return;
         };
-        self.start_exec_completion_monitor(job, session.created_at, Some(conversation));
+        self.start_exec_completion_monitor(
+            job,
+            session.created_at,
+            Some(conversation),
+            read_runtime_state(session).waiting_for_bash,
+        );
     }
 }
 
 impl ChildCompletionCoordinator {
+    fn spawn_bash_backstop(
+        &self,
+        session_id: String,
+        bash_ids: Vec<String>,
+        created_at: Option<DateTime<Utc>>,
+        wait: Option<WaitingForBashState>,
+    ) {
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            coordinator
+                .bash_self_resume(session_id, bash_ids, created_at, wait)
+                .await;
+        });
+    }
+
     fn start_exec_completion_monitor(
         &self,
         job: bamboo_tools::tools::exec_command::BackgroundExecJob,
         session_created_at: chrono::DateTime<Utc>,
         expected_conversation: Option<BackgroundExecConversation>,
+        expected_wait: Option<WaitingForBashState>,
     ) {
         let session_id = job.session_id().to_owned();
         let ids = vec![job.id().to_owned()];
@@ -3744,7 +3862,7 @@ impl ChildCompletionCoordinator {
                 )
                 .await;
         });
-        self.arrange_bash_self_resume(session_id, ids);
+        self.spawn_bash_backstop(session_id, ids, Some(session_created_at), expected_wait);
     }
 }
 
@@ -4533,12 +4651,12 @@ impl ChildCompletionCoordinator {
                     %session_id,
                     "boot reconciliation: re-arming bash self-resume backstop lost in restart"
                 );
-                let coordinator = self.clone();
-                tokio::spawn(async move {
-                    coordinator
-                        .bash_self_resume(session_id, wait.bash_ids)
-                        .await;
-                });
+                self.spawn_bash_backstop(
+                    session_id,
+                    wait.bash_ids.clone(),
+                    Some(control_plane.created_at),
+                    Some(wait),
+                );
             }
         }
     }

@@ -1,5 +1,6 @@
 use actix_web::{web, HttpRequest, HttpResponse, Result};
 
+use crate::app_state::ticket_application::project_manager::manager_matches;
 use crate::app_state::AppState;
 use bamboo_engine::model_config_helper::normalize_gold_config_json;
 use bamboo_engine::session_app::metadata::{MetadataError, SessionMetadataService};
@@ -7,10 +8,13 @@ use bamboo_engine::session_app::provider_model::{
     derive_model_ref, persist_legacy_model_provider, persist_model_ref,
 };
 
-use super::super::super::types::PatchSessionRequest;
+use super::super::super::types::SessionPatchBody;
 use super::query::get_session;
 use super::running::is_session_running;
 use crate::permission_audit::record_bamboo_runtime_permission_transition_metadata;
+
+#[cfg(test)]
+mod category_tests;
 
 #[cfg(test)]
 mod patch_test_hooks {
@@ -215,9 +219,22 @@ pub async fn patch_session(
     state: web::Data<AppState>,
     path: web::Path<String>,
     http_req: HttpRequest,
-    req: web::Json<PatchSessionRequest>,
+    req: web::Json<SessionPatchBody>,
 ) -> Result<HttpResponse> {
     let session_id = path.into_inner();
+    let req = match req.into_inner() {
+        SessionPatchBody::Category(patch) => {
+            return patch_category(state, session_id, &http_req, patch.category.as_deref()).await;
+        }
+        SessionPatchBody::General(req) if req.category.is_none() => req,
+        SessionPatchBody::General(_) => {
+            return Ok(crate::error::json_error_with_code(
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "Send category as a string or null in its own PATCH request".into(),
+                Some("invalid_session_category_patch"),
+            ));
+        }
+    };
     if req.thinking_mode.is_some() {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "error": {
@@ -395,6 +412,31 @@ pub async fn patch_session(
             Some(None) => None,
             None => current_project.clone(),
         };
+        let membership_changed = match target.as_ref() {
+            Some(target) => current_project.as_ref() != Some(target),
+            None => current_raw.is_some(),
+        };
+        if let Some(current_project) = current_project.as_ref().filter(|_| membership_changed) {
+            match state.project_store.get(current_project) {
+                Ok(project) if manager_matches(&project, &session) => {
+                    return Ok(HttpResponse::Conflict().json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": "project_manager_membership_fixed",
+                            "message": "A Project Manager must stay in its Project"
+                        },
+                        "session_id": session_id,
+                        "project_id": current_project,
+                    })));
+                }
+                Ok(_) | Err(bamboo_projects::ProjectStoreError::NotFound(_)) => {}
+                Err(error) => {
+                    return Err(crate::error::json_internal_server_error(format!(
+                        "Failed to validate current Project: {error}"
+                    )));
+                }
+            }
+        }
 
         let current_workspace = session.workspace_path_meta();
         let current_workspace_source = session
@@ -476,10 +518,6 @@ pub async fn patch_session(
         let final_workspace_display = final_workspace
             .as_deref()
             .map(bamboo_config::paths::path_to_display_string);
-        let membership_changed = match target.as_ref() {
-            Some(target) => current_project.as_ref() != Some(target),
-            None => current_raw.is_some(),
-        };
         let workspace_changed = req.workspace_path.is_some()
             && (current_workspace.as_deref() != final_workspace_display.as_deref()
                 || (target.is_some()
@@ -970,6 +1008,54 @@ pub async fn patch_session(
 
     // Report the permission posture and its ETag from the same durable read.
     get_session(state, web::Path::from(session_id)).await
+}
+
+async fn patch_category(
+    state: web::Data<AppState>,
+    session_id: String,
+    http_req: &HttpRequest,
+    category: Option<&str>,
+) -> Result<HttpResponse> {
+    let Some(expected_version) = parse_if_match(http_req) else {
+        return Ok(crate::error::json_error_with_code(
+            actix_web::http::StatusCode::PRECONDITION_REQUIRED,
+            "If-Match with the current session metadata_version is required for category changes"
+                .into(),
+            Some("session_category_precondition_required"),
+        ));
+    };
+
+    match SessionMetadataService::set_category(
+        state.get_ref(),
+        &session_id,
+        category,
+        expected_version,
+    )
+    .await
+    {
+        Ok(_) => get_session(state, web::Path::from(session_id)).await,
+        Err(MetadataError::VersionConflict { current, .. }) => {
+            Ok(precondition_failed(&session_id, current))
+        }
+        Err(MetadataError::NotFound(_)) => Ok(HttpResponse::NotFound().json(serde_json::json!({
+            "error": crate::error::error_value("Session not found"),
+            "session_id": session_id
+        }))),
+        Err(MetadataError::InvalidCategory(error)) => Ok(crate::error::json_error_with_code(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            error.to_string(),
+            Some("invalid_session_category"),
+        )),
+        Err(MetadataError::CategoryRequiresRoot) => Ok(crate::error::json_error_with_code(
+            actix_web::http::StatusCode::CONFLICT,
+            MetadataError::CategoryRequiresRoot.to_string(),
+            Some("session_category_requires_root"),
+        )),
+        Err(MetadataError::EventQueueUnavailable(error)) => {
+            Ok(crate::events::session_event_queue_unavailable(error))
+        }
+        Err(error) => Err(crate::error::json_internal_server_error(error.to_string())),
+    }
 }
 
 #[cfg(test)]

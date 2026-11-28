@@ -116,6 +116,48 @@ fn defaults_and_selective_roundtrip_exclude_unselected_sensitive_and_host_fields
 }
 
 #[test]
+fn work_review_is_opt_in_and_keeps_the_existing_scenario_wire_format() {
+    let mut source = fixture();
+    let mut selected = selection();
+    let original = select_bundle(&source, &selected).unwrap();
+    let original_share = encode_bundle(&original, None).unwrap();
+    let review_only = ShareSelection {
+        scenarios: BTreeSet::from([ShareScenario::WorkReview]),
+        ..Default::default()
+    };
+    assert_eq!(
+        select_bundle(&source, &review_only),
+        Err(ShareError::Selection)
+    );
+
+    source.defaults.as_mut().unwrap().work_review = Some(
+        bamboo_domain::ProviderModelRef::new("work", "demo-fast")
+            .with_reasoning_effort(ReasoningEffort::Disabled),
+    );
+    let omitted = select_bundle(&source, &selected).unwrap();
+    assert_eq!(encode_bundle(&omitted, None).unwrap(), original_share);
+    assert_eq!(decode_bundle(&original_share, None).unwrap(), original);
+
+    selected.scenarios.insert(ShareScenario::WorkReview);
+    let extended = select_bundle(&source, &selected).unwrap();
+    assert_eq!(
+        extended.scenarios.keys().next_back(),
+        Some(&ShareScenario::WorkReview)
+    );
+    let wire = serde_json::to_value(&extended).unwrap();
+    let work_review = &wire["scenarios"]["work_review"];
+    assert_eq!(
+        work_review,
+        &json!({"provider": "work", "model": "demo-fast", "reasoning_effort": "none"})
+    );
+    let share = encode_bundle(&extended, None).unwrap();
+    assert_eq!(decode_bundle(&share, None).unwrap(), extended);
+
+    let unsupported = plain_json(json!({"scenarios": {"future_review": work_review}}));
+    assert_eq!(decode_bundle(&unsupported, None), Err(ShareError::Invalid));
+}
+
+#[test]
 fn explicit_values_require_encryption_even_for_nonsecret_and_empty_env_values() {
     let mut selected = select_bundle(&fixture(), &selection()).unwrap();
     selected.env[0].secret = false;

@@ -3,14 +3,16 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveTime, Offset, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use super::log_monitor::LogMonitor;
-use super::trigger_engine::{default_trigger_engine, TriggerEngine};
+use super::trigger_engine::{
+    default_trigger_engine, interval_duration, next_edited_cron_occurrence, TriggerEngine,
+};
 use bamboo_domain::{
     MisFirePolicy, OverlapPolicy, ProjectId, ScheduleRunConfig, ScheduleRunRecord,
     ScheduleRunStatus, ScheduleSpec, ScheduleState, ScheduleTrigger, ScheduleWindow,
@@ -201,7 +203,7 @@ impl ScheduleEntry {
             .or_else(|| {
                 self.state
                     .next_fire_at
-                    .map(|next| next - Duration::seconds(every_seconds as i64))
+                    .and_then(|next| next.checked_sub_signed(interval_duration(every_seconds)?))
             })
             .or(Some(self.created_at))
     }
@@ -256,7 +258,7 @@ fn derive_legacy_anchor_at(raw: &ScheduleEntryCompat, every_seconds: u64) -> Opt
                 .as_ref()
                 .and_then(|state| state.next_fire_at)
                 .or(raw.next_run_at)
-                .map(|next| next - Duration::seconds(every_seconds as i64))
+                .and_then(|next| next.checked_sub_signed(interval_duration(every_seconds)?))
         })
 }
 
@@ -354,8 +356,29 @@ impl ScheduleDefinitionChanges {
 pub(crate) enum SchedulePatchRejection {
     #[error("schedule has no next run within configured window")]
     NoFutureOccurrence,
+    #[error("one-time occurrence is no longer pending")]
+    OnceNotPending,
     #[error("start_at must be earlier than end_at")]
     InvalidWindow,
+    #[error("interval must be a positive, representable number of seconds")]
+    InvalidInterval,
+    #[error("schedule cron expression is invalid")]
+    InvalidCronExpression,
+    #[error("schedule time must be a valid hour, minute and second")]
+    InvalidClockTime,
+    #[error("schedule no longer uses the requested trigger")]
+    TriggerChanged,
+    #[error("task message is required")]
+    InvalidPrompt,
+    #[error("schedule no longer has an editable task prompt")]
+    PromptChanged,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ScheduleClockKind {
+    Daily,
+    Weekly,
+    Monthly,
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -1251,6 +1274,357 @@ impl ScheduleStore {
         Ok(Some(candidate))
     }
 
+    pub(crate) async fn patch_interval_period(
+        &self,
+        id: &str,
+        every_seconds: u64,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        if interval_duration(every_seconds).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::InvalidInterval,
+            ));
+        }
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        let ScheduleTrigger::Interval {
+            every_seconds: previous,
+            ..
+        } = &existing.trigger
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::TriggerChanged,
+            ));
+        };
+        if every_seconds == *previous {
+            return Ok(Some(existing.clone()));
+        }
+
+        let now = Utc::now();
+        let mut candidate = existing.clone();
+        candidate.trigger =
+            ScheduleTrigger::legacy_interval(every_seconds, existing.derived_anchor_at());
+        // A clock change must not put the edited cadence back before a claimed fire.
+        let after = existing
+            .state
+            .last_scheduled_at
+            .map_or(now, |last| now.max(last));
+        candidate.state.next_fire_at = Some(compute_patch_next_run_at(
+            &candidate, existing, false, after,
+        )?);
+        candidate.updated_at = now;
+
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
+    }
+
+    pub(crate) async fn patch_once_at(
+        &self,
+        id: &str,
+        at: DateTime<Utc>,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        if !matches!(existing.trigger, ScheduleTrigger::Once { .. })
+            || existing.run_config.workflow_target.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::TriggerChanged,
+            ));
+        }
+
+        let now = Utc::now();
+        if existing.state.next_fire_at.is_none_or(|due| due <= now)
+            || current_due_at(existing).is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::OnceNotPending,
+            ));
+        }
+        let after = existing
+            .state
+            .last_scheduled_at
+            .map_or(now, |last| now.max(last));
+        if at <= after
+            || existing.start_at.is_some_and(|start| at < start)
+            || existing.end_at.is_some_and(|end| at > end)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::NoFutureOccurrence,
+            ));
+        }
+
+        let trigger = ScheduleTrigger::Once { at };
+        if existing.trigger == trigger && existing.state.next_fire_at == Some(at) {
+            return Ok(Some(existing.clone()));
+        }
+
+        let mut candidate = existing.clone();
+        candidate.trigger = trigger;
+        candidate.state.next_fire_at = Some(at);
+        candidate.updated_at = now;
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
+    }
+
+    pub(crate) async fn patch_cron_expression(
+        &self,
+        id: &str,
+        expression: String,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        let expression = expression.trim();
+        let invalid_expression = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::InvalidCronExpression,
+            )
+        };
+        if expression.is_empty() {
+            return Err(invalid_expression());
+        }
+
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        let old_expression = match &existing.trigger {
+            ScheduleTrigger::Cron { expr } if existing.run_config.workflow_target.is_none() => expr,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    SchedulePatchRejection::TriggerChanged,
+                ));
+            }
+        };
+        let cron = expression.parse().map_err(|_| invalid_expression())?;
+        if expression == old_expression.trim() {
+            return Ok(Some(existing.clone()));
+        }
+
+        let now = Utc::now();
+        let after = existing
+            .state
+            .last_scheduled_at
+            .map_or(now, |last| now.max(last));
+        let window = ScheduleWindow {
+            start_at: existing.start_at,
+            end_at: existing.end_at,
+        };
+        let next_fire_at =
+            next_edited_cron_occurrence(&cron, existing.timezone.as_deref(), after, &window)
+                .ok()
+                .flatten()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        SchedulePatchRejection::NoFutureOccurrence,
+                    )
+                })?;
+        let mut candidate = existing.clone();
+        candidate.trigger = ScheduleTrigger::Cron {
+            expr: expression.to_owned(),
+        };
+        candidate.state.next_fire_at = Some(next_fire_at);
+        candidate.updated_at = now;
+
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
+    }
+
+    pub(crate) async fn patch_calendar_time(
+        &self,
+        id: &str,
+        kind: ScheduleClockKind,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        if NaiveTime::from_hms_opt(hour.into(), minute.into(), second.into()).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::InvalidClockTime,
+            ));
+        }
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        let trigger_changed = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::TriggerChanged,
+            )
+        };
+        if existing.run_config.workflow_target.is_some() {
+            return Err(trigger_changed());
+        }
+        let trigger = match (&existing.trigger, kind) {
+            (ScheduleTrigger::Daily { .. }, ScheduleClockKind::Daily) => ScheduleTrigger::Daily {
+                hour,
+                minute,
+                second,
+            },
+            (ScheduleTrigger::Weekly { weekdays, .. }, ScheduleClockKind::Weekly)
+                if !weekdays.is_empty() =>
+            {
+                ScheduleTrigger::Weekly {
+                    weekdays: weekdays.clone(),
+                    hour,
+                    minute,
+                    second,
+                }
+            }
+            (ScheduleTrigger::Monthly { days, .. }, ScheduleClockKind::Monthly)
+                if !days.is_empty() && days.iter().all(|day| (1..=31).contains(day)) =>
+            {
+                ScheduleTrigger::Monthly {
+                    days: days.clone(),
+                    hour,
+                    minute,
+                    second,
+                }
+            }
+            _ => return Err(trigger_changed()),
+        };
+        if existing.trigger == trigger {
+            return Ok(Some(existing.clone()));
+        }
+
+        let now = Utc::now();
+        let after = existing
+            .state
+            .last_scheduled_at
+            .map_or(now, |last| now.max(last));
+        // Searching immediately before the inclusive opening lets the engine
+        // return a real clock occurrence instead of clipping to the opening.
+        let after = existing
+            .start_at
+            .and_then(|start| start.checked_sub_signed(Duration::nanoseconds(1)))
+            .map_or(after, |start| after.max(start));
+        let window = ScheduleWindow {
+            start_at: None,
+            end_at: existing.end_at,
+        };
+        let no_future_occurrence = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::NoFutureOccurrence,
+            )
+        };
+        let timezone = existing.timezone.as_deref();
+        if let Some(timezone) = timezone {
+            // Calendar recurrence assumes the lower bound has a representable
+            // date in the chosen zone.
+            let zone = timezone
+                .parse::<chrono_tz::Tz>()
+                .map_err(|_| no_future_occurrence())?;
+            let offset = after.with_timezone(&zone).offset().fix();
+            after
+                .naive_utc()
+                .checked_add_offset(offset)
+                .ok_or_else(no_future_occurrence)?;
+        }
+        let next_fire_at = default_trigger_engine()
+            .next_after(&trigger, timezone, after, &window)
+            .ok()
+            .flatten()
+            .ok_or_else(no_future_occurrence)?;
+        let mut candidate = existing.clone();
+        candidate.trigger = trigger;
+        candidate.state.next_fire_at = Some(next_fire_at);
+        candidate.updated_at = now;
+
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
+    }
+
+    pub(crate) async fn patch_task_prompt(
+        &self,
+        id: &str,
+        task_message: String,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        if task_message.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::InvalidPrompt,
+            ));
+        }
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let Some(existing) = index
+            .schedules
+            .get(id)
+            .filter(|entry| entry.log_monitor.is_none())
+        else {
+            return Ok(None);
+        };
+        let Some(previous) = existing
+            .run_config
+            .task_message
+            .as_deref()
+            .filter(|prompt| {
+                !prompt.trim().is_empty() && existing.run_config.workflow_target.is_none()
+            })
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                SchedulePatchRejection::PromptChanged,
+            ));
+        };
+        if previous == task_message {
+            return Ok(Some(existing.clone()));
+        }
+
+        let mut candidate = existing.clone();
+        candidate.run_config.task_message = Some(task_message);
+        candidate.updated_at = Utc::now();
+        let mut next = index.clone();
+        next.schedules.insert(id.to_owned(), candidate.clone());
+        self.persist_updated_index(&mut next).await?;
+        *index = next;
+        Ok(Some(candidate))
+    }
+
     pub async fn delete_schedule(&self, id: &str) -> io::Result<bool> {
         self.delete_schedule_inner(id, None).await
     }
@@ -1793,6 +2167,15 @@ mod tests {
                     "created_at": now,
                     "updated_at": now,
                     "last_run_at": next_run_at
+                },
+                "legacy-3": {
+                    "id": "legacy-3",
+                    "name": "legacy with an unrepresentable period",
+                    "enabled": false,
+                    "interval_seconds": i64::MAX as u64,
+                    "created_at": now,
+                    "updated_at": now,
+                    "next_run_at": next_run_at
                 }
             }
         });
@@ -1820,6 +2203,44 @@ mod tests {
             Some(next_run_at)
         );
         assert_eq!(legacy_without_next.state.next_fire_at, Some(now));
+        let legacy_out_of_range = store.get_schedule("legacy-3").await.unwrap();
+        assert_eq!(legacy_out_of_range.derived_anchor_at(), Some(now));
+
+        let path = store.index_path();
+        let original = fs::read(path).await.unwrap();
+        let backup = dir.path().join("saved-schedules.json");
+        // Force the atomic replacement to fail after the candidate is prepared.
+        fs::rename(path, &backup).await.unwrap();
+        fs::create_dir(path).await.unwrap();
+        let error = store
+            .patch_interval_period("legacy-1", 2700)
+            .await
+            .unwrap_err();
+        assert!(error.raw_os_error().is_some(), "{error}");
+        assert_eq!(store.get_schedule("legacy-1").await, Some(schedule.clone()));
+        assert_eq!(fs::read(&backup).await.unwrap(), original);
+        fs::remove_dir(path).await.unwrap();
+        fs::rename(&backup, path).await.unwrap();
+
+        let edited = store
+            .patch_interval_period("legacy-1", 2700)
+            .await
+            .unwrap()
+            .unwrap();
+        let anchor = next_run_at - Duration::hours(1);
+        assert_eq!(
+            edited.trigger,
+            ScheduleTrigger::legacy_interval(2700, Some(anchor))
+        );
+        let next = edited.state.next_fire_at.unwrap();
+        assert!(next > edited.updated_at);
+        assert_eq!(next.signed_duration_since(anchor).num_seconds() % 2700, 0);
+        let reopened = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(reopened.get_schedule("legacy-1").await, Some(edited));
+        assert_eq!(
+            reopened.get_schedule("legacy-2").await,
+            Some(legacy_without_next)
+        );
     }
 
     #[tokio::test]

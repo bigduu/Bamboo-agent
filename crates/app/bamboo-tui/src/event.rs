@@ -9,7 +9,7 @@ use crate::api::types::{
 };
 use crate::api::{
     ChatStart, ChatSubmission, LoopChatRecord, PermissionMutationFailure, RespondFailure,
-    SessionMutationFailure, VersionedSession,
+    SessionLoopPreview, SessionMutationFailure, VersionedSession,
 };
 use crate::app::{LoopObservation, OpenedSession, QuestionIdentity, SessionPickerIntent};
 
@@ -44,6 +44,11 @@ pub enum AppEvent {
         observation_epoch: u64,
         result: Loaded<ListSessionsEnvelope>,
     },
+    SelectedSessionLoopStatusLoaded {
+        generation: u64,
+        session_id: String,
+        result: Result<Option<SessionLoopPreview>, ()>,
+    },
     McpServersLoaded(Loaded<Vec<McpServer>>),
     McpToolsLoaded(Loaded<Vec<ToolInfo>>),
     SchedulesLoaded {
@@ -54,6 +59,21 @@ pub enum AppEvent {
         generation: u64,
         schedule_id: String,
         result: Loaded<Schedule>,
+    },
+    ScheduleRenameFinished {
+        generation: u64,
+        schedule_id: String,
+        result: Loaded<String>,
+    },
+    ScheduleCadenceFinished {
+        generation: u64,
+        schedule_id: String,
+        result: Loaded<Schedule>,
+    },
+    SchedulePromptFinished {
+        generation: u64,
+        schedule_id: String,
+        result: Loaded<String>,
     },
     ScheduleRunsLoaded {
         request_id: u64,

@@ -14,7 +14,7 @@ use std::path::Path;
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{
-    LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectSidebar,
+    LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectSidebar, ProjectSidebarSection,
     ProjectSidebarSectionBinding, ProjectStatus, SessionKind, WorkspaceBinding,
 };
 use bamboo_projects::{
@@ -49,11 +49,64 @@ where
 
 fn deserialize_sidebar_snapshot<'de, D>(
     deserializer: D,
-) -> std::result::Result<Option<ProjectSidebar>, D::Error>
+) -> std::result::Result<Option<ProjectSidebarSnapshotRequest>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    ProjectSidebar::deserialize(deserializer).map(Some)
+    ProjectSidebarSnapshotRequest::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ProjectSidebarSnapshotRequest {
+    sections: Vec<ProjectSidebarSectionRequest>,
+    session_sections: BTreeMap<String, Option<String>>,
+    hidden_legacy: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ProjectSidebarSectionRequest {
+    id: String,
+    name: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    description: Option<Option<String>>,
+}
+
+impl ProjectSidebarSnapshotRequest {
+    fn to_sidebar(&self, previous: Option<&ProjectSidebar>) -> ProjectSidebar {
+        let sections = self
+            .sections
+            .iter()
+            .map(|section| {
+                // Older clients send complete snapshots without descriptions.
+                let description = match &section.description {
+                    Some(value) => value
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned),
+                    None => previous
+                        .and_then(|sidebar| {
+                            sidebar.sections.iter().find(|old| old.id == section.id)
+                        })
+                        .and_then(|old| old.description.clone()),
+                };
+                ProjectSidebarSection {
+                    id: section.id.clone(),
+                    name: section.name.trim().to_string(),
+                    description,
+                }
+            })
+            .collect();
+        ProjectSidebar {
+            sections,
+            session_sections: self.session_sections.clone(),
+            hidden_legacy: self.hidden_legacy,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,10 +129,10 @@ pub struct PatchProjectRequest {
     /// Complete Project-owned sidebar snapshot. Explicit null is invalid;
     /// clearing the sidebar uses an empty snapshot, which remains durable.
     #[serde(default, deserialize_with = "deserialize_sidebar_snapshot")]
-    pub sidebar: Option<ProjectSidebar>,
+    pub sidebar: Option<ProjectSidebarSnapshotRequest>,
     /// One-time browser migration. It cannot overwrite an existing snapshot.
     #[serde(default, deserialize_with = "deserialize_sidebar_snapshot")]
-    pub import_sidebar: Option<ProjectSidebar>,
+    pub import_sidebar: Option<ProjectSidebarSnapshotRequest>,
 }
 
 // Bound incoming organization snapshots without imposing new read-time rules
@@ -106,7 +159,7 @@ impl Write for SidebarByteBudget {
     }
 }
 
-fn sidebar_request_within_limits(sidebar: &ProjectSidebar) -> bool {
+fn sidebar_request_within_limits(sidebar: &ProjectSidebarSnapshotRequest) -> bool {
     if sidebar.sections.len() > MAX_SIDEBAR_SECTIONS
         || sidebar.session_sections.len() > MAX_SIDEBAR_ASSIGNMENTS
     {
@@ -139,7 +192,7 @@ fn clear_removed_sidebar_assignments(
 
 fn apply_sidebar_snapshot(
     project: &mut ProjectManifest,
-    requested: Option<&ProjectSidebar>,
+    requested: Option<ProjectSidebar>,
     importing: bool,
     valid_roots: &BTreeMap<String, Option<String>>,
 ) -> bamboo_projects::ProjectStoreResult<()> {
@@ -149,12 +202,10 @@ fn apply_sidebar_snapshot(
         ));
     }
     let previous = project.sidebar.as_ref();
-    let Some(mut sidebar) = requested.cloned().or_else(|| previous.cloned()) else {
+    let replacing = requested.is_some();
+    let Some(mut sidebar) = requested.or_else(|| previous.cloned()) else {
         return Ok(());
     };
-    for section in &mut sidebar.sections {
-        section.name = section.name.trim().to_string();
-    }
     let mut available = sidebar
         .sections
         .iter()
@@ -176,7 +227,7 @@ fn apply_sidebar_snapshot(
         sidebar
             .session_sections
             .retain(|id, _| valid_roots.contains_key(id));
-    } else if requested.is_some() {
+    } else if replacing {
         for (id, target) in &sidebar.session_sections {
             let old = previous.and_then(|previous| previous.session_sections.get(id));
             // Existing entries may outlive a deleted/reassigned root. Preserve
@@ -217,6 +268,57 @@ fn apply_sidebar_snapshot(
     }
     project.sidebar = Some(sidebar);
     Ok(())
+}
+
+pub(crate) fn assign_managed_section(
+    projects: &bamboo_projects::ProjectStore,
+    project_id: &ProjectId,
+    root: &bamboo_domain::Session,
+    section_id: &str,
+) -> Result<Option<u64>, ProjectStoreError> {
+    if root.kind != SessionKind::Root
+        || root.project_id_meta().as_deref() != Some(project_id.as_str())
+    {
+        return Err(ProjectStoreError::Validation(
+            "Section requires a Root in this Project".into(),
+        ));
+    }
+    let roots = BTreeMap::from([(root.id.clone(), Some(root.root_mode_birth_token()))]);
+    let mut retried = false;
+    loop {
+        let project = projects.get(project_id)?;
+        if project.status != ProjectStatus::Active {
+            return Err(ProjectStoreError::Validation("Project is archived".into()));
+        }
+        let Some(mut sidebar) = project.sidebar else {
+            return Err(ProjectStoreError::Validation(
+                "Selected Project Section is unavailable".into(),
+            ));
+        };
+        // Preserve a move already recorded by the user for this Session.
+        if sidebar.session_sections.contains_key(&root.id) {
+            return Ok(None);
+        }
+        if !sidebar
+            .sections
+            .iter()
+            .any(|section| section.id == section_id)
+        {
+            return Err(ProjectStoreError::Validation(
+                "Selected Project Section is unavailable".into(),
+            ));
+        }
+        sidebar
+            .session_sections
+            .insert(root.id.clone(), Some(section_id.into()));
+        match projects.update(project_id, project.revision, |manifest| {
+            apply_sidebar_snapshot(manifest, Some(sidebar), false, &roots)
+        }) {
+            Ok(saved) => return Ok(Some(saved.revision)),
+            Err(ProjectStoreError::Conflict { .. }) if !retried => retried = true,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -529,6 +631,36 @@ pub async fn get_project(
     }
 }
 
+pub async fn project_session_categories(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> Result<HttpResponse> {
+    let id = match parse_id(&path) {
+        Ok(id) => id,
+        Err(response) => return Ok(*response),
+    };
+    if let Err(error) = state.project_store.get(&id) {
+        return Ok(project_error(error));
+    }
+
+    #[derive(Serialize)]
+    struct CategoryCount {
+        name: String,
+        session_count: usize,
+    }
+    let categories: Vec<_> = state
+        .session_store
+        .project_session_category_counts(&id)
+        .await
+        .into_iter()
+        .map(|(name, session_count)| CategoryCount {
+            name,
+            session_count,
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "categories": categories })))
+}
+
 pub async fn patch_project(
     state: web::Data<AppState>,
     path: web::Path<String>,
@@ -649,7 +781,8 @@ pub async fn patch_project(
         if let Some(new_chat_worktree) = request.new_chat_worktree {
             project.new_chat_worktree = new_chat_worktree;
         }
-        apply_sidebar_snapshot(project, requested_sidebar, importing, &valid_roots)?;
+        let sidebar = requested_sidebar.map(|request| request.to_sidebar(project.sidebar.as_ref()));
+        apply_sidebar_snapshot(project, sidebar, importing, &valid_roots)?;
         Ok(())
     };
     let result = if let Some(project_path) = request.project_path.as_deref() {

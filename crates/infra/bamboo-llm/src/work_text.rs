@@ -164,6 +164,29 @@ pub async fn complete(
     }
 }
 
+/// Summarize one Project Work through the bounded text-only Host transport.
+pub async fn project_scan(
+    client: &WorkTextClient,
+    provider: &dyn LLMProvider,
+    request: Request<'_>,
+    admit: Admission,
+    effort: Option<ReasoningEffort>,
+) -> WorkTextReply {
+    complete_with_options(
+        client,
+        provider,
+        request,
+        admit,
+        LLMRequestOptions {
+            request_purpose: Some("project_scan".into()),
+            reasoning_effort: effort,
+            ..Default::default()
+        },
+        &mut WorkTextObservations::default(),
+    )
+    .await
+}
+
 /// One explicit Work review over the same bounded managed transport. The role
 /// selection supplies the admitted provider and its configured effort.
 pub async fn review(

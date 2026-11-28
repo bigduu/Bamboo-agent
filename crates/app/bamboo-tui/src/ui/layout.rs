@@ -7,16 +7,17 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
-use crate::api::types::{PermissionDecisionKind, ReasoningEffort};
+use crate::api::types::{PermissionDecisionKind, ReasoningEffort, ScheduleClockKind};
 use crate::app::{
     ActiveQuestion, ActiveQuestionKind, ActivityKind, App, CommandPaletteEntry,
     CommandPaletteHitbox, CommandPaletteTrigger, ConnectionStatus, ModelPickerHitbox,
     ModelPickerHitboxKind, NoticeLevel, PermissionStage, QuestionOptionHitbox, RunPhase,
-    SessionActivityStatus, SessionPickerMode, Tab,
+    ScheduleCadenceEdit, ScheduleCadenceKind, SessionActivityStatus, SessionPickerMode, Tab,
 };
 use crate::keymap::{ActionContext, ActionId};
-use crate::schedule_form::ScheduleField;
+use crate::schedule_form::{parse_schedule_once_at, ScheduleField, ScheduleTriggerKind};
 use crate::theme::{self, colors};
+use crate::ui::schedules::cron_expression_line;
 use crate::ui::sessions::session_row_line_with_activity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2326,10 +2327,18 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
             Span::styled(value, style),
         ]));
     }
-    lines.push(Line::from(Span::styled(
-        format!("  {}", form.hint()),
-        Style::default().fg(colors::subtle()),
-    )));
+    let guidance = Style::default().fg(colors::subtle());
+    lines.push(Line::styled(format!("  {}", form.hint()), guidance));
+    if form.trigger == ScheduleTriggerKind::Once {
+        if let Ok(at) = parse_schedule_once_at(&form.timing, chrono::Utc::now()) {
+            let at = at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+            lines.push(Line::styled(format!("  UTC trigger  {at}"), guidance));
+        }
+        lines.push(Line::styled(
+            "  If picked up late, the Host can run it once.",
+            guidance,
+        ));
+    }
     if let Some(error) = &form.error {
         lines.push(Line::from(Span::styled(
             format!(
@@ -2365,6 +2374,196 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
         .border_style(Style::default().fg(colors::brand()))
         .title(" New schedule ");
     f.render_widget(paragraph.block(block), area);
+}
+
+pub(super) fn render_schedule_rename(f: &mut Frame, app: &App) {
+    if let Some(rename) = &app.schedule_rename {
+        render_schedule_editor(
+            f,
+            app,
+            ActionContext::ScheduleRename,
+            None,
+            &rename.draft,
+            rename.error.as_deref(),
+            app.schedule_rename_is_saving(),
+        );
+    }
+}
+
+pub(super) fn render_schedule_cadence(f: &mut Frame, app: &App) {
+    if let Some(cadence) = &app.schedule_cadence {
+        render_schedule_editor(
+            f,
+            app,
+            ActionContext::ScheduleInterval,
+            Some(cadence),
+            &cadence.draft,
+            cadence.error.as_deref(),
+            app.schedule_cadence_is_saving(),
+        );
+    }
+}
+
+pub(super) fn render_schedule_prompt(f: &mut Frame, app: &App) {
+    let Some(editor) = &app.schedule_prompt else {
+        return;
+    };
+    let screen = f.area();
+    let area = centered_rect(90, screen.height.min(12), screen);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::brand()))
+        .title(" Edit task prompt ");
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(u16::from(editor.error.is_some())),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    f.render_widget(&editor.textarea, chunks[0]);
+    if let Some(error) = &editor.error {
+        f.render_widget(
+            Paragraph::new(clip_cells(error, usize::from(chunks[1].width)))
+                .style(Style::default().fg(colors::error())),
+            chunks[1],
+        );
+    }
+    let footer = if app.schedule_prompt_is_saving() {
+        " Saving…".into()
+    } else {
+        let hint = |action| app.primary_key_hint(ActionContext::SchedulePrompt, action);
+        format!(
+            " {} save · {} cancel",
+            hint(ActionId::SaveSchedulePrompt),
+            hint(ActionId::Cancel)
+        )
+    };
+    f.render_widget(
+        Paragraph::new(clip_cells(&footer, usize::from(chunks[2].width)))
+            .style(Style::default().fg(colors::inactive())),
+        chunks[2],
+    );
+}
+
+fn render_schedule_editor(
+    f: &mut Frame,
+    app: &App,
+    context: ActionContext,
+    cadence: Option<&ScheduleCadenceEdit>,
+    draft: &str,
+    error: Option<&str>,
+    saving: bool,
+) {
+    let kind = cadence.map(|edit| edit.kind);
+    let (title, label) = match kind {
+        Some(ScheduleCadenceKind::Clock(ScheduleClockKind::Daily)) => {
+            (" Edit daily time ", "  Time: ")
+        }
+        Some(ScheduleCadenceKind::Clock(ScheduleClockKind::Weekly)) => {
+            (" Edit weekly time ", "  Time: ")
+        }
+        Some(ScheduleCadenceKind::Clock(ScheduleClockKind::Monthly)) => {
+            (" Edit monthly time ", "  Time: ")
+        }
+        Some(ScheduleCadenceKind::OnceAt) => (" Edit once time ", "  At: "),
+        Some(ScheduleCadenceKind::CronExpression) => (" Edit Cron expression ", "  Expression "),
+        Some(ScheduleCadenceKind::Interval) => (" Edit interval ", "  Every (seconds): "),
+        None => (" Rename schedule ", "  Name: "),
+    };
+    let screen = f.area();
+    let inner_width = centered_rect(90, 0, screen).width.saturating_sub(2);
+    let width = usize::from(inner_width);
+    let cursor = if saving { "" } else { "▏" };
+    let draft = if matches!(kind, Some(ScheduleCadenceKind::CronExpression)) {
+        cron_expression_line(draft)
+    } else {
+        draft.into()
+    };
+    let draft = clip_tail_cells(
+        &draft,
+        width.saturating_sub(label.len() + usize::from(!saving)),
+    );
+    let muted = Style::default().fg(colors::subtle());
+    let mut lines = vec![Line::from(vec![
+        Span::styled(label, muted),
+        Span::styled(
+            format!("{draft}{cursor}"),
+            Style::default().fg(colors::brand()),
+        ),
+    ])];
+    if matches!(kind, Some(ScheduleCadenceKind::OnceAt)) {
+        lines.push(Line::styled(
+            "  Include Z or an offset such as +08:00.",
+            muted,
+        ));
+    }
+    if matches!(kind, Some(ScheduleCadenceKind::CronExpression)) {
+        lines.push(Line::styled(
+            "  sec min hour day month weekday [year]",
+            muted,
+        ));
+    }
+    if let Some((kind, days)) =
+        cadence.and_then(|edit| edit.calendar_days.as_deref().map(|days| (edit.kind, days)))
+    {
+        let label = if matches!(kind, ScheduleCadenceKind::Clock(ScheduleClockKind::Monthly)) {
+            "Days of month"
+        } else {
+            "Weekdays"
+        };
+        lines.push(Line::styled(format!("  {label}  {days}"), muted));
+    }
+    if let Some(timezone) = cadence.and_then(|edit| edit.timezone.as_deref()) {
+        lines.push(Line::styled(
+            clip_cells(&format!("  Time zone  {timezone}"), width),
+            muted,
+        ));
+    }
+    if saving {
+        lines.push(Line::styled("  Saving…", muted));
+    } else {
+        if let Some(error) = error {
+            let error = if matches!(kind, Some(ScheduleCadenceKind::OnceAt)) {
+                error.to_owned()
+            } else {
+                clip_cells(error, width.saturating_sub(2))
+            };
+            lines.push(Line::styled(
+                format!("  {error}"),
+                Style::default().fg(colors::error()),
+            ));
+        }
+        let key = |action| app.keymap.primary_hint(context, action);
+        let mut footer = format!(
+            "  {} save · {} cancel",
+            key(ActionId::Activate),
+            key(ActionId::Cancel)
+        );
+        if matches!(kind, Some(ScheduleCadenceKind::CronExpression)) {
+            footer.push_str(&format!(" · {} clear", key(ActionId::ClearInput)));
+        }
+        lines.push(Line::styled(clip_cells(&footer, width), muted));
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let height = paragraph
+        .line_count(inner_width)
+        .saturating_add(2)
+        .min(usize::from(screen.height)) as u16;
+    let area = centered_rect(90, height, screen);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        paragraph.block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::brand()))
+                .title(title),
+        ),
+        area,
+    );
 }
 
 /// Contextual session picker (`Ctrl+P` on Chat). It renders over the
@@ -3877,9 +4076,35 @@ mod tests {
             if trigger == Once {
                 assert!(words.contains("offset"), "{text}");
             }
+            assert_eq!(
+                words.contains("If picked up late, the Host can run it once."),
+                trigger == Once,
+                "{text}"
+            );
+            assert!(!words.contains("UTC trigger"), "{text}");
             for label in ["Weekdays", "Days of month"] {
                 assert_eq!(text.contains(label), days == Some(label), "{text}");
             }
+        }
+
+        app.schedule_form = Some(ScheduleForm {
+            trigger: Once,
+            field: 2,
+            timing: "9999-12-31T23:59:59.123456789-23:59".into(),
+            error: Some("Enter a task prompt".into()),
+            ..ScheduleForm::default()
+        });
+        terminal
+            .draw(|frame| super::render_schedule_form(frame, &app))
+            .unwrap();
+        let text = terminal_text(&terminal);
+        for expected in [
+            "+10000-01-01T23:58:59.123456789Z",
+            "Enter a task prompt",
+            "Enter create",
+            "Esc cancel",
+        ] {
+            assert!(text.contains(expected), "{expected:?}\n{text}");
         }
     }
 
@@ -4086,9 +4311,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             if cfg!(target_os = "macos") {
-                [17_440_646_320_989_384_370, 16_351_077_110_429_304_208]
+                [15_061_808_871_578_271_522, 3_516_938_374_668_320_756]
             } else {
-                [14_693_427_191_799_456_976, 5_120_460_176_196_724_946]
+                [4_785_597_945_545_668_380, 13_987_455_454_154_022_978]
             },
             "complete help-overlay buffer golden changed"
         );

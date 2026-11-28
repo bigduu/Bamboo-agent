@@ -99,6 +99,50 @@ pub struct PatchScheduleRequest {
     pub run_config: Option<ScheduleRunConfig>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum RenameScheduleRequest {
+    // This struct variant requires named JSON fields.
+    Title { name: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum SetScheduleIntervalRequest {
+    // This struct variant requires named JSON fields.
+    Period { every_seconds: u64 },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum SetScheduleCronExpressionRequest {
+    // This struct variant requires named JSON fields.
+    Expression { expr: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum SetScheduleOnceAtRequest {
+    // This struct variant requires named JSON fields.
+    Instant { at: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum SetScheduleClockTimeRequest {
+    // This struct variant requires named JSON fields.
+    Clock { hour: u8, minute: u8, second: u8 },
+}
+
+pub type SetScheduleDailyTimeRequest = SetScheduleClockTimeRequest;
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum SetSchedulePromptRequest {
+    // This struct variant requires named JSON fields.
+    Prompt { task_message: String },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduleRunRecordView {
     pub run_id: String,

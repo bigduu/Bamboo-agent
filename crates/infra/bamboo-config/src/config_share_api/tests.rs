@@ -1185,6 +1185,137 @@ fn preview_cancel_is_read_only_and_apply_replay_returns_original_receipt() {
 }
 
 #[test]
+fn work_review_share_import_remaps_selected_account_and_preserves_explicit_none() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let _key = crate::encryption::set_test_encryption_key([0x41; 32]);
+    let source = fixture();
+    let destination = fixture();
+
+    let mut incoming: serde_json::Value =
+        serde_json::from_slice(snapshot().providers.as_deref().unwrap()).unwrap();
+    incoming["data"]["provider_instances"]["relay"]["label"] = "Shared relay".into();
+    incoming["data"]["provider_instances"]["relay"]["base_url"] =
+        "https://shared.invalid/v1".into();
+    incoming["data"]["defaults"] = serde_json::json!({
+        "chat": {"provider": "relay", "model": "good"},
+        "work_review": {"provider": "relay", "model": "good", "reasoning_effort": "none"},
+    });
+    std::fs::write(
+        source.path().join("providers.json"),
+        serde_json::to_vec(&incoming).unwrap(),
+    )
+    .unwrap();
+
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(snapshot().providers.as_deref().unwrap()).unwrap();
+    saved["data"]["provider_instances"]["other-review"] = serde_json::json!({
+        "provider_type": "openai", "label": "Other account", "enabled": true,
+        "model": "good", "runtime_models": ["good"],
+    });
+    saved["data"]["defaults"] = serde_json::json!({
+        "chat": {"provider": "relay", "model": "good", "reasoning_effort": "low"},
+        "fast": {"provider": "other-review", "model": "good"},
+        "work_review": {"provider": "other-review", "model": "good", "reasoning_effort": "high"},
+    });
+    let providers_path = destination.path().join("providers.json");
+    std::fs::write(&providers_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let mut selection = ShareSelection {
+        providers: ["relay".into()].into_iter().collect(),
+        provider_base_urls: ["relay".into()].into_iter().collect(),
+        ..Default::default()
+    };
+    let omitted = export_config_share(source.path(), &selection, false, None).unwrap();
+    assert!(config_share::decode_bundle(&omitted, None)
+        .unwrap()
+        .scenarios
+        .is_empty());
+    selection.scenarios.insert(ShareScenario::WorkReview);
+    let share = export_config_share(source.path(), &selection, false, None).unwrap();
+    let exported = config_share::decode_bundle(&share, None).unwrap();
+    assert_eq!(
+        serde_json::to_value(&exported).unwrap()["scenarios"],
+        serde_json::json!({
+            "work_review": {"provider": "relay", "model": "good", "reasoning_effort": "none"},
+        })
+    );
+    assert_eq!(exported.providers.len(), 1);
+    assert!(exported.providers[0].api_key.is_none());
+    assert!(exported.env.is_empty());
+    assert!(exported.subagent_models.is_empty());
+
+    let before = tree(destination.path());
+    let preview = preview_config_share(destination.path(), &share, None).unwrap();
+    assert!(!preview.apply_blocked);
+    assert_eq!(
+        serde_json::to_value(&preview.preview.scenarios).unwrap(),
+        serde_json::json!([
+            {"scenario": "work_review", "provider": "relay", "model": "good", "conflict": true},
+        ])
+    );
+    let [provider] = preview.preview.providers.as_slice() else {
+        panic!("expected one provider preview");
+    };
+    assert!(provider.conflict);
+    assert!(!provider.has_api_key);
+    assert_eq!(
+        provider.source_origin.as_deref(),
+        Some("https://shared.invalid")
+    );
+    assert_tree_unchanged(&before, destination.path());
+
+    let decisions = ShareDecisions {
+        providers: BTreeMap::from([(
+            "relay".into(),
+            ShareConflictChoice::Rename {
+                target: "shared-review".into(),
+            },
+        )]),
+        scenarios: BTreeMap::from([(ShareScenario::WorkReview, ShareConflictChoice::Replace)]),
+        ..Default::default()
+    };
+    let receipt = apply_config_share(
+        destination.path(),
+        &share,
+        None,
+        &decisions,
+        preview.expected_revisions,
+        &preview.preview_token,
+        Uuid::new_v4(),
+    )
+    .unwrap();
+    assert!(matches!(receipt, ShareOperationStatus::Committed { .. }));
+
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(providers_path).unwrap()).unwrap();
+    let shared = installed["data"]["provider_instances"]
+        .as_object_mut()
+        .unwrap()
+        .remove("shared-review")
+        .unwrap();
+    assert_eq!(shared["base_url"], "https://shared.invalid/v1");
+    assert!(shared.get("credential_ref").is_none());
+    assert!(shared.get("api_key").is_none());
+    saved["data"]["defaults"]["work_review"] = serde_json::json!({
+        "provider": "shared-review", "model": "good", "reasoning_effort": "none",
+    });
+    assert_eq!(installed["revision"], 8);
+    for field in [
+        "defaults",
+        "provider_instances",
+        "default_provider_instance",
+    ] {
+        assert_eq!(installed["data"][field], saved["data"][field], "{field}");
+    }
+    for path in ["env.json", "credentials.json"] {
+        assert_eq!(
+            std::fs::read(destination.path().join(path)).unwrap(),
+            before[Path::new(path)],
+        );
+    }
+}
+
+#[test]
 fn failed_prior_recovery_does_not_report_unstarted_operation_as_pending() {
     let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
     let _key = crate::encryption::set_test_encryption_key([0x54; 32]);

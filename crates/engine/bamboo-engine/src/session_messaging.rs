@@ -1605,7 +1605,9 @@ impl SessionMessenger {
         self.inbox.supports_runtime_target_lifetime()
     }
 
-    pub(crate) async fn admit_runtime_for_target(
+    /// Queue a trusted Host instruction for the exact stored Session lifetime.
+    /// The caller owns the authority to submit it and its activation policy.
+    pub async fn admit_runtime_for_target(
         &self,
         envelope: SessionMessageEnvelope,
         target_created_at: chrono::DateTime<chrono::Utc>,

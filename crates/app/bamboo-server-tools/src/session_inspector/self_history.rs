@@ -4,6 +4,7 @@
 //! the live current-request boundary are re-derived from `ToolCtx` on every
 //! invocation.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use bamboo_agent_core::tools::{ToolError, ToolResult};
@@ -20,6 +21,7 @@ const HISTORY_READ_DEFAULT_TURNS: usize = 10;
 const HISTORY_READ_MAX_TURNS: usize = 20;
 const HISTORY_READ_DEFAULT_CHARS: usize = 12_000;
 const HISTORY_READ_MAX_CHARS: usize = 20_000;
+const HISTORY_SLICE_DEFAULT_CHARS: usize = 2_000;
 const HISTORY_READ_MAX_MESSAGES: usize = 100;
 const HISTORY_AROUND_DEFAULT_ADJACENT_TURNS: usize = 1;
 const HISTORY_AROUND_MAX_ADJACENT_TURNS: usize = 5;
@@ -323,6 +325,131 @@ pub(super) async fn handle_read_current(
     })))
 }
 
+pub(super) async fn handle_read_slice(
+    tool: &SessionInspectorTool,
+    caller_session_id: &str,
+    current_tool_call_id: &str,
+    message_id: &str,
+    offset: Option<usize>,
+    max_chars: Option<usize>,
+) -> Result<ToolResult, ToolError> {
+    validate_history_message_id(message_id)?;
+    let max_chars = bounded_value(
+        "max_chars",
+        max_chars,
+        HISTORY_SLICE_DEFAULT_CHARS,
+        1,
+        HISTORY_READ_MAX_CHARS,
+    )?;
+    let offset = offset.unwrap_or_default();
+    let session = tool.load_session(caller_session_id).await?;
+    let (before_message_index, current_request_index) =
+        current_history_boundary(&session, current_tool_call_id);
+    let projection =
+        build_history_projection(&session, before_message_index, current_request_index);
+    let Some((_, anchor)) = find_history_anchor(&projection, message_id).filter(|(_, anchor)| {
+        !bamboo_domain::session::history::is_hidden_from_ui(anchor.message)
+            && !bamboo_domain::is_system_resume_message(anchor.message)
+    }) else {
+        return Ok(history_result(json!({
+            "contract_version": 1,
+            "action": "read_slice",
+            "available": false,
+            "unavailable_reason": "message_unavailable",
+        })));
+    };
+
+    let message = anchor.message;
+    let content = history_slice_text(message);
+    let total_chars = content.chars().count();
+    if offset > total_chars {
+        return Err(ToolError::InvalidArguments(format!(
+            "offset must be between 0 and {total_chars} for this message"
+        )));
+    }
+    let end_offset = offset.saturating_add(max_chars).min(total_chars);
+    let mut indices = content.char_indices();
+    let start_byte = indices
+        .nth(offset)
+        .map_or(content.len(), |(index, _)| index);
+    let end_byte = if end_offset == total_chars {
+        content.len()
+    } else {
+        indices
+            .nth(end_offset - offset - 1)
+            .map_or(content.len(), |(index, _)| index)
+    };
+    Ok(history_result(json!({
+        "contract_version": 1,
+        "action": "read_slice",
+        "available": true,
+        "message_id": message.id,
+        "role": role_to_str(&message.role),
+        "archived": message.compressed,
+        "offset": offset,
+        "next_offset": (end_offset < total_chars).then_some(end_offset),
+        "total_chars": total_chars,
+        "content_sha256": hex::encode(Sha256::digest(content.as_bytes())),
+        "content": &content[start_byte..end_byte],
+    })))
+}
+
+fn history_slice_text(message: &Message) -> Cow<'_, str> {
+    let mut content = Cow::Borrowed(message.content.as_str());
+    if message.role != Role::User {
+        return content;
+    }
+
+    // Native chat can store the same user text in the legacy field and in a
+    // multipart Text block. Omit only one mirror; intentional repetitions and
+    // distinct Text blocks retain their order and exact text.
+    let mut mirror = Some(message.content.as_str());
+    for part in message.content_parts.iter().flatten() {
+        let MessagePart::Text { text } = part else {
+            continue;
+        };
+        if mirror == Some(text.as_str()) {
+            mirror = None;
+        } else if !text.is_empty() {
+            let content = content.to_mut();
+            if !content.is_empty() {
+                content.push_str("\n\n");
+            }
+            content.push_str(text);
+        }
+    }
+    content
+}
+
+fn validate_history_message_id(message_id: &str) -> Result<(), ToolError> {
+    if message_id.is_empty() || message_id.chars().count() > HISTORY_ANCHOR_ID_MAX_CHARS {
+        return Err(ToolError::InvalidArguments(format!(
+            "message_id must contain between 1 and {HISTORY_ANCHOR_ID_MAX_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn find_history_anchor<'a>(
+    projection: &HistoryProjection<'a>,
+    message_id: &str,
+) -> Option<(usize, HistoryMessageRef<'a>)> {
+    let mut matches = projection
+        .turns
+        .iter()
+        .enumerate()
+        .flat_map(|(index, turn)| {
+            turn.messages
+                .iter()
+                .copied()
+                .filter(move |message| message.message.id == message_id)
+                .map(move |message| (index, message))
+        });
+    let anchor = matches.next()?;
+    // Missing and ambiguous IDs share the same unavailable result.
+    matches.next().is_none().then_some(anchor)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_read_around(
     tool: &SessionInspectorTool,
@@ -333,11 +460,7 @@ pub(super) async fn handle_read_around(
     after_turns: Option<usize>,
     max_chars: Option<usize>,
 ) -> Result<ToolResult, ToolError> {
-    if message_id.is_empty() || message_id.chars().count() > HISTORY_ANCHOR_ID_MAX_CHARS {
-        return Err(ToolError::InvalidArguments(format!(
-            "message_id must contain between 1 and {HISTORY_ANCHOR_ID_MAX_CHARS} characters"
-        )));
-    }
+    validate_history_message_id(&message_id)?;
     let before_turns = bounded_value(
         "before_turns",
         before_turns,
@@ -366,23 +489,10 @@ pub(super) async fn handle_read_around(
     let projection =
         build_history_projection(&session, before_message_index, current_request_index);
 
-    // IDs are expected to be unique. Fail closed with the same unavailable
-    // result for both no match and an ambiguous/corrupt duplicate.
-    let mut anchor = None;
-    for (turn_index, turn) in projection.turns.iter().enumerate() {
-        for message in &turn.messages {
-            if message.message.id != message_id {
-                continue;
-            }
-            if anchor.is_some() {
-                return Ok(unavailable_around_result());
-            }
-            anchor = Some((turn_index, message.index));
-        }
-    }
-    let Some((anchor_turn_index, anchor_message_index)) = anchor else {
+    let Some((anchor_turn_index, anchor)) = find_history_anchor(&projection, &message_id) else {
         return Ok(unavailable_around_result());
     };
+    let anchor_message_index = anchor.index;
 
     let anchor_turn = &projection.turns[anchor_turn_index];
     let anchor_chars = anchor_turn.char_count();

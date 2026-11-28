@@ -5,7 +5,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::types::SessionSummary;
-use crate::app::{App, SessionActivity, SessionActivityStatus};
+use crate::api::{SessionLoopPreviewMode, SessionLoopPreviewState};
+use crate::app::{App, SessionActivity, SessionActivityStatus, SessionListLoopStatus};
 use crate::keymap::{ActionContext, ActionId};
 use crate::text;
 use crate::theme::colors;
@@ -35,18 +36,37 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let selected_loop = app.selected_session_loop_status();
+    let loop_metadata = selected_loop.and_then(loop_metadata_detail);
+    let header_height = 1 + u16::from(loop_metadata.is_some());
     let chunks = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
-            ratatui::layout::Constraint::Length(1), // header
-            ratatui::layout::Constraint::Min(5),    // list
-            ratatui::layout::Constraint::Length(1), // page info
-            ratatui::layout::Constraint::Length(1), // key footer
+            ratatui::layout::Constraint::Length(header_height), // header
+            ratatui::layout::Constraint::Min(5),                // list
+            ratatui::layout::Constraint::Length(1),             // page info
+            ratatui::layout::Constraint::Length(1),             // key footer
         ])
         .split(area);
 
     // Header
-    let header = if area.width < 80 {
+    let header = if let Some(status) = selected_loop {
+        let title = " Selected · ";
+        let (detail, color) = loop_status_detail(status);
+        let detail = text::clip_cells(
+            &detail,
+            usize::from(area.width).saturating_sub(text::display_width(title)),
+        );
+        Line::from(vec![
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(colors::brand())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(detail, Style::default().fg(color)),
+        ])
+    } else if area.width < 80 {
         Line::from(Span::styled(
             format!(" Sessions · {} total", app.sessions.total),
             Style::default()
@@ -87,8 +107,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             ),
         ])
     };
-    let header = Paragraph::new(header);
-    f.render_widget(header, chunks[0]);
+    let mut header = vec![header];
+    if let Some(metadata) = loop_metadata {
+        header.push(Line::styled(
+            text::clip_cells(&format!(" {metadata}"), area.width.into()),
+            Style::default().fg(colors::subtle()),
+        ));
+    }
+    f.render_widget(Paragraph::new(header), chunks[0]);
 
     // Session list
     let mut lines: Vec<Line> = Vec::new();
@@ -136,13 +162,67 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     // Footer
     let footer_text = format!(
-        " {} open · {} delete · {} refresh",
+        " {} open · {} delete · {} refresh · {} loop status",
         app.key_hint(ActionContext::Sessions, ActionId::Activate),
         app.key_hint(ActionContext::Sessions, ActionId::DeleteSelection),
         app.key_hint(ActionContext::Sessions, ActionId::Refresh),
+        app.key_hint(
+            ActionContext::Sessions,
+            ActionId::InspectSelectedSessionLoop
+        ),
     );
     let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
     f.render_widget(footer, chunks[3]);
+}
+
+fn loop_status_detail(status: &SessionListLoopStatus) -> (String, Color) {
+    let text = match status {
+        SessionListLoopStatus::Loading => "Checking loop status…".into(),
+        SessionListLoopStatus::Available(None) => "No session loop".into(),
+        SessionListLoopStatus::Available(Some(record)) => match &record.state {
+            SessionLoopPreviewState::Scheduled => record.next_fire_at.as_ref().map_or_else(
+                || "Loop scheduled".into(),
+                |next| {
+                    format!(
+                        "Loop scheduled · next {} UTC",
+                        next.format("%Y-%m-%d %H:%M:%S")
+                    )
+                },
+            ),
+            SessionLoopPreviewState::Paused => "Loop paused".into(),
+            SessionLoopPreviewState::Stopped => "Loop stopped".into(),
+            SessionLoopPreviewState::Expired => "Loop expired".into(),
+        },
+        SessionListLoopStatus::Unavailable => {
+            return ("Loop status unavailable".into(), colors::error());
+        }
+    };
+    (text, colors::subtle())
+}
+
+fn loop_metadata_detail(status: &SessionListLoopStatus) -> Option<String> {
+    let SessionListLoopStatus::Available(Some(record)) = status else {
+        return None;
+    };
+    let mode = match &record.mode {
+        Some(SessionLoopPreviewMode::Fixed { interval_seconds }) => {
+            Some(interval_seconds.map_or_else(
+                || "Fixed".into(),
+                |seconds| format!("Fixed · every {seconds}s"),
+            ))
+        }
+        Some(SessionLoopPreviewMode::Adaptive) => Some("Adaptive".into()),
+        None => None,
+    };
+    let iteration = record.iteration.map(|iteration| match iteration {
+        0 => "No iterations yet".into(),
+        _ => format!("Iteration {iteration}"),
+    });
+    match (mode, iteration) {
+        (Some(mode), Some(iteration)) => Some(format!("{mode} · {iteration}")),
+        (Some(detail), None) | (None, Some(detail)) => Some(detail),
+        (None, None) => None,
+    }
 }
 
 /// Select the contiguous list window that keeps `selected` visible.
@@ -368,6 +448,32 @@ mod tests {
             bypass_permissions: false,
             plan_mode: None,
         }
+    }
+
+    #[test]
+    fn loop_metadata_detail_keeps_partial_receipts_and_explicit_zero_distinct() {
+        use crate::api::SessionLoopPreview;
+
+        let status = |mode, iteration| {
+            SessionListLoopStatus::Available(Some(SessionLoopPreview {
+                state: SessionLoopPreviewState::Scheduled,
+                next_fire_at: None,
+                mode,
+                iteration,
+            }))
+        };
+        assert_eq!(loop_metadata_detail(&status(None, None)), None);
+        assert_eq!(
+            loop_metadata_detail(&status(None, Some(0))).as_deref(),
+            Some("No iterations yet")
+        );
+        let fixed = SessionLoopPreviewMode::Fixed {
+            interval_seconds: None,
+        };
+        assert_eq!(
+            loop_metadata_detail(&status(Some(fixed), None)).as_deref(),
+            Some("Fixed")
+        );
     }
 
     #[test]

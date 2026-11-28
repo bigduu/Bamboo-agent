@@ -47,6 +47,314 @@ fn commit(repo: &Path, file: &str, body: &str) {
     git(repo, &["commit", "-m", file]);
 }
 
+fn init_repository_with_base(repo: &Path) {
+    fs::create_dir_all(repo).unwrap();
+    git(repo, &["init", "-b", "main"]);
+    commit(repo, "tracked.txt", "one\n");
+    git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+}
+
+fn init_repository_with_separate_metadata(base: &Path) -> PathBuf {
+    let repo = base.join("primary");
+    let metadata = base.join("git-metadata");
+    fs::create_dir(&repo).unwrap();
+    git(
+        &repo,
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+        ],
+    );
+    commit(&repo, "tracked.txt", "one\n");
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let config = git::git_command(&repo)
+        .args(["config", "--local", "--get", "core.worktree"])
+        .output()
+        .unwrap();
+    assert_eq!(config.status.code(), Some(1), "{config:?}");
+    let listing = git::git_command(&repo)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .unwrap();
+    assert!(listing.status.success(), "{listing:?}");
+    let native = listing.stdout.split(|byte| *byte == 0).next().unwrap();
+    let native = std::str::from_utf8(native.strip_prefix(b"worktree ").unwrap()).unwrap();
+    assert_eq!(Path::new(native).canonicalize().unwrap(), metadata);
+    repo
+}
+
+async fn register_container(base: &Path, container: &Path) -> (web::Data<AppState>, String) {
+    let state = web::Data::new(AppState::new(base.join("data")).await.unwrap());
+    let project = state
+        .project_store
+        .create_with_project_path("Container", None, container.to_str().unwrap(), vec![])
+        .unwrap();
+    let uri = format!("/api/v1/projects/{}/worktrees", project.id);
+    (state, uri)
+}
+
+#[actix_web::test]
+async fn merge_state_uses_verified_main_path_with_separate_git_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let primary = init_repository_with_separate_metadata(&base);
+    let (state, uri) = register_container(&base, &primary).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+
+    let inventory: Value =
+        test::call_and_read_body_json(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+    let response: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{uri}/merge-state?forge=off"))
+            .to_request(),
+    )
+    .await;
+    state.shutdown().await;
+
+    for result in [&inventory, &response] {
+        let repositories = result["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 1, "{result}");
+        let worktrees = repositories[0]["worktrees"].as_array().unwrap();
+        assert_eq!(worktrees.len(), 1, "{result}");
+        let path = Path::new(worktrees[0]["path"].as_str().unwrap());
+        assert_eq!(path.canonicalize().unwrap(), primary, "{result}");
+    }
+    let checkout = &response["repositories"][0]["worktrees"][0];
+    assert_eq!(checkout["head"], head(&primary).as_str());
+    assert_eq!(checkout["state"], "primary");
+    assert_eq!(checkout["reason"], "main_checkout");
+}
+
+#[actix_web::test]
+async fn merge_state_preserves_linked_checkout_when_separate_main_binding_is_unverified() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let primary = init_repository_with_separate_metadata(&base);
+    let linked = base.join("linked");
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    commit(&linked, "linked.txt", "unique work\n");
+    let (state, uri) = register_container(&base, &linked).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+
+    let response: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{uri}/merge-state?forge=off"))
+            .to_request(),
+    )
+    .await;
+    state.shutdown().await;
+
+    let diagnostics = response["discovery_diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing unverified checkout diagnostic in {response}"));
+    assert_eq!(diagnostics.len(), 1, "{response}");
+    let diagnostic = &diagnostics[0];
+    let path = Path::new(diagnostic["path"].as_str().unwrap());
+    assert_eq!(path.canonicalize().unwrap(), linked);
+    assert!(diagnostic["error"]
+        .as_str()
+        .unwrap()
+        .contains("without a verified checkout binding"));
+
+    let repositories = response["repositories"].as_array().unwrap();
+    assert_eq!(repositories.len(), 1, "{response}");
+    let worktrees = repositories[0]["worktrees"].as_array().unwrap();
+    assert_eq!(worktrees.len(), 1, "{response}");
+    let checkout = &worktrees[0];
+    let path = Path::new(checkout["path"].as_str().unwrap());
+    assert_eq!(path.canonicalize().unwrap(), linked);
+    assert_eq!(checkout["branch"], "linked");
+    assert_eq!(checkout["head"], head(&linked).as_str());
+    assert_eq!(checkout["state"], "in_progress");
+    assert_eq!(checkout["reason"], "unique_commits");
+}
+
+#[actix_web::test]
+async fn merge_state_discovers_the_same_deep_repository_as_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let container = base.join("project");
+    let repo = container.join("a/b/c/d/repo");
+    init_repository_with_base(&repo);
+    let (state, uri) = register_container(&base, &container).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+
+    let inventory: Value =
+        test::call_and_read_body_json(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+    let merge_state: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{uri}/merge-state?forge=off"))
+            .to_request(),
+    )
+    .await;
+    state.shutdown().await;
+
+    let path = repo.to_str().unwrap();
+    let inventory_repositories = inventory["repositories"].as_array().unwrap();
+    assert_eq!(inventory_repositories.len(), 1, "{inventory}");
+    assert_eq!(inventory_repositories[0]["path"], path);
+    assert!(inventory_repositories[0]["error"].is_null());
+
+    let repositories = merge_state["repositories"].as_array().unwrap();
+    assert_eq!(repositories.len(), 1, "{merge_state}");
+    let repository = &repositories[0];
+    assert_eq!(repository["path"], path);
+    assert_eq!(repository["base_ref"], "origin/main");
+    let commit = head(&repo);
+    assert_eq!(repository["base_commit"], commit.as_str());
+    assert!(repository["error"].is_null());
+    assert_eq!(repository["worktrees"].as_array().unwrap().len(), 1);
+    let checkout = &repository["worktrees"][0];
+    assert_eq!(
+        Path::new(checkout["path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        repo
+    );
+    assert_eq!(checkout["branch"], "main");
+    assert_eq!(checkout["head"], commit.as_str());
+    assert_eq!(checkout["state"], "primary");
+    assert_eq!(checkout["reason"], "main_checkout");
+}
+
+#[actix_web::test]
+async fn merge_state_reports_depth_truncation_without_losing_known_repositories() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let container = base.join("project");
+    let known = container.join("known");
+    init_repository_with_base(&known);
+    let mut boundary = container.clone();
+    for _ in 0..12 {
+        boundary.push("nested");
+    }
+    init_repository_with_base(&boundary.join("omitted"));
+    let (state, uri) = register_container(&base, &container).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+
+    let response: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{uri}/merge-state?forge=off"))
+            .to_request(),
+    )
+    .await;
+    state.shutdown().await;
+
+    let repositories = response["repositories"].as_array().unwrap();
+    assert_eq!(repositories.len(), 1, "{response}");
+    assert_eq!(repositories[0]["path"], known.to_str().unwrap());
+    assert_eq!(repositories[0]["worktrees"][0]["state"], "primary");
+    let diagnostics = response["discovery_diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{response}");
+    assert_eq!(diagnostics[0].as_object().unwrap().len(), 2);
+    assert_eq!(diagnostics[0]["path"], boundary.to_str().unwrap());
+    assert_eq!(
+        diagnostics[0]["error"],
+        "Repository discovery truncated at depth 12"
+    );
+}
+
+#[actix_web::test]
+async fn merge_state_uses_physical_primary_when_linked_source_is_discovered_first() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let container = base.join("project");
+    let primary = container.join("Z");
+    let linked = container.join("A");
+    init_repository_with_base(&primary);
+    git(
+        &primary,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    commit(&linked, "linked.txt", "unique work\n");
+    let (state, uri) = register_container(&base, &container).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+
+    let response: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{uri}/merge-state?forge=off"))
+            .to_request(),
+    )
+    .await;
+    state.shutdown().await;
+
+    let repositories = response["repositories"].as_array().unwrap();
+    assert_eq!(repositories.len(), 1, "{response}");
+    let repository = &repositories[0];
+    assert_eq!(repository["path"], linked.to_str().unwrap());
+    let checkouts = repository["worktrees"].as_array().unwrap();
+    assert_eq!(checkouts.len(), 2, "{response}");
+    for (path, branch, status, reason) in [
+        (&primary, "main", "primary", "main_checkout"),
+        (&linked, "linked", "in_progress", "unique_commits"),
+    ] {
+        let checkout = checkouts
+            .iter()
+            .find(|entry| {
+                entry["path"]
+                    .as_str()
+                    .and_then(|path| Path::new(path).canonicalize().ok())
+                    .as_ref()
+                    == Some(path)
+            })
+            .unwrap();
+        assert_eq!(checkout["branch"], branch);
+        assert_eq!(checkout["head"], head(path).as_str());
+        assert_eq!(checkout["state"], status, "{checkout}");
+        assert_eq!(checkout["reason"], reason, "{checkout}");
+    }
+}
+
 #[actix_web::test]
 async fn merge_state_reports_landed_and_outstanding_checkouts_then_degrades_without_a_base() {
     let temp = tempfile::tempdir().unwrap();

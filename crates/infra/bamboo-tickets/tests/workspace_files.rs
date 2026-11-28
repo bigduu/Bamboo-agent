@@ -23,6 +23,37 @@ fn execute(
 fn fixture() -> Fixture {
     fixture_with_workspace("worker", &[])
 }
+
+#[test]
+fn required_input_preflight_uses_the_worktree_read_boundary() {
+    let f = fixture();
+    let root = Path::new(&f.workspace.worktree);
+    assert!(f
+        .service
+        .verify_work_input(&f.workspace, "source.md")
+        .is_err());
+    fs::write(root.join("source.md"), "source").unwrap();
+    assert!(f
+        .service
+        .verify_work_input(&f.workspace, "source.md")
+        .is_ok());
+
+    let outside = f._temp.path().join("outside.md");
+    fs::write(&outside, "outside the worktree").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("link.md")).unwrap();
+    for path in [
+        "link.md",
+        "../outside.md",
+        ".git/config",
+        ".bamboo/config.json",
+    ] {
+        assert!(
+            f.service.verify_work_input(&f.workspace, path).is_err(),
+            "{path}"
+        );
+    }
+}
+
 fn fixture_with_workspace(relative_worktree: &str, relative_roots: &[&str]) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join(relative_worktree);

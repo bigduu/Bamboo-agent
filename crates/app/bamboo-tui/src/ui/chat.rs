@@ -522,7 +522,11 @@ fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedC
                 let rendered = if streaming {
                     markdown::render_streaming_markdown(content, width)
                 } else {
-                    markdown::render_markdown(content, width)
+                    markdown::render_markdown_with_mermaid_glyphs(
+                        content,
+                        width,
+                        app.mermaid_glyphs,
+                    )
                 };
                 lines.extend(rendered);
             }
@@ -1262,6 +1266,22 @@ mod tests {
             .collect()
     }
 
+    fn visible_transcript_row(terminal: &Terminal<TestBackend>, row: usize) -> String {
+        // A wide glyph covers its continuation cell even when TestBackend
+        // retains a symbol there from the previous draw.
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area().width);
+        let cells = &buffer.content()[row * width..(row + 1) * width];
+        let mut text = String::new();
+        let mut column = 0;
+        while let Some(cell) = cells.get(column) {
+            let symbol = cell.symbol();
+            text.push_str(symbol);
+            column += crate::text::grapheme_cell_width(symbol).max(1);
+        }
+        text
+    }
+
     fn fence_rows<'a>(rows: &'a [String], language: &str) -> &'a [String] {
         let top = rows
             .iter()
@@ -1369,6 +1389,549 @@ mod tests {
                         ..
                     }
                 ));
+            }
+        }
+    }
+
+    fn assistant_transcript(source: &str) -> App {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = map_history(vec![HistoryMessage {
+            id: "assistant-mermaid".into(),
+            role: "assistant".into(),
+            content: source.into(),
+            ..Default::default()
+        }]);
+        app
+    }
+
+    #[test]
+    fn testbackend_renders_settled_mermaid_td_paths_at_each_width() {
+        for (fence, header, edges, labels) in [
+            (
+                "```",
+                "flowchart TD",
+                "A[开始 🧪] --> B[验证]\nB --> C[完成 🧭]",
+                &["开始🧪", "验证", "完成🧭"][..],
+            ),
+            (
+                "~~~",
+                "graph TD",
+                "A[Start] --> B[Finish]",
+                &["Start", "Finish"][..],
+            ),
+        ] {
+            let source = format!(
+                "Before the diagram.\n\n{fence}mermaid\n{header}\n{edges}\n{fence}\n\nAfter the diagram."
+            );
+            let app = assistant_transcript(&source);
+            for width in [60, 80, 120] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                let rows = transcript_rows(&mut terminal, &app, false);
+                if width == 60
+                    && header == "flowchart TD"
+                    && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_TD").is_some()
+                {
+                    eprintln!(
+                        "MERMAID TD PREVIEW\n{}\nEND MERMAID TD PREVIEW",
+                        rows.join("\n")
+                    );
+                }
+                let row_for = |text: &str| rows.iter().position(|row| row.contains(text)).unwrap();
+                let first = row_for("┌");
+                assert!(row_for("Before the diagram.") < first);
+                assert!(row_for("After the diagram.") > first + labels.len() * 4 - 2);
+                assert!(!rows
+                    .iter()
+                    .any(|row| row.contains(header) || row.contains("-->")));
+
+                let buffer = terminal.backend().buffer();
+                let width = usize::from(width);
+                let cell_row = |row| &buffer.content()[row * width..(row + 1) * width];
+                let first_top = cell_row(first);
+                let left = first_top
+                    .iter()
+                    .position(|cell| cell.symbol() == "┌")
+                    .unwrap();
+                let right = first_top
+                    .iter()
+                    .position(|cell| cell.symbol() == "┐")
+                    .unwrap();
+                let center = cell_row(first + 2)
+                    .iter()
+                    .position(|cell| cell.symbol() == "┬")
+                    .unwrap();
+                assert!((left..=right).contains(&center));
+                assert!((center - left).abs_diff(right - center) <= 1);
+
+                for (index, label) in labels.iter().enumerate() {
+                    let top = first + index * 4;
+                    let joins_previous = index != 0;
+                    let joins_next = index + 1 != labels.len();
+                    assert_eq!(cell_row(top)[left].symbol(), "┌");
+                    assert_eq!(cell_row(top)[right].symbol(), "┐");
+                    assert_eq!(
+                        cell_row(top)[center].symbol(),
+                        if joins_previous { "┴" } else { "─" }
+                    );
+                    let contents: String = cell_row(top + 1)[left..=right]
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    assert_eq!(contents.replace(' ', ""), format!("│{label}│"));
+                    assert_eq!(cell_row(top + 2)[left].symbol(), "└");
+                    assert_eq!(cell_row(top + 2)[right].symbol(), "┘");
+                    assert_eq!(
+                        cell_row(top + 2)[center].symbol(),
+                        if joins_next { "┬" } else { "─" }
+                    );
+                    if joins_next {
+                        assert_eq!(cell_row(top + 3)[center].symbol(), "↓");
+                        assert_eq!(rows[top + 3].trim(), "↓");
+                    }
+                }
+                assert_eq!(app.chat.messages[0].content, source);
+            }
+        }
+    }
+
+    #[test]
+    fn testbackend_keeps_mermaid_source_visible_until_the_message_settles() {
+        let prefix = "Before the diagram.\n\n```mermaid\nflowchart TD\nA[Start] --> B[Finish]\n";
+        let partial = format!("{prefix}``");
+        let eof = format!("{prefix}```");
+        let closed = format!("{prefix}```\r\n\nAfter the diagram.");
+        let invalid = format!("{prefix}``` suffix");
+        let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+        live.chat.streaming = true;
+        live.chat.current_turn_id = Some("run:mermaid:preview".into());
+        let saved = assistant_transcript(&closed);
+        let saved_at_eof = assistant_transcript(&eof);
+        let saved_invalid = assistant_transcript(&invalid);
+
+        for width in [60, 80, 120] {
+            let draw = |app: &App| {
+                let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+                transcript_rows(&mut terminal, app, true)
+            };
+            for (source, literal_closer) in [
+                (prefix, None),
+                (&partial, Some("``")),
+                (&eof, None),
+                (&invalid, Some("``` suffix")),
+                (&closed, None),
+            ] {
+                live.chat.current_response = source.into();
+                let rows = draw(&live);
+                let body = fence_rows(&rows, "mermaid");
+                assert!(body[1].contains("flowchart TD"));
+                assert!(body[2].contains("A[Start] --> B[Finish]"));
+                assert!(!rows
+                    .iter()
+                    .any(|row| row.contains("↓") || row.contains("Mermaid source")));
+                if let Some(closer) = literal_closer {
+                    assert!(body.iter().any(|row| row.contains(closer)));
+                }
+                assert_eq!(live.chat.current_response, source);
+            }
+            let rows = draw(&saved_invalid);
+            assert!(fence_rows(&rows, "mermaid")
+                .iter()
+                .any(|row| row.contains("``` suffix")));
+            assert!(!rows
+                .iter()
+                .any(|row| row.contains('↓') || row.contains("Mermaid source")));
+            for app in [&saved, &saved_at_eof] {
+                let rows = draw(app);
+                assert!(rows.iter().any(|row| row.trim() == "↓"));
+                assert!(rows
+                    .iter()
+                    .any(|row| row.replace(' ', "").contains("│Start│")));
+                assert!(rows
+                    .iter()
+                    .any(|row| row.replace(' ', "").contains("│Finish│")));
+                assert!(!rows.iter().any(|row| row.contains("flowchart TD")));
+            }
+            assert!(draw(&saved)
+                .iter()
+                .any(|row| row.contains("After the diagram.")));
+        }
+        assert_eq!(saved.chat.messages[0].content, closed);
+    }
+
+    #[test]
+    fn testbackend_keeps_unsupported_and_wide_mermaid_source_readable() {
+        let unsupported = assistant_transcript(concat!(
+            "```mermaid\nflowchart TD\nA[Start] --> B[Finish]\nA --> C[Other]\n```\n\nAfter the diagram."
+        ));
+        let wide = assistant_transcript(&format!(
+            "```mermaid\nflowchart TD\nA[{}] --> B[Finish]\n```\n\nAfter the diagram.",
+            "W".repeat(40)
+        ));
+        for (width, app, explanation, source) in [
+            (
+                60,
+                &unsupported,
+                "Mermaid source · unsupported diagram",
+                "A --> C[Other]",
+            ),
+            (38, &wide, "Mermaid source · diagram too wide", "A[WWWW"),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+            let rows = transcript_rows(&mut terminal, app, false);
+            assert!(rows.iter().any(|row| row.trim() == explanation));
+            let body = fence_rows(&rows, "mermaid");
+            assert!(body.iter().any(|row| row.contains("flowchart TD")));
+            assert!(body.iter().any(|row| row.contains(source)));
+            assert!(rows.iter().any(|row| row.contains("After the diagram.")));
+            assert!(!rows.iter().any(|row| row.contains('↓')));
+        }
+    }
+
+    const MERMAID_LR_LABELS: [&str; 3] = ["开始 🧪", "Review report", "完成 🧭"];
+
+    fn mermaid_lr_source(fence: &str, header: &str) -> String {
+        let [first, middle, final_label] = MERMAID_LR_LABELS;
+        format!(
+            "Before the diagram.\n\n{fence}mermaid\n{header}\nB[{middle}] --> C[{final_label}]\nA[{first}] --> B\n{fence}\n\nAfter the diagram."
+        )
+    }
+
+    fn assert_mermaid_lr_path(rows: &[String]) {
+        let rendered = rows.join("\n");
+        let row_for = |text: &str| {
+            rows.iter()
+                .position(|row| row.contains(text))
+                .unwrap_or_else(|| panic!("missing {text:?} in transcript\n{rendered}"))
+        };
+        let first = row_for("┌");
+        assert!(row_for("Before the diagram.") < first);
+        assert!(row_for("After the diagram.") > first + 2);
+        assert!(!rendered.contains("Mermaid source"));
+        assert!(!rendered.contains(" LR") && !rendered.contains("-->"));
+
+        let border = |left, right| {
+            MERMAID_LR_LABELS
+                .map(|label| {
+                    let rule = "─".repeat(crate::text::grapheme_cell_width(label) + 2);
+                    format!("{left}{rule}{right}")
+                })
+                .join("   ")
+        };
+        assert_eq!(rows[first].trim(), border('┌', '┐'));
+        assert_eq!(
+            rows[first + 1].replace(' ', ""),
+            "│开始🧪├──→┤Reviewreport├──→┤完成🧭│"
+        );
+        assert_eq!(rows[first + 2].trim(), border('└', '┘'));
+    }
+
+    #[test]
+    fn testbackend_renders_settled_mermaid_lr_paths_at_each_width() {
+        for (fence, header) in [("```", "flowchart LR"), ("~~~", "graph LR")] {
+            let source = mermaid_lr_source(fence, header);
+            let app = assistant_transcript(&source);
+            for width in [60, 80, 120] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+                let rows = transcript_rows(&mut terminal, &app, false);
+                assert_mermaid_lr_path(&rows);
+                assert_eq!(app.chat.messages[0].content, source);
+                if width == 60
+                    && header == "flowchart LR"
+                    && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_LR").is_some()
+                {
+                    eprintln!(
+                        "MERMAID LR PREVIEW\n{}\nEND MERMAID LR PREVIEW",
+                        rows.join("\n")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn testbackend_keeps_mermaid_lr_source_live_and_redraws_settled_graph_after_resize() {
+        let source = mermaid_lr_source("```", "flowchart LR");
+        let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+        live.chat.current_turn_id = Some("run:mermaid-lr".into());
+        live.chat.streaming = true;
+        live.chat.current_response = source.clone();
+        let mut live_terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        let live_rows = transcript_rows(&mut live_terminal, &live, true);
+        let live_fence = fence_rows(&live_rows, "mermaid");
+        assert!(live_fence[1].contains("flowchart LR"));
+        assert!(live_fence[3].replace(' ', "").contains("A[开始🧪]-->B"));
+        assert!(!live_rows
+            .iter()
+            .any(|row| row.contains('→') || row.contains("Mermaid source")));
+        assert!(live_rows
+            .iter()
+            .any(|row| row.contains("After the diagram.")));
+        assert_eq!(live.chat.current_response, source);
+
+        let box_cells: usize = MERMAID_LR_LABELS
+            .iter()
+            .map(|label| crate::text::grapheme_cell_width(label) + 4)
+            .sum();
+        let required_width = box_cells + (MERMAID_LR_LABELS.len() - 1) * 3;
+        let narrow_width = u16::try_from(required_width - 1).unwrap();
+        let saved = assistant_transcript(&source);
+        let mut terminal = Terminal::new(TestBackend::new(narrow_width, 18)).unwrap();
+        let narrow = transcript_rows(&mut terminal, &saved, false);
+        assert!(narrow
+            .iter()
+            .any(|row| row.trim() == "Mermaid source · diagram too wide"));
+        assert!(fence_rows(&narrow, "mermaid")[1].contains("flowchart LR"));
+        assert!(!narrow.iter().any(|row| row.contains('→')));
+        terminal.backend_mut().resize(80, 18);
+        let wide = transcript_rows(&mut terminal, &saved, false);
+        assert_mermaid_lr_path(&wide);
+        assert_eq!(saved.chat.messages[0].content, source);
+    }
+
+    #[test]
+    fn testbackend_previews_rounded_mermaid_nodes_only_after_settling() {
+        let edges = "A(\"计划 🧭\") --> B[Review]\r\nB --> C(Done)\r\n";
+        for (direction, connector) in [("TD", '↓'), ("LR", '→')] {
+            let body = format!("flowchart {direction}\r\n{edges}");
+            let source = format!(
+                "Before the diagram.\r\n\r\n~~~mermaid\r\n{body}~~~\r\n\r\nAfter the diagram."
+            );
+            let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+            live.chat.streaming = true;
+            live.chat.current_turn_id = Some("run:mermaid-rounded".into());
+            live.chat.current_response = source.clone();
+            let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            let rows = transcript_rows(&mut terminal, &live, true);
+            let fence = fence_rows(&rows, "mermaid");
+            assert!(fence[1].contains(direction));
+            assert!(fence[2]
+                .replace(' ', "")
+                .contains("A(\"计划🧭\")-->B[Review]"));
+            assert!(!rows
+                .iter()
+                .any(|row| row.contains(connector) || row.contains('╭')));
+
+            let saved = assistant_transcript(&source);
+            if direction == "LR" {
+                terminal.backend_mut().resize(34, 24);
+                let narrow = transcript_rows(&mut terminal, &saved, false);
+                assert!(narrow
+                    .iter()
+                    .any(|row| row.trim() == "Mermaid source · diagram too wide"));
+                assert!(fence_rows(&narrow, "mermaid")[1].contains("flowchart LR"));
+                assert!(!narrow
+                    .iter()
+                    .any(|row| row.contains(connector) || row.contains('╭')));
+            }
+
+            for width in [60, 120] {
+                terminal.backend_mut().resize(width, 24);
+                let mut rows = transcript_rows(&mut terminal, &saved, false);
+                let top = rows
+                    .iter()
+                    .position(|row| row.starts_with('╭'))
+                    .unwrap_or_else(|| {
+                        panic!("missing rounded diagram at {width}:\n{}", rows.join("\n"))
+                    });
+                rows[top + 1] = visible_transcript_row(&terminal, top + 1);
+                let rendered = rows.join("\n");
+                if direction == "TD" {
+                    assert_eq!(rows[top].trim_end(), "╭─────────╮");
+                    assert_eq!(rows[top + 1].replace(' ', ""), "│计划🧭│");
+                    assert_eq!(rows[top + 2].trim_end(), "╰────┬────╯");
+                    assert_eq!(rows[top + 3].trim_end(), "     ↓");
+                    assert_eq!(rows[top + 4].trim_end(), "┌────┴────┐");
+                    assert_eq!(rows[top + 8].trim_end(), "╭────┴────╮");
+                    assert_eq!(rows[top + 10].trim_end(), "╰─────────╯");
+                } else {
+                    assert_eq!(rows[top].trim_end(), "╭─────────╮   ┌────────┐   ╭──────╮");
+                    assert_eq!(
+                        rows[top + 1].replace(' ', ""),
+                        "│计划🧭├──→┤Review├──→┤Done│"
+                    );
+                    assert_eq!(
+                        rows[top + 2].trim_end(),
+                        "╰─────────╯   └────────┘   ╰──────╯"
+                    );
+                }
+                assert!(rendered.contains("After the diagram."));
+                assert!(!rendered.contains("Mermaid source") && !rendered.contains("-->"));
+                if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_ROUNDED").is_some() {
+                    eprintln!(
+                        "MERMAID ROUNDED {direction} PREVIEW\n{rendered}\nEND MERMAID ROUNDED PREVIEW"
+                    );
+                }
+            }
+
+            assert_eq!(saved.chat.messages[0].content, source);
+            let (_, fences) = markdown::copyable_fences(&saved.chat.messages[0].content);
+            assert_eq!(
+                fences,
+                [markdown::CopyableFence {
+                    language: Some("mermaid"),
+                    source: &body,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn testbackend_previews_labeled_mermaid_chain_only_after_settling_and_when_it_fits() {
+        const LABEL: &str = "需要复核 🧭";
+        for (direction, connector) in [("TD", '↓'), ("LR", '→')] {
+            let body =
+                format!("flowchart {direction}\r\nA(Collect)-->|{LABEL}|B[Review]-->C(Done);\r\n");
+            let source = format!(
+                "Before the diagram.\r\n\r\n~~~mermaid\r\n{body}~~~\r\n\r\nAfter the diagram."
+            );
+            let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+            live.chat.streaming = true;
+            live.chat.current_turn_id = Some("run:mermaid-edge-label".into());
+            live.chat.current_response = source.clone();
+            let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            let streaming = transcript_rows(&mut terminal, &live, true);
+            let fence = fence_rows(&streaming, "mermaid");
+            assert!(fence[2]
+                .replace(' ', "")
+                .contains("A(Collect)-->|需要复核🧭|B[Review]-->C(Done);"));
+            assert!(!streaming.iter().any(|row| row.contains(connector)));
+
+            let saved = assistant_transcript(&source);
+            if direction == "LR" {
+                terminal.backend_mut().resize(38, 24);
+                let narrow = transcript_rows(&mut terminal, &saved, false);
+                assert!(narrow
+                    .iter()
+                    .any(|row| row.trim() == "Mermaid source · diagram too wide"));
+                assert!(fence_rows(&narrow, "mermaid")[1].contains("flowchart LR"));
+                assert!(!narrow.iter().any(|row| row.contains(connector)));
+            }
+
+            for width in [60, 120] {
+                terminal.backend_mut().resize(width, 24);
+                let mut rows = transcript_rows(&mut terminal, &saved, false);
+                let top = rows
+                    .iter()
+                    .position(|row| row.starts_with('╭'))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing labeled {direction} at {width}:\n{}",
+                            rows.join("\n")
+                        )
+                    });
+                let label_row = if direction == "TD" { top + 3 } else { top };
+                rows[label_row] = visible_transcript_row(&terminal, label_row);
+                if direction == "TD" {
+                    assert_eq!(rows[label_row].trim(), format!("↓ {LABEL}"));
+                    assert!(rows[top + 4].starts_with('┌'));
+                    assert_eq!(rows[top + 7].trim(), "↓");
+                } else {
+                    assert!(rows[label_row].contains(&format!("╮ {LABEL} ┌")));
+                    let dashes = "─".repeat(crate::text::grapheme_cell_width(LABEL) + 1);
+                    assert!(rows[top + 1].contains(&format!("├{dashes}→┤ Review ├──→┤")));
+                }
+                let rendered = rows.join("\n");
+                assert!(rendered.contains("After the diagram."));
+                assert!(!rendered.contains("Mermaid source") && !rendered.contains("-->"));
+                if width == 60
+                    && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_EDGE_LABEL").is_some()
+                {
+                    eprintln!(
+                        "MERMAID EDGE {direction} PREVIEW\n{rendered}\nEND MERMAID EDGE PREVIEW"
+                    );
+                }
+            }
+            assert_eq!(saved.chat.messages[0].content, source);
+            assert_eq!(
+                markdown::copyable_fences(&saved.chat.messages[0].content).1,
+                [markdown::CopyableFence {
+                    language: Some("mermaid"),
+                    source: &body,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn testbackend_previews_mermaid_decisions_in_both_glyph_modes() {
+        use markdown::MermaidGlyphs::{Ascii, Unicode};
+
+        const EDGES: &str = concat!(
+            "A(Plan) --> B{开始 🧭}\r\n",
+            "B -->|批准| C{\"复核 (QA) 🚀\"}\r\n",
+            "C --> D[Done]\r\n",
+        );
+        for (glyphs, slopes) in [(Unicode, ['╱', '╲']), (Ascii, ['/', '\\'])] {
+            for direction in ["TD", "LR"] {
+                let source = format!(
+                    "~~~mermaid\r\nflowchart {direction}\r\n{EDGES}~~~\r\n\r\nAfter the diagram."
+                );
+                let mut saved = assistant_transcript(&source);
+                saved.mermaid_glyphs = glyphs;
+                let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+                live.mermaid_glyphs = glyphs;
+                live.chat.streaming = true;
+                live.chat.current_turn_id = Some("run:mermaid-decision".into());
+                live.chat.current_response = source;
+
+                for width in [60, 80, 120] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                    let streaming = transcript_rows(&mut terminal, &live, true);
+                    let fence = fence_rows(&streaming, "mermaid");
+                    assert!(fence[1].contains(&format!("flowchart {direction}")));
+                    assert!(fence[2].replace(' ', "").contains("B{开始🧭}"));
+                    assert!(fence[3].replace(' ', "").contains("C{\"复核(QA)🚀\"}"));
+                    assert!(!streaming.iter().any(|row| row.contains(slopes)));
+
+                    let rows = transcript_rows(&mut terminal, &saved, false);
+                    let rendered = (0..rows.len())
+                        .map(|row| visible_transcript_row(&terminal, row))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    for label in [
+                        "Plan",
+                        "开始 🧭",
+                        "复核 (QA) 🚀",
+                        "批准",
+                        "Done",
+                        "After the diagram.",
+                    ] {
+                        assert!(rendered.contains(label), "missing {label:?}:\n{rendered}");
+                    }
+                    assert!(
+                        !rendered.contains("flowchart") && !rendered.contains("Mermaid source")
+                    );
+                    for slope in slopes {
+                        assert_eq!(rendered.matches(slope).count(), 4, "{rendered}");
+                    }
+                    if width == 60
+                        && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_DECISION").is_some()
+                    {
+                        eprintln!(
+                            "MERMAID DECISION {direction} {glyphs:?} PREVIEW\n{rendered}\nEND MERMAID DECISION PREVIEW"
+                        );
+                    }
+                }
+            }
+
+            for (edges, literal) in [
+                (
+                    "A{Ready?} --> B[Continue]\r\nA --> C[Stop]\r\n",
+                    "A --> C[Stop]",
+                ),
+                ("A{{Review}} --> B[Done]\r\n", "A{{Review}}"),
+            ] {
+                let mut saved =
+                    assistant_transcript(&format!("```mermaid\r\nflowchart TD\r\n{edges}```"));
+                saved.mermaid_glyphs = glyphs;
+                let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+                let rows = transcript_rows(&mut terminal, &saved, false);
+                assert!(rows
+                    .iter()
+                    .any(|row| row.trim() == "Mermaid source · unsupported diagram"));
+                assert!(fence_rows(&rows, "mermaid")
+                    .iter()
+                    .any(|row| row.contains(literal)));
             }
         }
     }
@@ -1891,7 +2454,7 @@ mod tests {
     fn testbackend_renders_assistant_image_alt_text_alongside_links_and_code() {
         let source = concat!(
             "Build report\n\n",
-            "![build_route 输出 🧪](assets/run(2).png) · [notes](https://example.test/notes)\n",
+            "![build_route 输出 🧪](assets/run(2).png) · [notes](https://example.test/n(2)/Z)\n",
             "![See [guide](https://example.test/guide)](assets/chart.png)\n",
             "Missing description: ![](assets/empty.png)\n",
             "Inline example: `![inline](assets/code.png)`\n\n",
@@ -1920,7 +2483,19 @@ mod tests {
                 });
             assert_eq!(
                 description.replace(' ', ""),
-                "build_route输出🧪·notes(https://example.test/notes)"
+                "build_route输出🧪·notes(https://example.test/n(2)/Z)"
+            );
+            let destination_end = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .find(|cell| cell.symbol() == "Z")
+                .unwrap();
+            assert_eq!(
+                destination_end.fg,
+                colors::subtle(),
+                "{width} columns\n{rendered}"
             );
             assert!(rows.iter().any(|row| row.trim_end() == "See guide"));
             assert!(rendered.contains("Missing description: [Image]"));

@@ -36,7 +36,8 @@ use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
     CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
-    ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    ProviderProtocol, ReasoningEffort, DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+    MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
@@ -50,6 +51,7 @@ use bamboo_llm::{
 use bamboo_tools::exposure::activated_discoverable_tools;
 use sha2::{Digest, Sha256};
 
+use super::context_preparation::ProviderPreparedTokenCounter;
 use super::{
     request_tool_policy, request_tool_schemas_for_loading_mode, select_request_tool_schemas,
     PromptMemoryExposureFrame, RoundRecoveryPolicy, RoundToolDispatch,
@@ -654,6 +656,7 @@ fn measure_request_usage(
     tool_footprint: &ProviderVisibleToolFootprint,
 ) -> ProjectedRequestUsage {
     let counter = TiktokenTokenCounter::default();
+    let message_counter = ProviderPreparedTokenCounter(&counter);
     let messages = envelope.ir.flatten();
     let history_boundary_event_ids = session
         .model_context_state
@@ -670,9 +673,9 @@ fn measure_request_usage(
         .iter()
         .filter(|message| history_boundary_event_ids.contains(message.id.as_str()))
         .fold(0u32, |total, message| {
-            total.saturating_add(counter.count_message(message))
+            total.saturating_add(message_counter.count_message(message))
         });
-    let mut message_input_tokens = counter.count_messages(&messages);
+    let mut message_input_tokens = message_counter.count_messages(&messages);
     let mut replaced_anchors = HashSet::new();
     for group in &envelope.ir.provider_transcript_groups {
         if replaced_anchors.insert(group.anchor_message_id()) {
@@ -681,7 +684,7 @@ fn measure_request_usage(
                 .find(|message| message.id == group.anchor_message_id())
             {
                 message_input_tokens =
-                    message_input_tokens.saturating_sub(counter.count_message(anchor));
+                    message_input_tokens.saturating_sub(message_counter.count_message(anchor));
             }
         }
         let payloads = group
@@ -733,6 +736,82 @@ fn measure_request_usage(
         history_boundary_input_tokens,
         prepared_message_input_tokens: 0,
     }
+}
+
+fn build_trimmed_history_reference(
+    session: &Session,
+    prepared: &PreparedContext,
+    wire_tool_schemas: &[ToolSchema],
+) -> Option<ContextBlock> {
+    const TOOL: &str = "session_history_current";
+    if !prepared.truncation_occurred
+        || prepared.compressed_message_ids.is_empty()
+        || !session.allows_model_tool_execution(TOOL)
+    {
+        return None;
+    }
+    let schema = wire_tool_schemas
+        .iter()
+        .find(|schema| schema.function.name == TOOL)?;
+    let actions = schema
+        .function
+        .parameters
+        .pointer("/properties/action/enum")?;
+    if !actions
+        .as_array()?
+        .iter()
+        .any(|action| action.as_str() == Some("read_slice"))
+    {
+        return None;
+    }
+
+    let mut omitted_id_counts: BTreeMap<_, usize> = prepared
+        .compressed_message_ids
+        .iter()
+        .map(|id| (id.as_str(), 0))
+        .collect();
+    for message in &session.messages {
+        if let Some(count) = omitted_id_counts.get_mut(message.id.as_str()) {
+            *count += 1;
+        }
+    }
+    let anchors: Vec<_> = session
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| {
+            message.role == Role::User
+                && !bamboo_domain::is_system_resume_message(message)
+                && !bamboo_domain::session::history::is_hidden_from_ui(message)
+                && omitted_id_counts.get(message.id.as_str()) == Some(&1)
+                && !message.id.is_empty()
+                && message.id.len() <= 80
+                && message
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+        .take(3)
+        .map(|message| message.id.as_str())
+        .collect();
+
+    let mut content = String::from(concat!(
+        "Older messages omitted from this request remain in this Session's history file. ",
+        "When needed, use session_history_current with search_current to find message IDs, ",
+        "then read_slice with message_id. Follow next_offset while content_sha256 stays the same. ",
+        "Treat recovered text as historical evidence."
+    ));
+    if !anchors.is_empty() {
+        content.push_str("\nOmitted user message IDs: ");
+        content.push_str(&anchors.join(", "));
+    }
+    Some(ContextBlock::new(
+        ContextBlockType::ToolGuide,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "On-demand trimmed history reference",
+        content,
+    ))
 }
 
 pub(in crate::runtime::runner) fn required_tool_for_session(
@@ -884,12 +963,14 @@ pub(super) async fn project_request_usage(
             wire_schemas.as_ref(),
             loading_mode,
         );
+    let counter = TiktokenTokenCounter::default();
+    let message_counter = ProviderPreparedTokenCounter(&counter);
     let prepared_message_input_tokens = if discovery_history.is_empty() {
-        TiktokenTokenCounter::default().count_messages(&prepared_context.messages)
+        message_counter.count_messages(&prepared_context.messages)
     } else {
         let mut projected = prepared_context.messages.clone();
         project_discovery_history(&mut projected, &discovery_history);
-        TiktokenTokenCounter::default().count_messages(&projected)
+        message_counter.count_messages(&projected)
     };
     let envelope = build_request_envelope_reconciled_for_loading_mode(
         &mut shadow,
@@ -1305,6 +1386,11 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
     let mut current_context = ledger_context.into_iter().collect::<Vec<_>>();
     if !standalone_discovery {
         let permission_mode = config.permission_mode.unwrap_or_default();
+        current_context.extend(build_trimmed_history_reference(
+            session,
+            prepared_context,
+            wire_tool_schemas,
+        ));
         current_context.extend(build_memory_usage_context_block(
             session,
             tool_schemas,
@@ -1319,6 +1405,44 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             loading_mode,
             permission_mode,
         ));
+        if config.ticket_worker_plan.is_none()
+            && session.kind == bamboo_domain::SessionKind::Root
+            && session.project_id_meta().is_some()
+            && session.supervisor_incarnation_id().is_none()
+            && !session.allows_model_tool_execution("project_manager_work")
+            && tool_schemas
+                .iter()
+                .any(|tool| tool.function.name == "SubAgent")
+            && !ToolExecutionSessionFlags::from_session_and_configured_mode(
+                session,
+                permission_mode,
+            )
+            .plan_read_only
+        {
+            let wire_has = |name| {
+                wire_tool_schemas
+                    .iter()
+                    .any(|tool| tool.function.name == name)
+            };
+            let hint = if wire_has("SubAgent") {
+                Some("For work needing separate tracking, later follow-up, or handoff, call SubAgent with role=ticket-creator and wait for its Work receipt.")
+            } else if wire_has(DISCOVERY_CONTROL_FALLBACK_TOOL_NAME) {
+                Some("For work needing separate tracking, later follow-up, or handoff, call discover_capabilities with query=SubAgent to load it, then use SubAgent with role=ticket-creator and wait for its Work receipt.")
+            } else if loading_mode == CapabilityLoadingMode::Progressive {
+                Some("For work needing separate tracking, later follow-up, or handoff, use tool discovery to load SubAgent, then call it with role=ticket-creator and wait for its Work receipt.")
+            } else {
+                None
+            };
+            current_context.extend(hint.map(|hint| {
+                ContextBlock::new(
+                    ContextBlockType::ToolGuide,
+                    ContextBlockPriority::High,
+                    ContextBlockStability::RoundDynamic,
+                    "Project Work",
+                    hint,
+                )
+            }));
+        }
     }
     // The agenda and tool guidance are current context, outside the
     // generated ledger. Present them before the user who owns this turn.

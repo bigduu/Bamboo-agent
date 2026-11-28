@@ -289,7 +289,12 @@ async fn root_tools_include_server_overlays_and_memory() {
         .expect("Root current-history schema");
     assert_eq!(
         current_history.function.parameters["properties"]["action"]["enum"],
-        json!(["search_current", "read_current", "read_around"])
+        json!([
+            "search_current",
+            "read_current",
+            "read_around",
+            "read_slice"
+        ])
     );
     assert!(current_history.function.parameters["properties"]
         .get("session_id")
@@ -410,7 +415,12 @@ async fn shared_base_history_keeps_host_scopes_separate_from_current_history() {
         .expect("Child current-history schema");
     assert_eq!(
         child_current_history.function.parameters["properties"]["action"]["enum"],
-        json!(["search_current", "read_current", "read_around"])
+        json!([
+            "search_current",
+            "read_current",
+            "read_around",
+            "read_slice"
+        ])
     );
     assert!(child_current_history.function.parameters["properties"]
         .get("session_id")
@@ -557,7 +567,12 @@ async fn current_history_survives_app_state_restart_with_archived_messages() {
         );
         assert_eq!(
             schema.function.parameters["properties"]["action"]["enum"],
-            json!(["search_current", "read_current", "read_around"])
+            json!([
+                "search_current",
+                "read_current",
+                "read_around",
+                "read_slice"
+            ])
         );
     }
 

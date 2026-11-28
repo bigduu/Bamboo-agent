@@ -33,8 +33,16 @@ open it. A child session shows **← Parent** in the header. Click it or press
 `F4` to return to the immediate parent.
 
 Search for **Terminal settings** in Functions to adjust appearance, expansion of
-new tool blocks, and toolbar hints for the current terminal process. The server
-configuration and permission policy entries open the corresponding Bamboo views.
+new tool blocks, and toolbar hints for the current terminal process.
+**Mermaid diagrams** switches preview borders and connectors between Unicode and
+ASCII. The server configuration and permission policy entries open the
+corresponding Bamboo views.
+
+Settled Mermaid flowcharts can preview one connected path in `TD` or `LR`.
+For example, `A[Start] -->|ready| B{Check} --> C(Done)` shows a rectangle, a
+decision node, and a rounded node. A bare ID uses its label when one was
+defined. The transcript shows the source while the reply streams, when the
+syntax is unsupported, or when the diagram is wider than the terminal.
 Press `Esc` to park an approval in chat and `Ctrl+Q` to reopen it. The current
 draft remains in the composer.
 
@@ -114,6 +122,9 @@ Action and context IDs are stable kebab-case strings:
   `confirm` and `reject`
 - `sessions`, `mcp`, `schedules`, `schedule-form`, `skills`, `config`,
   `config-editor`: the actions shown in the corresponding F1 group
+- `schedules`: `edit-schedule-interval` defaults to `i` on a saved Interval
+  schedule. In `schedule-interval`, `activate` saves, `backspace` edits the
+  period, and `cancel` closes the editor.
 - `session-picker-browse`, `session-picker-rename`,
   `session-picker-pinning`, `model-picker`, `command-palette`, `terminal-settings`: the actions
   shown in each picker group

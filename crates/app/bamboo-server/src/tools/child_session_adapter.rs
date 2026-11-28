@@ -1240,6 +1240,13 @@ impl ChildSessionPort for ChildSessionAdapter {
         use bamboo_skills::named_agents::{
             NamedAgentLimits, NamedAgentProfileStatus, ScopedNamedAgentCatalogStatus,
         };
+        if name == bamboo_domain::session::tool_authority::TICKET_CREATOR_ROLE
+            && !self.config.read().await.features.ticket_mutation
+        {
+            return Err(ChildSessionError::Execution(
+                "Project Ticket creation is disabled".into(),
+            ));
+        }
         let invalid = || ChildSessionError::Execution("named_profile_catalog_unavailable".into());
         // Reuse this adapter's actual data home and durable authority. A worker
         // embedding without ProjectStore has no supported profile producer.

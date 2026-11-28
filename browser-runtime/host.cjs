@@ -584,6 +584,20 @@ function createNativeRootTracker(spawns, expectedProfile, policy = {}) {
 
 const MAX_SNAPSHOT_CHARS = 80_000;
 const MAX_HTML_CHARS = 100_000;
+
+function boundedUnicodeText(value, maximum) {
+  let end = Math.min(value.length, maximum);
+  if (end < value.length) {
+    const before = value.charCodeAt(end - 1);
+    const after = value.charCodeAt(end);
+    // Leave the whole character out when it crosses the UTF-16 limit.
+    if (before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF) {
+      end -= 1;
+    }
+  }
+  return { text: value.slice(0, end).toWellFormed(), truncated: end < value.length };
+}
+
 const MAX_TABS = 8;
 // Rust retires this host after 30 seconds. Leave time for state() and stdio.
 const POINTER_ACTION_BUDGET_MS = 22_000;
@@ -1396,18 +1410,6 @@ function createChatScope({ id, generation, profileMode, context, downloadDir,
     return value.length > maximum ? value.slice(0, maximum) : value;
   }
 
-  function boundedDialogText(value) {
-    let text = '';
-    let consumed = 0;
-    for (const character of value) {
-      if (consumed + character.length > MAX_DIALOG_CHARS) break;
-      const codePoint = character.codePointAt(0);
-      text += codePoint >= 0xD800 && codePoint <= 0xDFFF ? '\uFFFD' : character;
-      consumed += character.length;
-    }
-    return { text, truncated: consumed < value.length };
-  }
-
   function staleEpochError() {
     const error = new Error('browser page changed; refresh state and retry');
     error.code = 'stale_epoch';
@@ -1442,8 +1444,8 @@ function createChatScope({ id, generation, profileMode, context, downloadDir,
   function dialogState() {
     const tab = requireActiveTab();
     const pending = pendingDialog;
-    const message = pending && boundedDialogText(pending.message);
-    const defaultValue = pending && boundedDialogText(pending.defaultValue);
+    const message = pending && boundedUnicodeText(pending.message, MAX_DIALOG_CHARS);
+    const defaultValue = pending && boundedUnicodeText(pending.defaultValue, MAX_DIALOG_CHARS);
     return {
       page_epoch: epoch,
       active_tab_id: tab.id,
@@ -3561,14 +3563,15 @@ function createChatScope({ id, generation, profileMode, context, downloadDir,
         }
         return stableRead(async tab => {
           const page = tab.page;
-          const snapshot = await page.ariaSnapshot({ mode: 'ai', depth: 12, timeout: 10_000 });
-          const html = await page.content();
+          const snapshot = boundedUnicodeText(
+            await page.ariaSnapshot({ mode: 'ai', depth: 12, timeout: 10_000 }), MAX_SNAPSHOT_CHARS);
+          const html = boundedUnicodeText(await page.content(), MAX_HTML_CHARS);
           return {
             title: await page.title(),
-            snapshot: bounded(snapshot, MAX_SNAPSHOT_CHARS),
-            html: bounded(html, MAX_HTML_CHARS),
-            snapshot_truncated: snapshot.length > MAX_SNAPSHOT_CHARS,
-            html_truncated: html.length > MAX_HTML_CHARS,
+            snapshot: snapshot.text,
+            html: html.text,
+            snapshot_truncated: snapshot.truncated,
+            html_truncated: html.truncated,
           };
         });
       }
@@ -4326,7 +4329,7 @@ if (require.main === module) {
     await closeHost().catch(() => {});
   });
 } else {
-  module.exports = { installScriptBlobCapture, installDownloadLinkInspector,
+  module.exports = { installScriptBlobCapture, installDownloadLinkInspector, boundedUnicodeText,
     IMAGE_BYTES, QUOTA_BYTES, ACCOUNT_KEY, macSharedStoragePlan,
     validateMacStorageObservation, inspectMacSharedStorage,
     validateMacStorageResetObservation, inspectMacStorageForReset,

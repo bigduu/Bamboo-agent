@@ -973,7 +973,12 @@ pub fn session_history_search_artifact_ids(session: &Session) -> HashSet<String>
                         .is_some_and(|arguments| {
                             matches!(
                                 arguments.get("action").and_then(serde_json::Value::as_str),
-                                Some("search_current" | "read_current" | "read_around")
+                                Some(
+                                    "search_current"
+                                        | "read_current"
+                                        | "read_around"
+                                        | "read_slice"
+                                )
                             )
                         });
                 if is_history_retrieval {
@@ -1475,6 +1480,7 @@ mod tests {
             ("session_history_current", "search_current"),
             ("session_history_current", "read_current"),
             ("session_history_current", "read_around"),
+            ("session_history_current", "read_slice"),
         ]
         .into_iter()
         .enumerate()

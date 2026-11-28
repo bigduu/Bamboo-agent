@@ -14,6 +14,10 @@ use std::path::{Component, Path, PathBuf};
 
 type Response = Result<HttpResponse, AppError>;
 
+pub(crate) fn list_git_worktrees(repo: &Path) -> Result<Vec<git::Worktree>, String> {
+    git::list_until(repo, std::time::Instant::now() + git::inventory_budget())
+}
+
 fn project(state: &AppState, id: &str) -> Result<ProjectManifest, AppError> {
     let id = ProjectId::parse(id).map_err(|e| AppError::BadRequest(e.to_string()))?;
     state
@@ -423,12 +427,28 @@ struct MergeStateRepository {
     worktrees: Vec<MergeStateInventory>,
 }
 
+#[derive(Serialize)]
+struct MergeStateResponse {
+    project_id: String,
+    repositories: Vec<MergeStateRepository>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    discovery_diagnostics: Vec<MergeStateDiscoveryDiagnostic>,
+}
+
+#[derive(Serialize)]
+struct MergeStateDiscoveryDiagnostic {
+    path: String,
+    error: String,
+}
+
 /// `GET /projects/{project_id}/worktrees/merge-state`
 ///
 /// Read-only for the repository: local Git objects only, never a fetch, never a
 /// ref mutation. A missing base, timeout or Git error degrades that entry to
 /// `unknown` rather than failing the request. The optional forge pass may only
 /// upgrade a locally-unproven `in_progress` to `merged` and never fails the call.
+/// Partial discovery and discovered paths that could not be evaluated are
+/// reported in `discovery_diagnostics`.
 pub async fn merge_state(
     state: web::Data<AppState>,
     id: web::Path<String>,
@@ -439,29 +459,42 @@ pub async fn merge_state(
     // An unrecognised value falls back to the default: this is a presentation
     // hint, not a command, so a typo must not fail the inventory.
     let forge_mode = query.forge.as_deref() != Some("off");
-    let mut repositories = blocking(move || {
+    let (mut repositories, mut diagnostics) = blocking(move || {
         let deadline = std::time::Instant::now() + merge_state::SCAN_BUDGET;
         let mut repositories = Vec::new();
+        let mut diagnostics = Vec::new();
         let mut seen = HashSet::new();
         for source in project.workspace_roots() {
-            // Same scoping rule as `list`: only namespaces this Project owns.
             let root = PathBuf::from(source);
-            // A registered root may be a checkout or a container of several
-            // repositories. Assuming it is always a checkout would return no
-            // state for a container Project whose checkouts the inventory does
-            // list, so discover within the root, bounded like everything here.
-            for path in merge_state::discover_bounded(&root, deadline) {
-                let Ok(common) = merge_state::repository_bounded(&path, deadline) else {
+            let discovered = git::discover_until(&root, deadline);
+            diagnostics.extend(discovered.diagnostics);
+            for path in discovered.repositories {
+                if std::time::Instant::now() >= deadline {
+                    diagnostics.push((
+                        path,
+                        "Merge-state budget exhausted; this repository was not evaluated".into(),
+                    ));
                     continue;
+                }
+                let common = match git::repository_until(&path, deadline) {
+                    Ok(common) => common,
+                    Err(error) => {
+                        diagnostics.push((path, error));
+                        continue;
+                    }
                 };
                 // Several bound roots may resolve to one repository.
-                if !seen.insert(common) {
+                if !seen.insert(common.clone()) {
                     continue;
                 }
                 let label = git::path_label(&path);
                 // A forge answer is only meaningful when the remote names one
                 // this build may query; resolve that once per repository.
-                let remote = forge::github_remote(&path);
+                let remote = if forge_mode {
+                    forge::github_remote(&path, deadline)
+                } else {
+                    Err(forge::ForgeReason::NotRequired)
+                };
                 let base = match merge_state::merge_base(&path, deadline) {
                     Ok(base) => base,
                     Err(reason) => {
@@ -476,22 +509,46 @@ pub async fn merge_state(
                         continue;
                     }
                 };
-                // The primary checkout is the workspace itself, never outstanding work.
-                let main_checkout = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                let entries = match merge_state::list_metadata(&path, deadline) {
-                    Ok(entries) => entries,
-                    Err(_) => {
-                        repositories.push(ComputedRepository {
-                            path: label,
-                            base_ref: Some(base.label()),
-                            base_commit: Some(base.commit.clone()),
-                            error: Some("inventory_unavailable"),
-                            remote,
-                            entries: Vec::new(),
-                        });
-                        continue;
+                let (mut main_checkout, mut entries) =
+                    match merge_state::list_metadata(&path, deadline) {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            repositories.push(ComputedRepository {
+                                path: label,
+                                base_ref: Some(base.label()),
+                                base_commit: Some(base.commit.clone()),
+                                error: Some("inventory_unavailable"),
+                                remote,
+                                entries: Vec::new(),
+                            });
+                            continue;
+                        }
+                    };
+                // Git can report the common metadata directory as its main
+                // record. Use the same checkout binding proof as inventory.
+                if main_checkout.as_deref() == Some(common.as_path()) {
+                    main_checkout = None;
+                    if let Some(entry) = entries.first_mut().filter(|entry| !entry.bare) {
+                        let checkout = if std::time::Instant::now() < deadline {
+                            git::main_worktree_by(&path, &common, deadline)
+                        } else {
+                            Err(
+                                "Merge-state budget exhausted; the main checkout was not verified"
+                                    .into(),
+                            )
+                        };
+                        match checkout {
+                            Ok(checkout) => {
+                                entry.path.clone_from(&checkout);
+                                main_checkout = Some(checkout);
+                            }
+                            Err(error) => {
+                                diagnostics.push((path.clone(), error));
+                                entries.remove(0);
+                            }
+                        }
                     }
-                };
+                }
                 let entries = entries
                     .into_iter()
                     .filter(|entry| entry.path.to_str().is_some())
@@ -499,7 +556,7 @@ pub async fn merge_state(
                         let verdict = merge_state::merge_verdict(
                             &path,
                             &entry,
-                            &main_checkout,
+                            main_checkout.as_deref(),
                             &base,
                             // Never a fresh full allowance: the request budget bounds
                             // every entry, so later entries degrade promptly.
@@ -525,7 +582,7 @@ pub async fn merge_state(
                 });
             }
         }
-        Ok(repositories)
+        Ok((repositories, diagnostics))
     })
     .await?;
 
@@ -554,10 +611,20 @@ pub async fn merge_state(
                 .collect(),
         })
         .collect();
-    Ok(HttpResponse::Ok().json(json!({
-        "project_id": project_id,
-        "repositories": repositories,
-    })))
+    diagnostics.sort_unstable();
+    diagnostics.dedup();
+    let discovery_diagnostics = diagnostics
+        .into_iter()
+        .map(|(path, error)| MergeStateDiscoveryDiagnostic {
+            path: git::path_label(&path),
+            error,
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(MergeStateResponse {
+        project_id,
+        repositories,
+        discovery_diagnostics,
+    }))
 }
 
 /// Record one forge reason on every entry that would have benefited from a query.

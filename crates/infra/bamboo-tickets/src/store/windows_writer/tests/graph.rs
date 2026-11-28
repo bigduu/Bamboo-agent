@@ -360,6 +360,7 @@ fn sample(sequence: u64, title: &str) -> Snapshot {
                 user_acceptance_required: false,
                 allowed_tools: Default::default(),
             },
+            draft_brief: None,
             priority: Default::default(),
             expected_completion_at: None,
             state: WorkState::Draft,

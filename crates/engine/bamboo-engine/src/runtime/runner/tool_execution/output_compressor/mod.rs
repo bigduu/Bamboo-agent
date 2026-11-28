@@ -480,6 +480,14 @@ pub(super) async fn maybe_compress(
         .as_ref()
         .map(|tool| tool.execution_name())
         .unwrap_or(tool_name);
+    let reads_history_slice = outcome.portable_tool.as_ref().is_some_and(|tool| {
+        tool.execution_name() == "session_history_current"
+            && tool
+                .input()
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                == Some("read_slice")
+    });
     let exec_session = matches!(execution_name, "exec_command" | "write_stdin");
     let result = match outcome.result {
         Ok(ref mut result) => result,
@@ -487,7 +495,7 @@ pub(super) async fn maybe_compress(
     };
 
     let scenario = detect_scenario(tool_name, args_json);
-    if scenario != OutputScenario::PassThrough {
+    if !reads_history_slice && scenario != OutputScenario::PassThrough {
         let original = result.result.clone();
         let base_tier = classify_tier(&original);
         let tier = adjust_tier_for_pressure(base_tier, context_pressure.as_ref());
@@ -522,6 +530,51 @@ pub(super) async fn maybe_compress(
         let counter = bamboo_compression::TiktokenTokenCounter::default();
         let tokens = counter.count_text(&result.result);
         if tokens > max_tool_output_tokens {
+            if reads_history_slice && result.success {
+                // A successful page must never skip content by advertising the
+                // next offset after clipping the content of this page.
+                let unavailable = serde_json::from_str::<serde_json::Value>(&result.result)
+                    .ok()
+                    .is_some_and(|payload| {
+                        payload.get("action").and_then(serde_json::Value::as_str)
+                            == Some("read_slice")
+                            && payload
+                                .get("available")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(false)
+                    });
+                let (error, retry) = if unavailable {
+                    ("message_unavailable", "Message unavailable.")
+                } else {
+                    (
+                        "history_slice_exceeds_tool_output_budget",
+                        "Retry the same offset with smaller max_chars.",
+                    )
+                };
+                let failure = serde_json::json!({
+                    "error": error,
+                    "message": retry,
+                    "limit_tokens": max_tool_output_tokens,
+                })
+                .to_string();
+                result.success = false;
+                result.result = if counter.count_text(&failure) <= max_tool_output_tokens {
+                    failure
+                } else if counter.count_text(retry) <= max_tool_output_tokens {
+                    retry.to_owned()
+                } else {
+                    counter.truncate_to_token_prefix(
+                        if unavailable {
+                            "Unavailable."
+                        } else {
+                            "Retry."
+                        },
+                        max_tool_output_tokens,
+                    )
+                };
+                result.images.clear();
+                return outcome;
+            }
             let subagent_content_page = execution_name == "SubAgent"
                 && result.success
                 && serde_json::from_str::<serde_json::Value>(&result.result)
@@ -1083,6 +1136,87 @@ mod tests {
         .unwrap();
         assert!(foreign.success);
         assert!(foreign.result.contains("tool output truncated"));
+    }
+
+    #[tokio::test]
+    async fn history_slice_over_budget_fails_without_advancing_its_offset() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+
+        let raw = serde_json::json!({
+            "contract_version":1, "action":"read_slice", "available":true,
+            "message_id":"message-1", "role":"tool", "archived":false,
+            "offset":100, "next_offset":1700, "total_chars":4400,
+            "content_sha256":"a".repeat(64), "content":"界🦀".repeat(800),
+        })
+        .to_string();
+        let counter = TiktokenTokenCounter::default();
+        assert!(counter.count_text(&raw) > 128);
+        let make_outcome = |execution_name, action| ToolExecutionOutcome {
+            output_cap: None,
+            permission_replay_origin: None,
+            result: Ok(ToolResult::text(true, raw.clone())),
+            needs_human: None,
+            portable_tool: Some(
+                super::super::per_call::PortableToolExecution::with_input_fixture(
+                    execution_name,
+                    serde_json::json!({"action":action,"offset":100}),
+                ),
+            ),
+            post_tool_hook_eligible: true,
+            managed_running_violation: false,
+            tool_duration: std::time::Duration::ZERO,
+        };
+        let compress = |cap, execution_name, action| {
+            maybe_compress(
+                "default::session_history_current",
+                r#"{"action":"read_slice","offset":100}"#,
+                "history-slice-cap",
+                make_outcome(execution_name, action),
+                cap,
+                None,
+                None,
+            )
+        };
+
+        let bounded = compress(128, "session_history_current", "read_slice")
+            .await
+            .result
+            .unwrap();
+        assert!(!bounded.success);
+        assert!(counter.count_text(&bounded.result) <= 128);
+        let failure: serde_json::Value = serde_json::from_str(&bounded.result).unwrap();
+        assert_eq!(failure["error"], "history_slice_exceeds_tool_output_budget");
+        assert_eq!(
+            failure["message"],
+            "Retry the same offset with smaller max_chars."
+        );
+        assert!(failure.get("next_offset").is_none());
+        assert!(failure.get("content").is_none());
+
+        let tiny = compress(1, "session_history_current", "read_slice")
+            .await
+            .result
+            .unwrap();
+        assert!(!tiny.success);
+        assert!(counter.count_text(&tiny.result) <= 1);
+
+        for cap in [0, counter.count_text(&raw)] {
+            let fits = compress(cap, "session_history_current", "read_slice")
+                .await
+                .result
+                .unwrap();
+            assert!(fits.success);
+            assert_eq!(fits.result, raw);
+        }
+
+        for (execution_name, action) in [
+            ("vendor::session_history_current", "read_slice"),
+            ("session_history_current", "read_around"),
+        ] {
+            let other = compress(128, execution_name, action).await.result.unwrap();
+            assert!(other.success);
+            assert!(other.result.contains("tool output truncated"));
+        }
     }
 
     #[tokio::test]

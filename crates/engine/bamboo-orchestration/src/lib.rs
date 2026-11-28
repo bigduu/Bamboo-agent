@@ -8,6 +8,7 @@ pub mod handoff;
 pub mod managed_session;
 pub mod managed_work;
 pub mod patrol;
+pub mod project_scan;
 pub mod work_lifetime;
 pub mod work_review;
 

@@ -7,7 +7,7 @@
 //! crate still warns, since the blanket crate-level allow was removed.
 #![allow(dead_code)]
 
-use chrono::{DateTime, NaiveTime, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveTime, SecondsFormat, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 fn default_allow_custom() -> bool {
@@ -823,13 +823,20 @@ pub struct ToolInfo {
 /// Flat, display-oriented schedule used by the Schedules tab. Built from the
 /// server's richer `ScheduleView` via [`Schedule::from_view`] — the server has
 /// no flat `cron`/`prompt` fields, so we project its `trigger`/`state` into the
-/// handful of fields the list actually renders.
+/// fields the list and schedule editors use.
 #[derive(Debug, Clone)]
 pub struct Schedule {
     pub id: String,
     pub name: Option<String>,
     pub cron: Option<String>,
+    pub cron_expression: Option<String>,
     pub cadence_detail: Option<String>,
+    pub interval_seconds: Option<u64>,
+    pub daily_time: Option<ScheduleClockTime>,
+    pub weekly_time: Option<ScheduleWeeklyTime>,
+    pub monthly_time: Option<ScheduleMonthlyTime>,
+    pub once_at: Option<DateTime<Utc>>,
+    pub timezone: Option<String>,
     pub enabled: Option<bool>,
     pub prompt: Option<String>,
     pub last_run: Option<DateTime<Utc>>,
@@ -838,17 +845,182 @@ pub struct Schedule {
 
 impl Schedule {
     pub fn from_view(v: ScheduleView) -> Self {
+        let interval_seconds =
+            if v.trigger.get("type").and_then(|tag| tag.as_str()) == Some("interval") {
+                v.trigger
+                    .get("every_seconds")
+                    .and_then(|period| period.as_u64())
+                    .filter(|&period| is_valid_schedule_interval(period))
+            } else {
+                None
+            };
+        let ordinary = v.run_config.workflow_target.is_none();
+        let cron_expression =
+            if ordinary && v.trigger.get("type").and_then(|tag| tag.as_str()) == Some("cron") {
+                v.trigger
+                    .get("expr")
+                    .and_then(|expr| expr.as_str())
+                    .filter(|expr| !expr.trim().is_empty())
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+        let once_at = v
+            .state
+            .next_fire_at
+            .filter(|_| {
+                ordinary && v.trigger.get("type").and_then(|tag| tag.as_str()) == Some("once")
+            })
+            .and_then(|_| v.trigger.get("at"))
+            .and_then(|at| DateTime::<Utc>::deserialize(at).ok());
+        let (daily_time, weekly_time, monthly_time) = if ordinary
+            && matches!(
+                v.trigger.get("type").and_then(|tag| tag.as_str()),
+                Some("daily" | "weekly" | "monthly")
+            ) {
+            match ScheduleTriggerReq::deserialize(&v.trigger).ok() {
+                Some(ScheduleTriggerReq::Daily {
+                    hour,
+                    minute,
+                    second,
+                }) => (ScheduleClockTime::new(hour, minute, second), None, None),
+                Some(ScheduleTriggerReq::Weekly {
+                    weekdays,
+                    hour,
+                    minute,
+                    second,
+                }) if !weekdays.is_empty() => (
+                    None,
+                    ScheduleClockTime::new(hour, minute, second)
+                        .map(|time| ScheduleWeeklyTime { time, weekdays }),
+                    None,
+                ),
+                Some(ScheduleTriggerReq::Monthly {
+                    days,
+                    hour,
+                    minute,
+                    second,
+                }) if valid_schedule_month_days(&days) => (
+                    None,
+                    None,
+                    ScheduleClockTime::new(hour, minute, second)
+                        .map(|time| ScheduleMonthlyTime { time, days }),
+                ),
+                _ => (None, None, None),
+            }
+        } else {
+            (None, None, None)
+        };
+        let prompt = if ordinary {
+            v.run_config.task_message
+        } else {
+            None
+        };
         Self {
             cron: Some(trigger_display(&v.trigger)),
+            cron_expression,
             cadence_detail: Some(trigger_cadence(v.trigger, v.timezone.as_deref())),
+            interval_seconds,
+            daily_time,
+            weekly_time,
+            monthly_time,
+            once_at,
+            timezone: v.timezone,
             name: Some(v.name),
             enabled: Some(v.enabled),
-            prompt: v.run_config.task_message,
+            prompt,
             last_run: v.state.last_finished_at,
             next_run: v.state.next_fire_at,
             id: v.id,
         }
     }
+
+    pub(crate) fn clock_time(&self, kind: ScheduleClockKind) -> Option<ScheduleClockTime> {
+        match kind {
+            ScheduleClockKind::Daily => self.daily_time,
+            ScheduleClockKind::Weekly => self.weekly_time.as_ref().map(|weekly| weekly.time),
+            ScheduleClockKind::Monthly => self.monthly_time.as_ref().map(|monthly| monthly.time),
+        }
+    }
+
+    pub(crate) fn upcoming_once_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.once_at.filter(|&at| {
+            self.next_run.is_some_and(|next| next > now) && schedule_once_rfc3339_time(at).is_some()
+        })
+    }
+}
+
+fn schedule_once_rfc3339_time(at: DateTime<Utc>) -> Option<DateTime<FixedOffset>> {
+    const MAX_RFC3339_OFFSET_SECONDS: i32 = 23 * 3600 + 59 * 60;
+    // UTC normalization can move a valid four-digit local timestamp across
+    // the RFC3339 year boundary. Use a legal offset that maps it back.
+    let offset = match at.year() {
+        0..=9999 => return Some(at.fixed_offset()),
+        -1 => FixedOffset::east_opt(MAX_RFC3339_OFFSET_SECONDS)?,
+        10000 => FixedOffset::west_opt(MAX_RFC3339_OFFSET_SECONDS)?,
+        _ => return None,
+    };
+    let local = at.with_timezone(&offset);
+    (0..=9999).contains(&local.year()).then_some(local)
+}
+
+pub(crate) fn format_schedule_once_at(at: DateTime<Utc>) -> Option<String> {
+    schedule_once_rfc3339_time(at).map(|value| value.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScheduleClockKind {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl ScheduleClockKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Daily => "Daily",
+            Self::Weekly => "Weekly",
+            Self::Monthly => "Monthly",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScheduleClockTime {
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+impl ScheduleClockTime {
+    pub(crate) fn new(hour: u8, minute: u8, second: u8) -> Option<Self> {
+        NaiveTime::from_hms_opt(hour.into(), minute.into(), second.into())?;
+        Some(Self {
+            hour,
+            minute,
+            second,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleWeeklyTime {
+    pub time: ScheduleClockTime,
+    pub weekdays: Vec<ScheduleWeekdayReq>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleMonthlyTime {
+    pub time: ScheduleClockTime,
+    pub days: Vec<u8>,
+}
+
+pub(crate) fn is_valid_schedule_interval(every_seconds: u64) -> bool {
+    every_seconds > 0
+        && i64::try_from(every_seconds)
+            .ok()
+            .and_then(TimeDelta::try_seconds)
+            .is_some()
 }
 
 /// Human-readable one-liner for a schedule trigger. Cron triggers show their
@@ -907,18 +1079,12 @@ fn known_trigger_cadence(trigger: ScheduleTriggerReq, timezone: Option<&str>) ->
             format!("Daily {} {}", cadence_time(hour, minute, second)?, zone())
         }
         ScheduleTriggerReq::Weekly {
-            mut weekdays,
+            weekdays,
             hour,
             minute,
             second,
         } if !weekdays.is_empty() => {
-            weekdays.sort_unstable();
-            weekdays.dedup();
-            let days = weekdays
-                .iter()
-                .map(ScheduleWeekdayReq::short_name)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let days = format_schedule_weekdays(&weekdays);
             format!(
                 "Weekly {days} at {} {}",
                 cadence_time(hour, minute, second)?,
@@ -926,14 +1092,12 @@ fn known_trigger_cadence(trigger: ScheduleTriggerReq, timezone: Option<&str>) ->
             )
         }
         ScheduleTriggerReq::Monthly {
-            mut days,
+            days,
             hour,
             minute,
             second,
-        } if !days.is_empty() && days.iter().all(|day| (1..=31).contains(day)) => {
-            days.sort_unstable();
-            days.dedup();
-            let days = month_day_choices(&days);
+        } if valid_schedule_month_days(&days) => {
+            let days = format_schedule_month_days(&days);
             format!(
                 "Monthly {days} at {} {}",
                 cadence_time(hour, minute, second)?,
@@ -953,8 +1117,15 @@ fn cadence_time(hour: u8, minute: u8, second: u8) -> Option<String> {
     Some(time.format(format).to_string())
 }
 
-fn month_day_choices(days: &[u8]) -> String {
-    let mut days = days.iter().copied().peekable();
+fn valid_schedule_month_days(days: &[u8]) -> bool {
+    !days.is_empty() && days.iter().all(|day| (1..=31).contains(day))
+}
+
+pub(crate) fn format_schedule_month_days(days: &[u8]) -> String {
+    let mut sorted_days = days.to_vec();
+    sorted_days.sort_unstable();
+    sorted_days.dedup();
+    let mut days = sorted_days.into_iter().peekable();
     let mut choices = Vec::new();
     while let Some(first) = days.next() {
         let mut last = first;
@@ -1077,6 +1248,8 @@ pub struct ScheduleRunConfigView {
     pub project_id: Option<String>,
     #[serde(default)]
     pub task_message: Option<String>,
+    #[serde(default)]
+    pub workflow_target: Option<serde_json::Value>,
 }
 
 /// Body of `POST /api/v1/schedules`. Must match the server's
@@ -1129,7 +1302,7 @@ pub enum ScheduleTriggerReq {
     },
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleWeekdayReq {
     Mon,
@@ -1142,7 +1315,7 @@ pub enum ScheduleWeekdayReq {
 }
 
 impl ScheduleWeekdayReq {
-    fn short_name(&self) -> &'static str {
+    pub(crate) fn short_name(&self) -> &'static str {
         match self {
             Self::Mon => "Mon",
             Self::Tue => "Tue",
@@ -1153,6 +1326,16 @@ impl ScheduleWeekdayReq {
             Self::Sun => "Sun",
         }
     }
+}
+
+pub(crate) fn format_schedule_weekdays(weekdays: &[ScheduleWeekdayReq]) -> String {
+    let mut days: Vec<_> = weekdays.iter().collect();
+    days.sort_unstable();
+    days.dedup();
+    days.into_iter()
+        .map(ScheduleWeekdayReq::short_name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -1312,6 +1495,309 @@ pub struct SkillDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedule_projection_exposes_only_ordinary_saved_cron_expressions() {
+        let expression = " \t0  30 8 * * MON-FRI ";
+        let cron = serde_json::json!({"type":"cron","expr":expression});
+        let mut view = serde_json::json!({
+            "id": "cron-17",
+            "trigger": cron,
+            "timezone": "America/New_York",
+            "enabled": false,
+            "state": {"next_fire_at":"2030-04-01T12:30:00Z"},
+            "run_config": {"task_message":"Review results"},
+        });
+        let saved = Schedule::from_view(serde_json::from_value(view.clone()).unwrap());
+        assert_eq!(saved.cron_expression.as_deref(), Some(expression));
+        assert_eq!(saved.cron.as_deref(), Some(expression));
+        assert_eq!(saved.timezone.as_deref(), Some("America/New_York"));
+        assert_eq!(
+            saved.next_run,
+            Some("2030-04-01T12:30:00Z".parse().unwrap())
+        );
+        assert_eq!(saved.enabled, Some(false));
+
+        view["run_config"]["workflow_target"] = serde_json::json!({"workflow_id":"review"});
+        let workflow = Schedule::from_view(serde_json::from_value(view.clone()).unwrap());
+        assert_eq!(workflow.cron_expression, None);
+        assert_eq!(workflow.cron.as_deref(), Some(expression));
+
+        view["run_config"] = serde_json::json!({});
+        for trigger in [
+            serde_json::json!({"type":"future","expr":expression}),
+            serde_json::json!({"type":"cron","expr":" \t "}),
+            serde_json::json!({"type":"cron","expr":42}),
+            serde_json::json!({"type":"cron"}),
+        ] {
+            view["trigger"] = trigger;
+            let saved = Schedule::from_view(serde_json::from_value(view.clone()).unwrap());
+            assert_eq!(saved.cron_expression, None);
+        }
+    }
+
+    #[test]
+    fn schedule_projection_requires_an_ordinary_once_trigger_and_pending_state() {
+        let project = |trigger, next_fire_at, run_config| {
+            let view = serde_json::from_value(serde_json::json!({
+                "id": "once-17",
+                "enabled": false,
+                "trigger": trigger,
+                "state": {"next_fire_at": next_fire_at},
+                "run_config": run_config,
+            }))
+            .unwrap();
+            Schedule::from_view(view)
+        };
+        let raw_at = "2030-03-31T08:15:00.125+08:00";
+        let saved_at = DateTime::parse_from_rfc3339(raw_at).unwrap().to_utc();
+        let trigger = serde_json::json!({"type": "once", "at": raw_at});
+        let next = "2030-03-31T00:30:00Z";
+        let next_run = DateTime::parse_from_rfc3339(next).unwrap().to_utc();
+        let ordinary = serde_json::json!({"task_message": "Review results"});
+        let saved = project(trigger.clone(), Some(next), ordinary.clone());
+        assert_eq!(saved.once_at, Some(saved_at));
+        assert_eq!(saved.enabled, Some(false));
+        assert_eq!(saved.upcoming_once_at(saved_at), Some(saved_at));
+        assert_eq!(saved.upcoming_once_at(next_run), None);
+        assert_eq!(
+            saved.cadence_detail.as_deref(),
+            Some("Once 2030-03-31T00:15:00.125Z")
+        );
+        let unrepresentable = "+10000-01-02T00:00:00Z";
+        let legacy = project(
+            serde_json::json!({"type": "once", "at": unrepresentable}),
+            Some(unrepresentable),
+            ordinary.clone(),
+        );
+        assert!(legacy.once_at.is_some());
+        assert_eq!(legacy.upcoming_once_at(saved_at), None);
+        for (trigger, pending, config) in [
+            (trigger.clone(), None, ordinary.clone()),
+            (
+                trigger,
+                Some(next),
+                serde_json::json!({"workflow_target": {"workflow_id": "review"}}),
+            ),
+            (
+                serde_json::json!({"type": "daily", "at": raw_at}),
+                Some(next),
+                ordinary.clone(),
+            ),
+            (
+                serde_json::json!({"type": "once", "at": "not a timestamp"}),
+                Some(next),
+                ordinary,
+            ),
+        ] {
+            let saved = project(trigger, pending, config);
+            assert_eq!(saved.once_at, None);
+            assert_eq!(saved.upcoming_once_at(saved_at), None);
+        }
+    }
+
+    #[test]
+    fn once_timestamp_format_keeps_instants_that_cross_the_rfc3339_years() {
+        for timestamp in [
+            "9999-12-31T23:59:59.125-23:59",
+            "0000-01-01T00:00:00.125+23:59",
+        ] {
+            let at = DateTime::parse_from_rfc3339(timestamp).unwrap().to_utc();
+            assert_eq!(format_schedule_once_at(at).as_deref(), Some(timestamp));
+        }
+        let at = "+10000-01-02T00:00:00Z".parse().unwrap();
+        assert_eq!(format_schedule_once_at(at), None);
+    }
+
+    #[test]
+    fn schedule_projection_exposes_only_valid_typed_interval_periods() {
+        for (trigger, expected) in [
+            (None, None),
+            (
+                Some(serde_json::json!({"type":"interval","every_seconds":1})),
+                Some(1),
+            ),
+            (
+                Some(serde_json::json!({"type":"interval","every_seconds":0})),
+                None,
+            ),
+            (
+                Some(serde_json::json!({"type":"interval","every_seconds":"90"})),
+                None,
+            ),
+            (
+                Some(serde_json::json!({"type":"interval","every_seconds":i64::MAX})),
+                None,
+            ),
+            (
+                Some(serde_json::json!({"type":"future","every_seconds":90})),
+                None,
+            ),
+        ] {
+            let mut body = serde_json::json!({ "id": "schedule-17" });
+            if let Some(trigger) = trigger {
+                body["trigger"] = trigger;
+            }
+            let view: ScheduleView = serde_json::from_value(body).unwrap();
+            assert_eq!(Schedule::from_view(view).interval_seconds, expected);
+        }
+    }
+
+    #[test]
+    fn schedule_projection_exposes_valid_daily_clocks_and_saved_timezones() {
+        let project = |trigger, timezone, run_config| {
+            let view: ScheduleView = serde_json::from_value(serde_json::json!({
+                "id": "schedule-17",
+                "trigger": trigger,
+                "timezone": timezone,
+                "run_config": run_config,
+            }))
+            .unwrap();
+            Schedule::from_view(view)
+        };
+        let saved = project(
+            serde_json::json!({"type":"daily","hour":8,"minute":42,"second":31}),
+            Some("Asia/Shanghai"),
+            serde_json::json!({}),
+        );
+        assert_eq!(saved.daily_time, ScheduleClockTime::new(8, 42, 31));
+        assert_eq!(saved.timezone.as_deref(), Some("Asia/Shanghai"));
+        let legacy = project(
+            serde_json::json!({"type":"daily","hour":8,"minute":42}),
+            None,
+            serde_json::json!({}),
+        );
+        assert_eq!(legacy.daily_time, ScheduleClockTime::new(8, 42, 0));
+        assert_eq!(legacy.timezone, None);
+        assert_eq!(legacy.cadence_detail.as_deref(), Some("Daily 08:42 UTC"));
+
+        for trigger in [
+            serde_json::json!({"type":"daily","hour":24,"minute":0}),
+            serde_json::json!({"type":"daily","hour":8,"minute":60}),
+            serde_json::json!({"type":"daily","hour":8,"minute":0,"second":60}),
+            serde_json::json!({"type":"daily","hour":8,"minute":0,"second":null}),
+            serde_json::json!({"type":"daily","hour":8}),
+            serde_json::json!({"type":"future","hour":8,"minute":0}),
+        ] {
+            assert_eq!(
+                project(trigger, None, serde_json::json!({})).daily_time,
+                None
+            );
+        }
+        assert_eq!(
+            project(
+                serde_json::json!({"type":"daily","hour":8,"minute":0}),
+                None,
+                serde_json::json!({"workflow_target":{"workflow_id":"example"}}),
+            )
+            .daily_time,
+            None
+        );
+    }
+
+    #[test]
+    fn schedule_projection_exposes_only_valid_ordinary_weekly_clocks() {
+        let project = |trigger, run_config| {
+            let view = serde_json::from_value(serde_json::json!({
+                "id": "schedule-17",
+                "trigger": trigger,
+                "timezone": "Asia/Shanghai",
+                "run_config": run_config,
+            }))
+            .unwrap();
+            Schedule::from_view(view)
+        };
+        let trigger = serde_json::json!({
+            "type": "weekly", "weekdays": ["fri", "mon", "fri"], "hour": 8, "minute": 42
+        });
+        let saved = project(trigger.clone(), serde_json::json!({}));
+        assert_eq!(
+            saved.clock_time(ScheduleClockKind::Weekly),
+            ScheduleClockTime::new(8, 42, 0)
+        );
+        assert_eq!(saved.clock_time(ScheduleClockKind::Daily), None);
+        assert_eq!(saved.timezone.as_deref(), Some("Asia/Shanghai"));
+        let weekdays = saved.weekly_time.unwrap().weekdays;
+        assert_eq!(
+            weekdays,
+            [
+                ScheduleWeekdayReq::Fri,
+                ScheduleWeekdayReq::Mon,
+                ScheduleWeekdayReq::Fri,
+            ]
+        );
+        assert_eq!(format_schedule_weekdays(&weekdays), "Mon, Fri");
+        assert!(project(
+            trigger.clone(),
+            serde_json::json!({"workflow_target":{"workflow_id":"review"}}),
+        )
+        .weekly_time
+        .is_none());
+        for (field, invalid) in [
+            ("weekdays", serde_json::json!([])),
+            ("weekdays", serde_json::json!(["unknown"])),
+            ("hour", serde_json::json!(24)),
+            ("minute", serde_json::json!(60)),
+            ("second", serde_json::json!(null)),
+        ] {
+            let mut malformed = trigger.clone();
+            malformed[field] = invalid;
+            assert!(project(malformed, serde_json::json!({}))
+                .weekly_time
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn schedule_projection_exposes_valid_ordinary_monthly_clocks_and_exact_days() {
+        let project = |trigger, run_config| {
+            let view = serde_json::from_value(serde_json::json!({
+                "id": "schedule-17",
+                "trigger": trigger,
+                "timezone": "Asia/Shanghai",
+                "run_config": run_config,
+            }))
+            .unwrap();
+            Schedule::from_view(view)
+        };
+        let trigger = serde_json::json!({
+            "type": "monthly", "days": [31, 2, 1, 15, 31], "hour": 8, "minute": 42
+        });
+        let saved = project(trigger.clone(), serde_json::json!({}));
+        assert_eq!(
+            saved.clock_time(ScheduleClockKind::Monthly),
+            ScheduleClockTime::new(8, 42, 0)
+        );
+        assert_eq!(saved.clock_time(ScheduleClockKind::Daily), None);
+        assert_eq!(saved.clock_time(ScheduleClockKind::Weekly), None);
+        assert_eq!(saved.timezone.as_deref(), Some("Asia/Shanghai"));
+        let days = saved.monthly_time.unwrap().days;
+        assert_eq!(days, [31, 2, 1, 15, 31]);
+        assert_eq!(format_schedule_month_days(&days), "1–2, 15, 31");
+        assert_eq!(
+            saved.cadence_detail.as_deref(),
+            Some("Monthly 1–2, 15, 31 at 08:42 Asia/Shanghai")
+        );
+        assert!(project(
+            trigger.clone(),
+            serde_json::json!({"workflow_target":{"workflow_id":"review"}}),
+        )
+        .monthly_time
+        .is_none());
+        for (field, invalid) in [
+            ("days", serde_json::json!([])),
+            ("days", serde_json::json!([0])),
+            ("days", serde_json::json!([1, 32])),
+            ("hour", serde_json::json!(24)),
+            ("second", serde_json::json!(null)),
+        ] {
+            let mut malformed = trigger.clone();
+            malformed[field] = invalid;
+            assert!(project(malformed, serde_json::json!({}))
+                .monthly_time
+                .is_none());
+        }
+    }
 
     #[test]
     fn cadence_projection_keeps_calendar_choices_readable_and_bounded() {

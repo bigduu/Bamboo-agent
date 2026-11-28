@@ -17,27 +17,30 @@ const HANDOFF_GUIDANCE: &str =
     "Finish with a handoff covering each acceptance item and any open findings for Supervisor review.";
 
 pub const WORK_HANDOFF_GUIDANCE: &str = concat!(
+    "Put the full text of any requested checklist, note, or Markdown deliverable in the final reply. The Host saves that reply on the original Work as the artifact and computes its hash. ",
+    "Submit once the deliverable is ready. The designated user reviews and accepts the submission from the Work card afterward. Ask a question only if an essential input prevents you from producing the deliverable. ",
     "Verify each acceptance item with the tools and evidence authorized for this Work. ",
     "In the final reply, give each item's status (passed, failed, or unverified), the check actually performed, its result, and an evidence reference when available. ",
     "For code changes, give the changed paths and the exact commit SHA if one exists. ",
     "For failed or unverified items, state the blocker and the next authorized check or decision. ",
-    "Submit this handoff for Supervisor review and leave final acceptance to the designated authority."
+    "Give the Supervisor the handoff and evidence needed to review the submission."
 );
 
 pub fn validate_start(spec: &DispatchSpec) -> Result<()> {
-    if spec.workspace.is_none()
-        || !spec.contract.allowed_tools.contains("Task")
-        || spec
-            .contract
-            .allowed_tools
-            .iter()
-            .any(|tool| !matches!(tool.as_str(), "Read" | "Task"))
-    {
+    if spec.workspace.is_none() || !supports_contract(&spec.contract) {
         return Err(Error::ScopeDenied(
             "Managed Work requires an explicit worktree and a Task or Read/Task contract".into(),
         ));
     }
     Ok(())
+}
+
+pub(crate) fn supports_contract(contract: &Contract) -> bool {
+    contract.allowed_tools.contains("Task")
+        && contract
+            .allowed_tools
+            .iter()
+            .all(|tool| matches!(tool.as_str(), "Read" | "Task"))
 }
 
 pub fn first_instruction(
@@ -421,6 +424,7 @@ mod tests {
                 user_acceptance_required: false,
                 allowed_tools: ["Task".into()].into(),
             },
+            draft_brief: None,
             workspace: Some(ExecutionWorkspace {
                 repo: "fixture".into(),
                 base_commit: "base".into(),

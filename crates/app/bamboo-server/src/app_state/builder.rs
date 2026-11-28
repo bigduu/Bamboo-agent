@@ -704,7 +704,8 @@ impl AppState {
         // Build one creation service before shared tools. Both the generic
         // caller port and Supervisor controls retain this same durable writer.
         let project_context_source = Arc::new(
-            crate::project_context::ProjectStoreContextSource::new(project_store.clone()),
+            crate::project_context::ProjectStoreContextSource::new(project_store.clone())
+                .with_session_storage(storage.clone()),
         );
         let project_context_resolver = Arc::new(
             bamboo_engine::project_context::ProjectContextResolver::new_with_workspace_resolver(
@@ -723,7 +724,11 @@ impl AppState {
             messenger: session_messenger.clone(),
             account: account_sink.clone(),
         });
-        tickets.bind_managed_work_host(root_creator.clone(), provider_registry.clone());
+        tickets.bind_managed_work_host(
+            root_creator.clone(),
+            persistence.clone(),
+            provider_registry.clone(),
+        );
         let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
         let workflow_workspace_scope_guard =
             Arc::new(crate::workflow::WorkflowWorkspaceScopeGuard::default());
@@ -910,7 +915,8 @@ impl AppState {
                 data_dir.clone(),
                 Some(account_sink.inbox()),
             )
-            .with_root_account_sink(account_sink.clone()),
+            .with_root_account_sink(account_sink.clone())
+            .with_ticket_draft_publisher(tickets.clone()),
         );
         session_activation_router
             .set_spawner(child_completion_coordinator.clone())
@@ -1488,6 +1494,7 @@ impl AppState {
             ),
         );
         if startup.start_inbox_reconciler() {
+            tickets.spawn_project_scans(mcp_proxy_shutdown.clone());
             observer_subscriptions.spawn_material_notifications(mcp_proxy_shutdown.clone());
             observer_subscriptions.tick(chrono::Utc::now()).await;
             // Reconcile exact Inbox wake readiness before serving, then pace

@@ -71,10 +71,54 @@ pub(crate) struct LoopChatRecord {
 }
 
 #[derive(serde::Deserialize)]
-struct SessionLoopStatus {
+#[serde(bound(deserialize = "T: serde::Deserialize<'de>"))]
+struct SessionLoopStatus<T> {
     session_id: String,
     #[serde(rename = "loop", deserialize_with = "serde::Deserialize::deserialize")]
-    record: Option<LoopChatRecord>,
+    record: Option<T>,
+}
+
+#[derive(serde::Deserialize)]
+struct SelectedSessionLoopRecord {
+    #[serde(flatten)]
+    core: LoopChatRecord,
+    mode: Option<String>,
+    interval_seconds: Option<u64>,
+    iteration: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLoopPreview {
+    pub state: SessionLoopPreviewState,
+    pub next_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub mode: Option<SessionLoopPreviewMode>,
+    pub iteration: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLoopPreviewMode {
+    Fixed { interval_seconds: Option<u64> },
+    Adaptive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLoopPreviewState {
+    Scheduled,
+    Paused,
+    Stopped,
+    Expired,
+}
+
+impl SessionLoopPreviewState {
+    fn from_wire(state: &str) -> Option<Self> {
+        match state {
+            "scheduled" => Some(Self::Scheduled),
+            "paused" => Some(Self::Paused),
+            "stopped" => Some(Self::Stopped),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
 }
 
 impl LoopChatAcknowledgment {
@@ -305,47 +349,82 @@ fn parse_auto_resume_status(body: &str) -> std::result::Result<String, RespondFa
     }
 }
 
-const MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SCHEDULE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SESSION_LOOP_PREVIEW_BYTES: usize = 128 * 1024;
+const SCHEDULE_LIST_UNAVAILABLE: &str = "Could not load schedules. Reopen Schedules to try again.";
+const SCHEDULE_UNAVAILABLE_OR_CHANGED: &str =
+    "Schedule is unavailable or changed. Reopen Schedules.";
+const SCHEDULE_CREATE_UNCONFIRMED: &str =
+    "Could not confirm creation. Check Schedules before trying again.";
+const SCHEDULE_DELETE_UNCONFIRMED: &str =
+    "Could not confirm deletion. Check the schedule before trying again.";
+const SCHEDULE_RUN_UNCONFIRMED: &str =
+    "Could not confirm Run Now. Check Recent runs before trying again.";
 
-enum ScheduleBodyError {
+enum BoundedBodyError {
     TooLarge,
     Read(reqwest::Error),
 }
 
-async fn read_bounded_schedule_body(
+async fn read_bounded_body(
     mut response: reqwest::Response,
     limit: usize,
-) -> std::result::Result<Vec<u8>, ScheduleBodyError> {
+) -> std::result::Result<Vec<u8>, BoundedBodyError> {
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(ScheduleBodyError::TooLarge);
+        return Err(BoundedBodyError::TooLarge);
     }
 
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(ScheduleBodyError::Read)? {
+    while let Some(chunk) = response.chunk().await.map_err(BoundedBodyError::Read)? {
         if chunk.len() > limit - body.len() {
-            return Err(ScheduleBodyError::TooLarge);
+            return Err(BoundedBodyError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
 }
 
-async fn schedule_has_no_future_occurrence(response: reqwest::Response) -> bool {
+async fn schedule_response_code(response: reqwest::Response) -> Option<String> {
     const MAX_ERROR_BYTES: usize = 8 * 1024;
-    let Ok(body) = read_bounded_schedule_body(response, MAX_ERROR_BYTES).await else {
-        return false;
-    };
+    let body = read_bounded_body(response, MAX_ERROR_BYTES).await.ok()?;
     serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
-        .is_some_and(|error| {
+        .and_then(|error| {
             error
                 .pointer("/error/code")
                 .and_then(serde_json::Value::as_str)
-                == Some("schedule_no_future_occurrence")
+                .map(str::to_owned)
         })
+}
+
+async fn schedule_response_has_code(response: reqwest::Response, code: &str) -> bool {
+    schedule_response_code(response).await.as_deref() == Some(code)
+}
+
+async fn schedule_project_conflict(response: reqwest::Response) -> Option<&'static str> {
+    // A slow error body should not delay feedback in the Schedule views.
+    let code = tokio::time::timeout(Duration::from_millis(500), schedule_response_code(response))
+        .await
+        .ok()
+        .flatten()?;
+    match code.as_str() {
+        "project_archived" => Some("The schedule needs an active Project."),
+        "project_workspace_conflict" => {
+            Some("The workspace belongs to another Project. Check the Project settings.")
+        }
+        "project_path_missing" => Some("Set a workspace path for the schedule's Project."),
+        "project_path_unavailable" => {
+            Some("The Project workspace is unavailable. Check its path on the Host.")
+        }
+        _ => None,
+    }
+}
+
+fn schedule_action_unconfirmed(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT
 }
 
 #[derive(Clone)]
@@ -459,18 +538,22 @@ impl BambooClient {
         self.submit_chat(&req).await
     }
 
-    pub(crate) async fn session_loop_status(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<LoopChatRecord>> {
+    fn session_loop_url(&self, session_id: &str) -> Result<reqwest::Url> {
         let mut url = reqwest::Url::parse(&self.base_url)?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("Bamboo base URL cannot contain Session paths"))?
             .pop_if_empty()
             .extend(["api", "v1", "sessions", session_id, "loop"]);
+        Ok(url)
+    }
+
+    pub(crate) async fn session_loop_status(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<LoopChatRecord>> {
         let response = self
             .client
-            .get(url)
+            .get(self.session_loop_url(session_id)?)
             .header(reqwest::header::CACHE_CONTROL, "no-store")
             .send()
             .await?;
@@ -479,16 +562,102 @@ impl BambooClient {
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("Session loop status failed ({status}): {}", body.trim());
         }
-        let status: SessionLoopStatus = response.json().await?;
+        let status: SessionLoopStatus<LoopChatRecord> = response.json().await?;
         anyhow::ensure!(
             status.session_id == session_id
-                && status.record.as_ref().is_none_or(|record| matches!(
-                    record.state.as_str(),
-                    "scheduled" | "paused" | "stopped" | "expired"
-                )),
+                && status
+                    .record
+                    .as_ref()
+                    .is_none_or(
+                        |record| SessionLoopPreviewState::from_wire(&record.state).is_some()
+                    ),
             "Invalid Session loop status"
         );
         Ok(status.record)
+    }
+
+    /// Read the selected Session's paced loop for display in the Session list.
+    pub(crate) async fn selected_session_loop_status(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionLoopPreview>> {
+        anyhow::ensure!(
+            !session_id.trim().is_empty() && !matches!(session_id, "." | ".."),
+            "Invalid Session ID"
+        );
+        let url = self
+            .session_loop_url(session_id)
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?;
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not contact the Host for Session loop status"))?;
+        let response = client
+            .get(url)
+            .header(reqwest::header::CACHE_CONTROL, "no-store")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out waiting for Session loop status")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host for Session loop status")
+                }
+            })?;
+        let http_status = response.status();
+        anyhow::ensure!(
+            http_status == reqwest::StatusCode::OK,
+            "Could not fetch Session loop status (HTTP {})",
+            http_status.as_u16()
+        );
+        let body = read_bounded_body(response, MAX_SESSION_LOOP_PREVIEW_BYTES)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::TooLarge => {
+                    anyhow::anyhow!("Session loop status response is too large (128 KiB limit)")
+                }
+                BoundedBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for Session loop status")
+                }
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid Session loop status"),
+            })?;
+        // Serde structs also accept sequences. Check the object shape, then
+        // decode the original bytes so duplicate known fields are rejected.
+        let shape: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Session loop status"))?;
+        anyhow::ensure!(
+            matches!(
+                shape.get("loop"),
+                Some(serde_json::Value::Null | serde_json::Value::Object(_))
+            ),
+            "Invalid Session loop status"
+        );
+        let status: SessionLoopStatus<SelectedSessionLoopRecord> = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Session loop status"))?;
+        anyhow::ensure!(
+            status.session_id == session_id,
+            "Invalid Session loop status"
+        );
+        let Some(record) = status.record else {
+            return Ok(None);
+        };
+        let state = SessionLoopPreviewState::from_wire(&record.core.state)
+            .ok_or_else(|| anyhow::anyhow!("Invalid Session loop status"))?;
+        let mode = match record.mode.as_deref() {
+            Some("fixed") => Some(SessionLoopPreviewMode::Fixed {
+                interval_seconds: record.interval_seconds.filter(|&seconds| seconds > 0),
+            }),
+            Some("adaptive") => Some(SessionLoopPreviewMode::Adaptive),
+            _ => None,
+        };
+        Ok(Some(SessionLoopPreview {
+            state,
+            next_fire_at: record.core.next_fire_at,
+            mode,
+            iteration: record.iteration,
+        }))
     }
 
     async fn submit_chat(&self, req: &ChatRequest) -> Result<ChatSubmission> {
@@ -1075,13 +1244,26 @@ impl BambooClient {
             .client
             .get(self.url("/api/v1/schedules"))
             .send()
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!(SCHEDULE_LIST_UNAVAILABLE))?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("list schedules failed ({status}): {body}");
-        }
-        let parsed: ListSchedulesResponse = resp.json().await?;
+        anyhow::ensure!(
+            !schedule_action_unconfirmed(status),
+            SCHEDULE_LIST_UNAVAILABLE
+        );
+        anyhow::ensure!(
+            status.is_success(),
+            "The Host refused to load schedules. Reopen Schedules to try again."
+        );
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|_| anyhow::anyhow!(SCHEDULE_LIST_UNAVAILABLE))?;
+        let parsed: ListSchedulesResponse = serde_json::from_slice(&body).map_err(|_| {
+            anyhow::anyhow!(
+                "The Host returned an invalid schedule list. Reopen Schedules to try again."
+            )
+        })?;
         Ok(parsed
             .schedules
             .into_iter()
@@ -1154,10 +1336,591 @@ impl BambooClient {
             reply.view.enabled = reply.enabled;
             return Ok(Schedule::from_view(reply.view));
         }
-        if status == StatusCode::CONFLICT && schedule_has_no_future_occurrence(response).await {
+        if status == StatusCode::CONFLICT
+            && schedule_response_has_code(response, "schedule_no_future_occurrence").await
+        {
             anyhow::bail!("Schedule has no future occurrence");
         }
         anyhow::bail!("Could not update schedule (HTTP {})", status.as_u16());
+    }
+
+    pub(crate) async fn rename_schedule(&self, schedule_id: &str, name: &str) -> Result<String> {
+        use reqwest::StatusCode;
+
+        #[derive(serde::Deserialize)]
+        struct RenameReply {
+            id: String,
+            name: String,
+        }
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "Enter a schedule name");
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "name"]);
+        // The dedicated route guarantees that a rename preserves saved cadence.
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not connect to the Host to rename the schedule"))?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to rename the schedule")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to rename the schedule")
+                }
+            })?;
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            if schedule_response_has_code(response, "schedule_not_found").await {
+                anyhow::bail!("Schedule no longer exists");
+            }
+            anyhow::bail!("Renaming requires a newer Host");
+        }
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            anyhow::bail!("Renaming requires a newer Host");
+        }
+        anyhow::ensure!(
+            status == StatusCode::OK,
+            "Could not rename schedule (HTTP {})",
+            status.as_u16()
+        );
+
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::TooLarge => {
+                    anyhow::anyhow!("Schedule rename response is too large (2 MiB limit)")
+                }
+                BoundedBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for the schedule rename response")
+                }
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid schedule rename response"),
+            })?;
+        let reply: RenameReply = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid schedule rename response"))?;
+        anyhow::ensure!(
+            reply.id == schedule_id && reply.name == name,
+            "Schedule rename response does not match the request"
+        );
+        Ok(reply.name)
+    }
+
+    pub(crate) async fn update_schedule_interval(
+        &self,
+        schedule_id: &str,
+        every_seconds: u64,
+    ) -> Result<Schedule> {
+        use reqwest::StatusCode;
+
+        const INVALID_PERIOD: &str =
+            "Schedule interval must be a positive representable number of seconds";
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        anyhow::ensure!(
+            is_valid_schedule_interval(every_seconds),
+            "{INVALID_PERIOD}"
+        );
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "interval"]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| {
+                anyhow::anyhow!("Could not contact the Host to update the schedule interval")
+            })?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "every_seconds": every_seconds }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update the schedule interval")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update the schedule interval")
+                }
+            })?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let code = match status {
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                    schedule_response_code(response).await
+                }
+                _ => None,
+            };
+            let message = match (status, code.as_deref()) {
+                (StatusCode::BAD_REQUEST, Some("invalid_schedule_interval")) => INVALID_PERIOD,
+                (StatusCode::CONFLICT, Some("schedule_trigger_changed")) => {
+                    "Schedule is no longer an Interval schedule"
+                }
+                (StatusCode::CONFLICT, Some("schedule_no_future_occurrence")) => {
+                    "Schedule has no future occurrence"
+                }
+                (StatusCode::NOT_FOUND, Some("schedule_not_found")) => "Schedule no longer exists",
+                (StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED, _) => {
+                    "Editing the interval requires a newer Host"
+                }
+                _ => anyhow::bail!(
+                    "Could not update schedule interval (HTTP {})",
+                    status.as_u16()
+                ),
+            };
+            anyhow::bail!("{message}");
+        }
+
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::TooLarge => {
+                    anyhow::anyhow!("Schedule interval response is too large (2 MiB limit)")
+                }
+                BoundedBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for the schedule interval response")
+                }
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid schedule interval response"),
+            })?;
+        let view: ScheduleView = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid schedule interval response"))?;
+        let schedule = Schedule::from_view(view);
+        anyhow::ensure!(
+            schedule.id == schedule_id && schedule.interval_seconds == Some(every_seconds),
+            "Schedule interval response does not match the request"
+        );
+        Ok(schedule)
+    }
+
+    pub(crate) async fn update_schedule_clock_time(
+        &self,
+        schedule_id: &str,
+        kind: ScheduleClockKind,
+        time: ScheduleClockTime,
+    ) -> Result<Schedule> {
+        use reqwest::StatusCode;
+
+        let label = kind.label();
+        let (route, invalid_code) = match kind {
+            ScheduleClockKind::Daily => ("daily-time", "invalid_schedule_daily_time"),
+            ScheduleClockKind::Weekly => ("weekly-time", "invalid_schedule_weekly_time"),
+            ScheduleClockKind::Monthly => ("monthly-time", "invalid_schedule_monthly_time"),
+        };
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        anyhow::ensure!(
+            ScheduleClockTime::new(time.hour, time.minute, time.second).is_some(),
+            "Enter a {label} time in HH:MM or HH:MM:SS format"
+        );
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, route]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not contact the Host to update {label} time"))?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&time)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update {label} time")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update {label} time")
+                }
+            })?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let code = match status {
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                    schedule_response_code(response).await
+                }
+                _ => None,
+            };
+            match (status, code.as_deref()) {
+                (StatusCode::BAD_REQUEST, Some(code)) if code == invalid_code => {
+                    anyhow::bail!("Enter a {label} time in HH:MM or HH:MM:SS format")
+                }
+                (StatusCode::CONFLICT, Some("schedule_trigger_changed")) => {
+                    anyhow::bail!("Schedule is no longer a {label} schedule")
+                }
+                (StatusCode::CONFLICT, Some("schedule_no_future_occurrence")) => {
+                    anyhow::bail!("Schedule has no future occurrence")
+                }
+                (StatusCode::NOT_FOUND, Some("schedule_not_found")) => {
+                    anyhow::bail!("Schedule no longer exists")
+                }
+                (StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED, _) => {
+                    anyhow::bail!("Editing {label} time requires a newer Host")
+                }
+                _ => anyhow::bail!("Could not update {label} time (HTTP {})", status.as_u16()),
+            }
+        }
+
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::TooLarge => {
+                    anyhow::anyhow!("{label} time response is too large (2 MiB limit)")
+                }
+                BoundedBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for the {label} time response")
+                }
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid {label} time response"),
+            })?;
+        let receipt: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid {label} time response"))?;
+        // Save acknowledgements carry the state and run configuration. Keep
+        // their presence check separate from compatibility decoding of lists.
+        anyhow::ensure!(
+            receipt
+                .get("state")
+                .is_some_and(serde_json::Value::is_object)
+                && receipt
+                    .get("run_config")
+                    .is_some_and(serde_json::Value::is_object),
+            "Invalid {label} time response"
+        );
+        let view: ScheduleView = serde_json::from_value(receipt)
+            .map_err(|_| anyhow::anyhow!("Invalid {label} time response"))?;
+        // Canonical mutation replies include seconds. Older list rows may omit them.
+        let exact_time = <ScheduleClockTime as serde::Deserialize>::deserialize(&view.trigger).ok()
+            == Some(time);
+        let schedule = Schedule::from_view(view);
+        anyhow::ensure!(
+            schedule.id == schedule_id && schedule.clock_time(kind) == Some(time) && exact_time,
+            "{label} time response does not match the request"
+        );
+        Ok(schedule)
+    }
+
+    pub(crate) async fn update_schedule_cron_expression(
+        &self,
+        schedule_id: &str,
+        expression: &str,
+    ) -> Result<Schedule> {
+        use reqwest::StatusCode;
+
+        #[derive(serde::Deserialize)]
+        struct CronExpressionReceipt {
+            trigger: ScheduleTriggerReq,
+            #[serde(flatten)]
+            view: ScheduleView,
+        }
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        let expression = expression.trim();
+        anyhow::ensure!(!expression.is_empty(), "Enter a valid Cron expression");
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "cron-expression"]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| {
+                anyhow::anyhow!("Could not contact the Host to update the Cron expression")
+            })?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "expr": expression }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update the Cron expression")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update the Cron expression")
+                }
+            })?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let code = match status {
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                    schedule_response_code(response).await
+                }
+                _ => None,
+            };
+            match (status, code.as_deref()) {
+                (StatusCode::BAD_REQUEST, Some("invalid_schedule_cron")) => {
+                    anyhow::bail!("Enter a valid Cron expression")
+                }
+                (StatusCode::CONFLICT, Some("schedule_trigger_changed")) => {
+                    anyhow::bail!("Schedule is no longer an editable Cron Task schedule")
+                }
+                (StatusCode::CONFLICT, Some("schedule_no_future_occurrence")) => {
+                    anyhow::bail!("Schedule has no future occurrence")
+                }
+                (StatusCode::NOT_FOUND, Some("schedule_not_found")) => {
+                    anyhow::bail!("Schedule no longer exists")
+                }
+                (StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED, _) => {
+                    anyhow::bail!("Editing a Cron expression requires a newer Host")
+                }
+                _ => anyhow::bail!(
+                    "Could not update the Cron expression (HTTP {})",
+                    status.as_u16()
+                ),
+            }
+        }
+
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::TooLarge => {
+                    anyhow::anyhow!("Cron expression response is too large (2 MiB limit)")
+                }
+                BoundedBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for the Cron expression response")
+                }
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid Cron expression response"),
+            })?;
+        let shape: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Cron expression response"))?;
+        // Keep list-row defaults separate from a receipt that will replace the
+        // row. An exhausted no-op can omit the next timestamp.
+        anyhow::ensure!(
+            shape.get("name").is_some_and(serde_json::Value::is_string)
+                && shape
+                    .get("enabled")
+                    .is_some_and(serde_json::Value::is_boolean)
+                && shape.get("state").is_some_and(serde_json::Value::is_object)
+                && shape
+                    .get("run_config")
+                    .is_some_and(serde_json::Value::is_object),
+            "Invalid Cron expression response"
+        );
+        // Decode the original bytes with a typed trigger so conflicting
+        // known keys cannot be collapsed by the object shape check.
+        let CronExpressionReceipt { trigger, mut view } = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Cron expression response"))?;
+        let ScheduleTriggerReq::Cron { expr } = trigger else {
+            anyhow::bail!("Cron expression response does not match the request");
+        };
+        anyhow::ensure!(
+            view.id == schedule_id
+                && view.run_config.workflow_target.is_none()
+                && expr.trim() == expression,
+            "Cron expression response does not match the request"
+        );
+        view.trigger = serde_json::json!({ "type": "cron", "expr": expr });
+        Ok(Schedule::from_view(view))
+    }
+
+    pub(crate) async fn update_schedule_once_at(
+        &self,
+        schedule_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Schedule> {
+        use reqwest::StatusCode;
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        let timestamp = format_schedule_once_at(at)
+            .context("Enter a future RFC3339 timestamp for Once time")?;
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "once-at"]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not contact the Host to update Once time"))?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "at": timestamp }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update Once time")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update Once time")
+                }
+            })?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let code = match status {
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                    schedule_response_code(response).await
+                }
+                _ => None,
+            };
+            match (status, code.as_deref()) {
+                (StatusCode::BAD_REQUEST, Some("invalid_schedule_once_at")) => {
+                    anyhow::bail!("Enter a future RFC3339 timestamp for Once time")
+                }
+                (StatusCode::CONFLICT, Some("schedule_trigger_changed")) => {
+                    anyhow::bail!("Schedule is no longer a Once schedule")
+                }
+                (StatusCode::CONFLICT, Some("schedule_once_not_pending")) => {
+                    anyhow::bail!("Once schedule no longer has a pending occurrence")
+                }
+                (StatusCode::CONFLICT, Some("schedule_no_future_occurrence")) => {
+                    anyhow::bail!("Schedule has no future occurrence")
+                }
+                (StatusCode::NOT_FOUND, Some("schedule_not_found")) => {
+                    anyhow::bail!("Schedule no longer exists")
+                }
+                (StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED, _) => {
+                    anyhow::bail!("Editing Once time requires a newer Host")
+                }
+                _ => anyhow::bail!("Could not update Once time (HTTP {})", status.as_u16()),
+            }
+        }
+
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::TooLarge => {
+                    anyhow::anyhow!("Once time response is too large (2 MiB limit)")
+                }
+                BoundedBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for the Once time response")
+                }
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid Once time response"),
+            })?;
+        let receipt: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Once time response"))?;
+        anyhow::ensure!(
+            receipt
+                .get("state")
+                .is_some_and(serde_json::Value::is_object)
+                && receipt
+                    .get("run_config")
+                    .is_some_and(serde_json::Value::is_object),
+            "Invalid Once time response"
+        );
+        let view: ScheduleView = serde_json::from_value(receipt)
+            .map_err(|_| anyhow::anyhow!("Invalid Once time response"))?;
+        let schedule = Schedule::from_view(view);
+        anyhow::ensure!(
+            schedule.id == schedule_id
+                && schedule.once_at == Some(at)
+                && schedule.next_run == Some(at),
+            "Once time response does not match the request"
+        );
+        Ok(schedule)
+    }
+
+    pub(crate) async fn set_schedule_prompt(
+        &self,
+        schedule_id: &str,
+        task_message: &str,
+    ) -> Result<String> {
+        use reqwest::StatusCode;
+
+        #[derive(serde::Deserialize)]
+        struct PromptReply {
+            id: String,
+            run_config: PromptRunConfig,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct PromptRunConfig {
+            task_message: String,
+        }
+
+        anyhow::ensure!(
+            !matches!(schedule_id, "" | "." | ".."),
+            "Invalid schedule ID"
+        );
+        anyhow::ensure!(!task_message.trim().is_empty(), "Enter a task prompt");
+        let mut url = reqwest::Url::parse(&self.base_url).context("Invalid Bamboo URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?
+            .pop_if_empty()
+            .extend(["api", "v1", "schedules", schedule_id, "prompt"]);
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not contact the Host to update the task prompt"))?;
+        let response = client
+            .patch(url)
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "task_message": task_message }))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out contacting the Host to update the task prompt")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host to update the task prompt")
+                }
+            })?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let code = match status {
+                StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                    schedule_response_code(response).await
+                }
+                _ => None,
+            };
+            let message = match (status, code.as_deref()) {
+                (StatusCode::BAD_REQUEST, Some("invalid_schedule_prompt")) => "Enter a task prompt",
+                (StatusCode::CONFLICT, Some("schedule_prompt_changed")) => {
+                    "Schedule task prompt can no longer be edited"
+                }
+                (StatusCode::NOT_FOUND, Some("schedule_not_found")) => "Schedule no longer exists",
+                (StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED, _) => {
+                    "Editing the task prompt requires a newer Host"
+                }
+                _ => anyhow::bail!("Could not update task prompt (HTTP {})", status.as_u16()),
+            };
+            anyhow::bail!("{message}");
+        }
+
+        let reply: PromptReply = response.json().await.map_err(|error| {
+            if error.is_timeout() {
+                anyhow::anyhow!("Timed out waiting for the task prompt response")
+            } else {
+                anyhow::anyhow!("Invalid schedule task prompt response")
+            }
+        })?;
+        anyhow::ensure!(
+            reply.id == schedule_id && reply.run_config.task_message == task_message,
+            "Schedule task prompt response does not match the request"
+        );
+        Ok(reply.run_config.task_message)
     }
 
     pub async fn list_schedule_sessions(&self, schedule_id: &str) -> Result<Vec<SessionSummary>> {
@@ -1189,16 +1952,16 @@ impl BambooClient {
             "Could not fetch schedule sessions (HTTP {})",
             status.as_u16()
         );
-        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES)
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
             .await
             .map_err(|error| match error {
-                ScheduleBodyError::TooLarge => {
+                BoundedBodyError::TooLarge => {
                     anyhow::anyhow!("Schedule sessions response is too large (2 MiB limit)")
                 }
-                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                BoundedBodyError::Read(error) if error.is_timeout() => {
                     anyhow::anyhow!("Timed out fetching schedule sessions")
                 }
-                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid schedule sessions response"),
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid schedule sessions response"),
             })?;
         let reply: ListScheduleSessionsResponse = serde_json::from_slice(&body)
             .map_err(|_| anyhow::anyhow!("Invalid schedule sessions response"))?;
@@ -1335,18 +2098,27 @@ impl BambooClient {
     }
 
     pub async fn create_schedule(&self, req: CreateScheduleRequest) -> Result<()> {
+        use reqwest::StatusCode;
+
         let resp = self
             .client
             .post(self.url("/api/v1/schedules"))
             .json(&req)
             .send()
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!(SCHEDULE_CREATE_UNCONFIRMED))?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("create schedule failed ({status}): {body}");
-        }
-        Ok(())
+        let refused = "The Host refused to create the schedule.";
+        let message = match status {
+            status if status.is_success() => return Ok(()),
+            status if schedule_action_unconfirmed(status) => SCHEDULE_CREATE_UNCONFIRMED,
+            StatusCode::BAD_REQUEST => {
+                "Could not create the schedule. Check its details and Host settings."
+            }
+            StatusCode::CONFLICT => schedule_project_conflict(resp).await.unwrap_or(refused),
+            _ => refused,
+        };
+        anyhow::bail!("{message}")
     }
 
     pub async fn delete_schedule(&self, id: &str) -> Result<()> {
@@ -1354,27 +2126,43 @@ impl BambooClient {
             .client
             .delete(self.url(&format!("/api/v1/schedules/{}", id)))
             .send()
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!(SCHEDULE_DELETE_UNCONFIRMED))?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("delete schedule failed ({status}): {body}");
-        }
+        anyhow::ensure!(
+            !schedule_action_unconfirmed(status),
+            SCHEDULE_DELETE_UNCONFIRMED
+        );
+        anyhow::ensure!(
+            status != reqwest::StatusCode::NOT_FOUND,
+            SCHEDULE_UNAVAILABLE_OR_CHANGED
+        );
+        anyhow::ensure!(
+            status.is_success(),
+            "The Host refused to delete the schedule."
+        );
         Ok(())
     }
 
     pub async fn run_schedule_now(&self, id: &str) -> Result<()> {
+        use reqwest::StatusCode;
+
         let resp = self
             .client
             .post(self.url(&format!("/api/v1/schedules/{}/run", id)))
             .send()
-            .await?;
+            .await
+            .map_err(|_| anyhow::anyhow!(SCHEDULE_RUN_UNCONFIRMED))?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("run schedule failed ({status}): {body}");
-        }
-        Ok(())
+        let refused = "The Host refused Run Now. Check the saved schedule and Host settings.";
+        let message = match status {
+            status if status.is_success() => return Ok(()),
+            status if schedule_action_unconfirmed(status) => SCHEDULE_RUN_UNCONFIRMED,
+            StatusCode::NOT_FOUND => SCHEDULE_UNAVAILABLE_OR_CHANGED,
+            StatusCode::CONFLICT => schedule_project_conflict(resp).await.unwrap_or(refused),
+            _ => refused,
+        };
+        anyhow::bail!("{message}")
     }
 
     // ── Skills ──
@@ -1623,6 +2411,11 @@ mod tests {
             ("200 OK", r#"{"session_id":"chat"}"#, false),
             ("200 OK", r#"{"session_id":"other","loop":null}"#, false),
             ("200 OK", r#"{"session_id":"chat","loop":null}"#, true),
+            (
+                "200 OK",
+                r#"{"session_id":"chat","loop":{"state":"scheduled","mode":"future","interval_seconds":"unrecognized","iteration":null}}"#,
+                true,
+            ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
@@ -1677,6 +2470,600 @@ mod tests {
             backend.await.unwrap();
             assert_eq!(result.is_ok(), supported, "{http_status} {body}");
         }
+    }
+
+    const LOOP_PREVIEW_SESSION: &str = "session/one ?#%";
+
+    async fn read_loop_preview_request(socket: &mut tokio::net::TcpStream) {
+        let request = read_request(socket).await;
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            headers.lines().next(),
+            Some("GET /api/v1/sessions/session%2Fone%20%3F%23%25/loop HTTP/1.1")
+        );
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("cache-control: no-store")));
+        assert!(body.is_empty());
+    }
+
+    async fn loop_preview_reply(status: &str, body: &str) -> Result<Option<SessionLoopPreview>> {
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_loop_preview_request(&mut socket).await;
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.selected_session_loop_status(LOOP_PREVIEW_SESSION),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_reads_the_exact_session_and_known_states() {
+        use SessionLoopPreviewState::{Expired, Paused, Scheduled, Stopped};
+
+        for (wire, state, next_fire_at) in [
+            ("scheduled", Scheduled, Some("2026-11-28T02:03:04.125Z")),
+            ("scheduled", Scheduled, None),
+            ("paused", Paused, None),
+            ("stopped", Stopped, None),
+            ("expired", Expired, None),
+        ] {
+            let body = serde_json::json!({
+                "session_id": LOOP_PREVIEW_SESSION,
+                "loop": {
+                    "state": wire, "next_fire_at": next_fire_at,
+                    "prompt": "Host prompt does not belong to the list preview",
+                    "last_run_id": "host-run",
+                },
+            });
+            assert_eq!(
+                loop_preview_reply("200 OK", &body.to_string())
+                    .await
+                    .unwrap(),
+                Some(SessionLoopPreview {
+                    state,
+                    next_fire_at: next_fire_at.map(|value| value.parse().unwrap()),
+                    mode: None,
+                    iteration: None,
+                })
+            );
+        }
+        let body = serde_json::json!({ "session_id": LOOP_PREVIEW_SESSION, "loop": null });
+        assert_eq!(
+            loop_preview_reply("200 OK", &body.to_string())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_projects_optional_paced_details() {
+        use serde_json::json;
+        use SessionLoopPreviewMode::{Adaptive, Fixed};
+        use SessionLoopPreviewState::Scheduled;
+
+        for (details, mode, iteration) in [
+            (
+                json!({ "mode": "fixed", "interval_seconds": 300, "iteration": 7 }),
+                Some(Fixed {
+                    interval_seconds: Some(300),
+                }),
+                Some(7),
+            ),
+            (
+                json!({ "mode": "adaptive", "interval_seconds": 91, "iteration": 2 }),
+                Some(Adaptive),
+                Some(2),
+            ),
+            (
+                json!({ "mode": "fixed", "interval_seconds": 0, "iteration": 0 }),
+                Some(Fixed {
+                    interval_seconds: None,
+                }),
+                Some(0),
+            ),
+            (
+                json!({ "mode": "fixed", "interval_seconds": null, "iteration": null }),
+                Some(Fixed {
+                    interval_seconds: None,
+                }),
+                None,
+            ),
+            (
+                json!({ "mode": "fixed" }),
+                Some(Fixed {
+                    interval_seconds: None,
+                }),
+                None,
+            ),
+            (
+                json!({ "mode": "future", "interval_seconds": 60, "iteration": 1 }),
+                None,
+                Some(1),
+            ),
+            (
+                json!({ "mode": null, "interval_seconds": null, "iteration": null }),
+                None,
+                None,
+            ),
+            (
+                json!({ "interval_seconds": 300, "iteration": 3 }),
+                None,
+                Some(3),
+            ),
+        ] {
+            let mut record = details;
+            record["state"] = json!("scheduled");
+            record["next_fire_at"] = json!("2026-11-28T02:03:04Z");
+            let body = json!({ "session_id": LOOP_PREVIEW_SESSION, "loop": record });
+            assert_eq!(
+                loop_preview_reply("200 OK", &body.to_string())
+                    .await
+                    .unwrap(),
+                Some(SessionLoopPreview {
+                    state: Scheduled,
+                    next_fire_at: Some("2026-11-28T02:03:04Z".parse().unwrap()),
+                    mode,
+                    iteration,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_rejects_invalid_receipts_and_sanitizes_errors() {
+        for body in [
+            r#"{"session_id":"other","loop":null}"#,
+            r#"{"session_id":"session/one ?#%"}"#,
+            r#"{"session_id":"other","session_id":"session/one ?#%","loop":null}"#,
+            r#"{"session_id":"session/one ?#%","loop":null,"loop":{"state":"scheduled"}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"stopped","state":"scheduled"}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","id":null,"id":"loop-one"}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","next_fire_at":null,"next_fire_at":null}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","mode":"future","mode":"fixed"}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","interval_seconds":null,"interval_seconds":60}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","iteration":null,"iteration":0}}"#,
+            r#"["session/one ?#%",null]"#,
+            r#"{"session_id":"session/one ?#%","loop":[null,"scheduled",null,null,null]}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"RAW_HOST_DETAILS"}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","next_fire_at":"RAW_HOST_DETAILS"}}"#,
+            "RAW_HOST_DETAILS",
+        ] {
+            assert_eq!(
+                loop_preview_reply("200 OK", body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid Session loop status"
+            );
+        }
+
+        for (status, code) in [
+            ("202 Accepted", 202),
+            ("403 Forbidden", 403),
+            ("404 Not Found", 404),
+        ] {
+            assert_eq!(
+                loop_preview_reply(status, "RAW_HOST_DETAILS")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                format!("Could not fetch Session loop status (HTTP {code})")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_does_not_redirect_or_wait_for_error_body() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (release, held) = oneshot::channel();
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_loop_preview_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /unexpected\r\nContent-Length: 42\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            held.await.unwrap();
+            drop(socket);
+        };
+        let fetch = async {
+            let result = client
+                .selected_session_loop_status(LOOP_PREVIEW_SESSION)
+                .await;
+            release.send(()).unwrap();
+            result
+        };
+        let (result, ()) = timeout(Duration::from_secs(4), async { tokio::join!(fetch, serve) })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Could not fetch Session loop status (HTTP 302)"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_bounds_advertised_and_chunked_bodies() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        for advertised in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let (release, held) = oneshot::channel();
+            let serve = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_loop_preview_request(&mut socket).await;
+                if advertised {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        MAX_SESSION_LOOP_PREVIEW_BYTES + 1
+                    );
+                    socket.write_all(headers.as_bytes()).await.unwrap();
+                } else {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await
+                        .unwrap();
+                    const CHUNK_BYTES: usize = 16 * 1024;
+                    let mut frame = format!("{CHUNK_BYTES:x}\r\n").into_bytes();
+                    frame.resize(frame.len() + CHUNK_BYTES, b'x');
+                    frame.extend_from_slice(b"\r\n");
+                    for _ in 0..(MAX_SESSION_LOOP_PREVIEW_BYTES / CHUNK_BYTES) {
+                        socket.write_all(&frame).await.unwrap();
+                    }
+                    socket.write_all(b"1\r\nx\r\n").await.unwrap();
+                }
+                // Keep the body open until the byte limit rejects the response.
+                held.await.unwrap();
+                drop(socket);
+            };
+            let fetch = async {
+                let result = client
+                    .selected_session_loop_status(LOOP_PREVIEW_SESSION)
+                    .await;
+                release.send(()).unwrap();
+                result
+            };
+            let (result, ()) =
+                timeout(Duration::from_secs(5), async { tokio::join!(fetch, serve) })
+                    .await
+                    .unwrap();
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Session loop status response is too large (128 KiB limit)"
+            );
+        }
+    }
+
+    async fn schedule_action_reply<T, F>(
+        request_line: &str,
+        request_body: Option<serde_json::Value>,
+        status: &str,
+        body: &str,
+        request: impl FnOnce(BambooClient) -> F,
+    ) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(request.lines().next(), Some(request_line));
+            if let Some(expected) = request_body {
+                assert_eq!(request_json(&request), expected);
+            } else {
+                assert_eq!(request.split_once("\r\n\r\n").unwrap().1, "");
+            }
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(request(client), serve)
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn list_schedules_preserves_empty_catalogs_and_returns_fixed_errors() {
+        const GET: &str = "GET /api/v1/schedules HTTP/1.1";
+        for body in [r#"{"schedules":[]}"#, "{}"] {
+            assert!(
+                schedule_action_reply(GET, None, "200 OK", body, |client| async move {
+                    client.list_schedules().await
+                })
+                .await
+                .unwrap()
+                .is_empty()
+            );
+        }
+        for (status, body, expected) in [
+            (
+                "503 Service Unavailable",
+                r#"{"error":{"message":"RAW_HOST_BODY"}}"#,
+                "Could not load schedules. Reopen Schedules to try again.",
+            ),
+            (
+                "408 Request Timeout",
+                "",
+                "Could not load schedules. Reopen Schedules to try again.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"project_archived","message":"RAW_HOST_BODY"}}"#,
+                "The Host refused to load schedules. Reopen Schedules to try again.",
+            ),
+            (
+                "200 OK",
+                r#"{"schedules":"RAW_HOST_BODY"}"#,
+                "The Host returned an invalid schedule list. Reopen Schedules to try again.",
+            ),
+        ] {
+            assert_eq!(
+                schedule_action_reply(GET, None, status, body, |client| async move {
+                    client.list_schedules().await
+                })
+                .await
+                .unwrap_err()
+                .to_string(),
+                expected
+            );
+        }
+    }
+
+    async fn create_schedule_action_reply(expr: &str, status: &str, body: &str) -> Result<()> {
+        schedule_action_reply(
+            "POST /api/v1/schedules HTTP/1.1",
+            Some(serde_json::json!({
+                "name":"Review results",
+                "trigger":{"type":"cron","expr":expr},
+                "enabled":true,
+                "run_config":{"task_message":"Check the report","auto_execute":true},
+            })),
+            status,
+            body,
+            |client| async move {
+                client
+                    .create_schedule(CreateScheduleRequest {
+                        name: "Review results".into(),
+                        trigger: ScheduleTriggerReq::Cron { expr: expr.into() },
+                        timezone: None,
+                        enabled: true,
+                        run_config: ScheduleRunConfigReq {
+                            project_id: None,
+                            task_message: Some("Check the report".into()),
+                            auto_execute: true,
+                        },
+                    })
+                    .await
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn create_schedule_preserves_request_and_maps_validation_and_project_failures() {
+        const EXPR: &str = "0 0 9 * * MON";
+        create_schedule_action_reply(EXPR, "201 Created", "")
+            .await
+            .unwrap();
+        for (status, body, expected) in [
+            (
+                "400 Bad Request",
+                r#"{"error":{"type":"api_error","message":"trigger.expr is not a valid cron expression: invalid cron"}}"#,
+                "Could not create the schedule. Check its details and Host settings.",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":{"code":"project_archived","message":"RAW_HOST_BODY"}}"#,
+                "Could not create the schedule. Check its details and Host settings.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"project_archived","message":"RAW_HOST_BODY"},"project_id":"example"}"#,
+                "The schedule needs an active Project.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"project_path_missing","message":"RAW_HOST_BODY"}}"#,
+                "Set a workspace path for the schedule's Project.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"future_conflict","message":"RAW_HOST_BODY"}}"#,
+                "The Host refused to create the schedule.",
+            ),
+            (
+                "503 Service Unavailable",
+                "RAW_HOST_BODY",
+                "Could not confirm creation. Check Schedules before trying again.",
+            ),
+        ] {
+            let expr = if status.starts_with("400") {
+                "invalid cron"
+            } else {
+                EXPR
+            };
+            assert_eq!(
+                create_schedule_action_reply(expr, status, body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_schedule_now_reports_stale_selection_project_conflicts_and_uncertain_outcomes() {
+        const POST: &str = "POST /api/v1/schedules/schedule-17/run HTTP/1.1";
+        let run =
+            |client: BambooClient| async move { client.run_schedule_now("schedule-17").await };
+        schedule_action_reply(POST, None, "202 Accepted", "", run)
+            .await
+            .unwrap();
+        for (status, body, expected) in [
+            (
+                "404 Not Found",
+                r#"{"error":{"type":"api_error","message":"Schedule not found"},"schedule_id":"schedule-17"}"#,
+                "Schedule is unavailable or changed. Reopen Schedules.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"project_workspace_conflict","message":"RAW_HOST_BODY"}}"#,
+                "The workspace belongs to another Project. Check the Project settings.",
+            ),
+            (
+                "409 Conflict",
+                r#"{"error":{"code":"project_path_unavailable","message":"RAW_HOST_BODY"}}"#,
+                "The Project workspace is unavailable. Check its path on the Host.",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":{"type":"api_error","message":"run_config.project_id references a Project that does not exist"},"project_id":"example"}"#,
+                "The Host refused Run Now. Check the saved schedule and Host settings.",
+            ),
+            (
+                "500 Internal Server Error",
+                "RAW_HOST_BODY",
+                "Could not confirm Run Now. Check Recent runs before trying again.",
+            ),
+        ] {
+            assert_eq!(
+                schedule_action_reply(POST, None, status, body, run)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_schedule_reports_stale_selection_and_uncertain_outcomes() {
+        const DELETE: &str = "DELETE /api/v1/schedules/schedule-17 HTTP/1.1";
+        let delete =
+            |client: BambooClient| async move { client.delete_schedule("schedule-17").await };
+        schedule_action_reply(DELETE, None, "204 No Content", "", delete)
+            .await
+            .unwrap();
+        for (status, expected) in [
+            (
+                "404 Not Found",
+                "Schedule is unavailable or changed. Reopen Schedules.",
+            ),
+            (
+                "408 Request Timeout",
+                "Could not confirm deletion. Check the schedule before trying again.",
+            ),
+            ("403 Forbidden", "The Host refused to delete the schedule."),
+        ] {
+            assert_eq!(
+                schedule_action_reply(DELETE, None, status, "RAW_HOST_BODY", delete)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_transport_failures_provide_actionable_list_and_run_feedback() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        for (list, request_line, expected) in [
+            (
+                true,
+                "GET /api/v1/schedules HTTP/1.1",
+                "Could not load schedules. Reopen Schedules to try again.",
+            ),
+            (
+                false,
+                "POST /api/v1/schedules/schedule-17/run HTTP/1.1",
+                "Could not confirm Run Now. Check Recent runs before trying again.",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let serve = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_request(&mut socket).await.lines().next(),
+                    Some(request_line)
+                );
+                socket.shutdown().await.unwrap();
+            };
+            let request = async {
+                if list {
+                    client.list_schedules().await.map(|_| ())
+                } else {
+                    client.run_schedule_now("schedule-17").await
+                }
+            };
+            let (result, ()) = timeout(Duration::from_secs(5), async {
+                tokio::join!(request, serve)
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap_err().to_string(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_project_conflict_falls_back_when_the_host_holds_the_error_body() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (release, held) = oneshot::channel();
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_request(&mut socket).await.lines().next(),
+                Some("POST /api/v1/schedules/schedule-17/run HTTP/1.1")
+            );
+            socket
+                .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 99\r\n\r\n")
+                .await
+                .unwrap();
+            held.await.unwrap();
+            drop(socket);
+        };
+        let run = async {
+            let result = client.run_schedule_now("schedule-17").await;
+            release.send(()).unwrap();
+            result
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async { tokio::join!(run, serve) })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "The Host refused Run Now. Check the saved schedule and Host settings."
+        );
     }
 
     #[tokio::test]
@@ -1865,7 +3252,7 @@ mod tests {
                 if advertised {
                     let headers = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                        MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES + 1
+                        MAX_SCHEDULE_RESPONSE_BYTES + 1
                     );
                     socket.write_all(headers.as_bytes()).await.unwrap();
                 } else {
@@ -1877,7 +3264,7 @@ mod tests {
                     let mut frame = format!("{CHUNK_BYTES:x}\r\n").into_bytes();
                     frame.resize(frame.len() + CHUNK_BYTES, b'x');
                     frame.extend_from_slice(b"\r\n");
-                    for _ in 0..(MAX_SCHEDULE_SESSIONS_RESPONSE_BYTES / CHUNK_BYTES) {
+                    for _ in 0..(MAX_SCHEDULE_RESPONSE_BYTES / CHUNK_BYTES) {
                         socket.write_all(&frame).await.unwrap();
                     }
                     socket.write_all(b"1\r\nx\r\n").await.unwrap();
@@ -2032,6 +3419,1311 @@ mod tests {
     }
 
     const TOGGLE_SCHEDULE_ID: &str = "schedule/17 ?#%";
+
+    #[tokio::test]
+    async fn rename_schedule_requires_the_exact_receipt_and_keeps_the_dedicated_route() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        for (status, extra, body, expected) in [
+            (
+                "200 OK",
+                "",
+                r#"{"id":"other","name":"Weekly plan"}"#,
+                "Schedule rename response does not match the request",
+            ),
+            (
+                "200 OK",
+                "",
+                r#"{"id":"schedule-17","name":"Earlier title"}"#,
+                "Schedule rename response does not match the request",
+            ),
+            (
+                "404 Not Found",
+                "",
+                r#"{"error":{"code":"schedule_not_found","message":"RAW_DETAILS"}}"#,
+                "Schedule no longer exists",
+            ),
+            (
+                "307 Temporary Redirect",
+                "Location: /api/v1/schedules/schedule-17\r\n",
+                "",
+                "Could not rename schedule (HTTP 307)",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let serve = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut socket).await;
+                assert_eq!(
+                    request.lines().next(),
+                    Some("PATCH /api/v1/schedules/schedule-17/name HTTP/1.1")
+                );
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+                if !extra.is_empty() {
+                    assert!(timeout(Duration::from_millis(120), listener.accept())
+                        .await
+                        .is_err());
+                }
+            };
+            let (result, ()) = timeout(Duration::from_secs(5), async {
+                tokio::join!(client.rename_schedule("schedule-17", "Weekly plan"), serve)
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap_err().to_string(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_daily_time_sends_only_clock_and_projects_confirmed_timezone() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Morning review",
+            "enabled": false,
+            "trigger": {"type":"daily","hour":8,"minute":15,"second":0},
+            "timezone": "Asia/Shanghai",
+            "state": {"next_fire_at":"2030-02-13T00:15:00Z"},
+            "run_config": {"task_message":"Review progress"},
+        });
+        let schedule =
+            schedule_clock_time_reply(ScheduleClockKind::Daily, "200 OK", "", &body.to_string())
+                .await
+                .unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(schedule.daily_time, ScheduleClockTime::new(8, 15, 0));
+        assert_eq!(schedule.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(schedule.enabled, Some(false));
+        assert_eq!(
+            schedule.cadence_detail.as_deref(),
+            Some("Daily 08:15 Asia/Shanghai")
+        );
+        assert_eq!(
+            schedule.next_run.unwrap().to_rfc3339(),
+            "2030-02-13T00:15:00+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schedule_daily_time_rejects_mismatched_or_incomplete_receipts() {
+        let daily = serde_json::json!({"type":"daily","hour":8,"minute":15,"second":0});
+        for (id, trigger) in [
+            ("other-schedule", daily.clone()),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"daily","hour":8,"minute":15,"second":1}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"daily","hour":8,"minute":15}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"weekly","weekdays":["mon"],"hour":8,"minute":15,"second":0}),
+            ),
+        ] {
+            let body =
+                serde_json::json!({"id": id, "trigger": trigger, "state": {}, "run_config": {}});
+            assert_eq!(
+                schedule_clock_time_reply(
+                    ScheduleClockKind::Daily,
+                    "200 OK",
+                    "",
+                    &body.to_string()
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                "Daily time response does not match the request"
+            );
+        }
+        for body in [
+            serde_json::json!({"id": TOGGLE_SCHEDULE_ID, "trigger": daily}),
+            serde_json::json!({"id": TOGGLE_SCHEDULE_ID, "trigger": daily, "run_config": {}}),
+            serde_json::json!({"id": TOGGLE_SCHEDULE_ID, "trigger": daily, "state": {}}),
+        ] {
+            assert_eq!(
+                schedule_clock_time_reply(
+                    ScheduleClockKind::Daily,
+                    "200 OK",
+                    "",
+                    &body.to_string()
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                "Invalid Daily time response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_daily_time_sanitizes_refusals_and_never_falls_back() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                Some("invalid_schedule_daily_time"),
+                "Enter a Daily time in HH:MM or HH:MM:SS format",
+            ),
+            (
+                "409 Conflict",
+                Some("schedule_trigger_changed"),
+                "Schedule is no longer a Daily schedule",
+            ),
+            (
+                "409 Conflict",
+                Some("schedule_no_future_occurrence"),
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                Some("schedule_not_found"),
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                None,
+                "Editing Daily time requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                None,
+                "Editing Daily time requires a newer Host",
+            ),
+            (
+                "503 Service Unavailable",
+                Some("schedule_trigger_changed"),
+                "Could not update Daily time (HTTP 503)",
+            ),
+        ] {
+            let body = code.map_or_else(
+                || "RAW_DETAILS".to_owned(),
+                |code| {
+                    serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}}).to_string()
+                },
+            );
+            assert_eq!(
+                schedule_clock_time_reply(ScheduleClockKind::Daily, status, "", &body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert_eq!(
+            schedule_clock_time_reply(
+                ScheduleClockKind::Daily,
+                "307 Temporary Redirect",
+                "Location: /api/v1/schedules/schedule-17\r\n",
+                "",
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "Could not update Daily time (HTTP 307)"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schedule_weekly_time_sends_only_clock_and_retains_reply_weekdays() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Weekly review",
+            "enabled": false,
+            "trigger": {"type":"weekly","weekdays":["fri","mon"],"hour":8,"minute":15,"second":0},
+            "timezone": "Asia/Shanghai",
+            "state": {"next_fire_at":"2030-02-18T00:15:00Z"},
+            "run_config": {"task_message":"Review progress"},
+        });
+        let schedule =
+            schedule_clock_time_reply(ScheduleClockKind::Weekly, "200 OK", "", &body.to_string())
+                .await
+                .unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(
+            schedule.clock_time(ScheduleClockKind::Weekly),
+            ScheduleClockTime::new(8, 15, 0)
+        );
+        assert_eq!(schedule.clock_time(ScheduleClockKind::Daily), None);
+        assert_eq!(
+            schedule.weekly_time.unwrap().weekdays,
+            [ScheduleWeekdayReq::Fri, ScheduleWeekdayReq::Mon]
+        );
+        assert_eq!(schedule.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(schedule.enabled, Some(false));
+        assert_eq!(
+            schedule.cadence_detail.as_deref(),
+            Some("Weekly Mon, Fri at 08:15 Asia/Shanghai")
+        );
+        assert_eq!(
+            schedule.next_run.unwrap().to_rfc3339(),
+            "2030-02-18T00:15:00+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schedule_weekly_time_requires_an_exact_ordinary_weekly_receipt() {
+        let weekly =
+            serde_json::json!({"type":"weekly","weekdays":["mon"],"hour":8,"minute":15,"second":0});
+        for (id, trigger, config) in [
+            ("other-schedule", weekly.clone(), serde_json::json!({})),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"daily","hour":8,"minute":15,"second":0}),
+                serde_json::json!({}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"weekly","weekdays":[],"hour":8,"minute":15,"second":0}),
+                serde_json::json!({}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"weekly","weekdays":["unknown"],"hour":8,"minute":15,"second":0}),
+                serde_json::json!({}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"weekly","weekdays":["mon"],"hour":8,"minute":15}),
+                serde_json::json!({}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"weekly","weekdays":["mon"],"hour":8,"minute":15,"second":1}),
+                serde_json::json!({}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                weekly.clone(),
+                serde_json::json!({"workflow_target":{"workflow_id":"report"}}),
+            ),
+        ] {
+            let body =
+                serde_json::json!({"id":id,"trigger":trigger,"state":{},"run_config":config});
+            assert_eq!(
+                schedule_clock_time_reply(
+                    ScheduleClockKind::Weekly,
+                    "200 OK",
+                    "",
+                    &body.to_string()
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                "Weekly time response does not match the request"
+            );
+        }
+        let body = serde_json::json!({"id":TOGGLE_SCHEDULE_ID,"trigger":weekly,"run_config":{}});
+        assert_eq!(
+            schedule_clock_time_reply(ScheduleClockKind::Weekly, "200 OK", "", &body.to_string())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Invalid Weekly time response"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schedule_weekly_time_sanitizes_refusals_and_requires_a_supported_host() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                "invalid_schedule_weekly_time",
+                "Enter a Weekly time in HH:MM or HH:MM:SS format",
+            ),
+            (
+                "409 Conflict",
+                "schedule_trigger_changed",
+                "Schedule is no longer a Weekly schedule",
+            ),
+            (
+                "409 Conflict",
+                "schedule_no_future_occurrence",
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                "schedule_not_found",
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                "unknown_route",
+                "Editing Weekly time requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                "method_not_allowed",
+                "Editing Weekly time requires a newer Host",
+            ),
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}});
+            assert_eq!(
+                schedule_clock_time_reply(ScheduleClockKind::Weekly, status, "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_monthly_time_sends_only_clock_and_retains_reply_days() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Monthly review",
+            "enabled": false,
+            "trigger": {"type":"monthly","days":[31,2,1,31],"hour":8,"minute":15,"second":0},
+            "timezone": "Asia/Shanghai",
+            "state": {"next_fire_at":"2030-03-31T00:15:00Z"},
+            "run_config": {"task_message":"Review progress"},
+        });
+        let schedule =
+            schedule_clock_time_reply(ScheduleClockKind::Monthly, "200 OK", "", &body.to_string())
+                .await
+                .unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(
+            schedule.clock_time(ScheduleClockKind::Monthly),
+            ScheduleClockTime::new(8, 15, 0)
+        );
+        assert_eq!(schedule.clock_time(ScheduleClockKind::Daily), None);
+        assert_eq!(schedule.clock_time(ScheduleClockKind::Weekly), None);
+        assert_eq!(schedule.monthly_time.unwrap().days, [31, 2, 1, 31]);
+        assert_eq!(schedule.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(schedule.enabled, Some(false));
+        assert_eq!(
+            schedule.cadence_detail.as_deref(),
+            Some("Monthly 1–2, 31 at 08:15 Asia/Shanghai")
+        );
+        assert_eq!(
+            schedule.next_run.unwrap().to_rfc3339(),
+            "2030-03-31T00:15:00+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schedule_monthly_time_requires_an_exact_ordinary_monthly_receipt() {
+        let receipt = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "trigger": {"type":"monthly","days":[31],"hour":8,"minute":15,"second":0},
+            "state": {},
+            "run_config": {},
+        });
+        for (path, value) in [
+            ("/id", serde_json::json!("other-schedule")),
+            (
+                "/trigger",
+                serde_json::json!({"type":"daily","hour":8,"minute":15,"second":0}),
+            ),
+            ("/trigger/days", serde_json::json!([])),
+            ("/trigger/days", serde_json::json!([1, 32])),
+            ("/trigger/second", serde_json::json!(1)),
+            (
+                "/trigger",
+                serde_json::json!({"type":"monthly","days":[31],"hour":8,"minute":15}),
+            ),
+            (
+                "/run_config",
+                serde_json::json!({"workflow_target":{"workflow_id":"review"}}),
+            ),
+        ] {
+            let mut body = receipt.clone();
+            *body.pointer_mut(path).unwrap() = value;
+            assert_eq!(
+                schedule_clock_time_reply(
+                    ScheduleClockKind::Monthly,
+                    "200 OK",
+                    "",
+                    &body.to_string()
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                "Monthly time response does not match the request"
+            );
+        }
+        for field in ["state", "run_config"] {
+            let mut body = receipt.clone();
+            body.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                schedule_clock_time_reply(
+                    ScheduleClockKind::Monthly,
+                    "200 OK",
+                    "",
+                    &body.to_string()
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                "Invalid Monthly time response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_monthly_time_sanitizes_refusals_and_requires_a_supported_host() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                "invalid_schedule_monthly_time",
+                "Enter a Monthly time in HH:MM or HH:MM:SS format",
+            ),
+            (
+                "409 Conflict",
+                "schedule_trigger_changed",
+                "Schedule is no longer a Monthly schedule",
+            ),
+            (
+                "409 Conflict",
+                "schedule_no_future_occurrence",
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                "schedule_not_found",
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                "unknown_route",
+                "Editing Monthly time requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                "method_not_allowed",
+                "Editing Monthly time requires a newer Host",
+            ),
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}});
+            assert_eq!(
+                schedule_clock_time_reply(
+                    ScheduleClockKind::Monthly,
+                    status,
+                    "",
+                    &body.to_string()
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+                expected
+            );
+        }
+    }
+
+    async fn schedule_clock_time_reply(
+        kind: ScheduleClockKind,
+        status: &str,
+        extra: &str,
+        body: &str,
+    ) -> Result<Schedule> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some(match kind {
+                    ScheduleClockKind::Daily => "PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/daily-time HTTP/1.1",
+                    ScheduleClockKind::Weekly => "PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/weekly-time HTTP/1.1",
+                    ScheduleClockKind::Monthly => "PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/monthly-time HTTP/1.1",
+                })
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({"hour":8,"minute":15,"second":0})
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            if status.starts_with("404") || status.starts_with("405") || status.starts_with("307") {
+                assert!(timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err());
+            }
+        };
+        let time = ScheduleClockTime::new(8, 15, 0).unwrap();
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.update_schedule_clock_time(TOGGLE_SCHEDULE_ID, kind, time),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn update_schedule_once_at_sends_only_rfc3339_and_retains_confirmed_instant() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Review results",
+            "enabled": false,
+            "trigger": {"type":"once","at":"2030-03-31T08:15:00.125+08:00"},
+            "timezone": "Asia/Shanghai",
+            "state": {"next_fire_at": ONCE_SCHEDULE_AT},
+            "run_config": {"task_message": "Review results"},
+        });
+        let schedule = schedule_once_at_reply(ONCE_SCHEDULE_AT, "200 OK", "", &body.to_string())
+            .await
+            .unwrap();
+        let at = ONCE_SCHEDULE_AT.parse().unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(schedule.once_at, Some(at));
+        assert_eq!(schedule.next_run, Some(at));
+        assert_eq!(schedule.enabled, Some(false));
+        assert_eq!(schedule.timezone.as_deref(), Some("Asia/Shanghai"));
+    }
+
+    #[tokio::test]
+    async fn update_schedule_once_at_preserves_a_valid_offset_across_the_utc_year_boundary() {
+        let wire_at = "9999-12-31T23:59:59.125-23:59";
+        let utc_at = "+10000-01-01T23:58:59.125Z";
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "trigger": {"type":"once","at":utc_at},
+            "state": {"next_fire_at":utc_at},
+            "run_config": {},
+        });
+        let schedule = schedule_once_at_reply(wire_at, "200 OK", "", &body.to_string())
+            .await
+            .unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339(wire_at)
+            .unwrap()
+            .to_utc();
+        assert_eq!(schedule.once_at, Some(at));
+        assert_eq!(schedule.next_run, Some(at));
+    }
+
+    #[tokio::test]
+    async fn update_schedule_once_at_rejects_mismatched_or_incomplete_receipts() {
+        let receipt = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "trigger": {"type":"once","at":ONCE_SCHEDULE_AT},
+            "state": {"next_fire_at":ONCE_SCHEDULE_AT},
+            "run_config": {},
+        });
+        for (path, value) in [
+            ("/id", serde_json::json!("different-id")),
+            ("/trigger/type", serde_json::json!("daily")),
+            ("/trigger/at", serde_json::json!("2030-03-31T00:15:00Z")),
+            (
+                "/state/next_fire_at",
+                serde_json::json!("2030-03-31T00:15:00Z"),
+            ),
+            ("/state/next_fire_at", serde_json::json!(null)),
+            (
+                "/run_config",
+                serde_json::json!({"workflow_target":{"workflow_id":"review"}}),
+            ),
+        ] {
+            let mut body = receipt.clone();
+            *body.pointer_mut(path).unwrap() = value;
+            assert_eq!(
+                schedule_once_at_reply(ONCE_SCHEDULE_AT, "200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Once time response does not match the request"
+            );
+        }
+        for field in ["state", "run_config"] {
+            let mut body = receipt.clone();
+            body.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                schedule_once_at_reply(ONCE_SCHEDULE_AT, "200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid Once time response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_once_at_preserves_typed_refusals_and_never_falls_back() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                "invalid_schedule_once_at",
+                "Enter a future RFC3339 timestamp for Once time",
+            ),
+            (
+                "409 Conflict",
+                "schedule_once_not_pending",
+                "Once schedule no longer has a pending occurrence",
+            ),
+            (
+                "409 Conflict",
+                "schedule_trigger_changed",
+                "Schedule is no longer a Once schedule",
+            ),
+            (
+                "409 Conflict",
+                "schedule_no_future_occurrence",
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                "schedule_not_found",
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                "unknown_route",
+                "Editing Once time requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                "method_not_allowed",
+                "Editing Once time requires a newer Host",
+            ),
+            (
+                "503 Service Unavailable",
+                "internal_error",
+                "Could not update Once time (HTTP 503)",
+            ),
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}});
+            assert_eq!(
+                schedule_once_at_reply(ONCE_SCHEDULE_AT, status, "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert_eq!(
+            schedule_once_at_reply(
+                ONCE_SCHEDULE_AT,
+                "307 Temporary Redirect",
+                "Location: /api/v1/schedules/other\r\n",
+                ""
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "Could not update Once time (HTTP 307)"
+        );
+    }
+
+    const ONCE_SCHEDULE_AT: &str = "2030-03-31T00:15:00.125Z";
+
+    async fn schedule_once_at_reply(
+        wire_at: &str,
+        status: &str,
+        extra: &str,
+        body: &str,
+    ) -> Result<Schedule> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/once-at HTTP/1.1")
+            );
+            assert_eq!(request_json(&request), serde_json::json!({"at":wire_at}));
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            if status.starts_with("404") || status.starts_with("405") || status.starts_with("307") {
+                assert!(timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err());
+            }
+        };
+        let at = chrono::DateTime::parse_from_rfc3339(wire_at)
+            .unwrap()
+            .to_utc();
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.update_schedule_once_at(TOGGLE_SCHEDULE_ID, at),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    const CRON_EXPRESSION: &str = "0  30 8 * * MON-FRI";
+
+    fn cron_expression_receipt() -> serde_json::Value {
+        serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Review results",
+            "enabled": false,
+            "trigger": {"type": "cron", "expr": CRON_EXPRESSION},
+            "timezone": "America/New_York",
+            "state": {"next_fire_at": "2030-04-01T12:30:00Z"},
+            "run_config": {"task_message": "Review results"},
+        })
+    }
+
+    #[tokio::test]
+    async fn update_schedule_cron_expression_sends_only_expr_and_keeps_canonical_state() {
+        let mut body = cron_expression_receipt();
+        let input = format!(" \t{CRON_EXPRESSION}\n");
+        let schedule = cron_expression_reply(&input, "200 OK", "", &body.to_string())
+            .await
+            .unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(schedule.name.as_deref(), Some("Review results"));
+        assert_eq!(schedule.cron.as_deref(), Some(CRON_EXPRESSION));
+        assert_eq!(schedule.cron_expression.as_deref(), Some(CRON_EXPRESSION));
+        assert_eq!(
+            schedule.next_run,
+            Some("2030-04-01T12:30:00Z".parse().unwrap())
+        );
+        assert_eq!(schedule.enabled, Some(false));
+        assert_eq!(schedule.timezone.as_deref(), Some("America/New_York"));
+        assert_eq!(schedule.prompt.as_deref(), Some("Review results"));
+
+        body["trigger"]["expr"] = serde_json::json!(input);
+        for state in [
+            serde_json::json!({}),
+            serde_json::json!({"next_fire_at":null}),
+        ] {
+            body["state"] = state;
+            let saved = cron_expression_reply(CRON_EXPRESSION, "200 OK", "", &body.to_string())
+                .await
+                .unwrap();
+            assert_eq!(
+                saved.cron_expression.as_deref(),
+                body["trigger"]["expr"].as_str()
+            );
+            assert_eq!(saved.next_run, None);
+            assert_eq!(saved.enabled, Some(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_cron_expression_rejects_mismatched_or_incomplete_receipts() {
+        let receipt = cron_expression_receipt();
+        for (path, value) in [
+            ("/id", serde_json::json!("different-id")),
+            (
+                "/trigger",
+                serde_json::json!({"type":"daily","hour":8,"minute":30,"second":0}),
+            ),
+            ("/trigger/expr", serde_json::json!("@daily")),
+            (
+                "/run_config",
+                serde_json::json!({"workflow_target":{"workflow_id":"review"}}),
+            ),
+        ] {
+            let mut body = receipt.clone();
+            *body.pointer_mut(path).unwrap() = value;
+            assert_eq!(
+                cron_expression_reply(CRON_EXPRESSION, "200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Cron expression response does not match the request"
+            );
+        }
+        for field in ["state", "run_config", "name", "enabled"] {
+            let mut body = receipt.clone();
+            body.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                cron_expression_reply(CRON_EXPRESSION, "200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid Cron expression response"
+            );
+        }
+        let body = receipt.to_string();
+        for conflicting in [
+            body.replacen(r#""id":"#, r#""id":"other","id":"#, 1),
+            body.replacen(r#""expr":"#, r#""expr":"@daily","expr":"#, 1),
+        ] {
+            assert_eq!(
+                cron_expression_reply(CRON_EXPRESSION, "200 OK", "", &conflicting)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid Cron expression response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_cron_expression_preserves_typed_refusals_and_never_falls_back() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                "invalid_schedule_cron",
+                "Enter a valid Cron expression",
+            ),
+            (
+                "409 Conflict",
+                "schedule_trigger_changed",
+                "Schedule is no longer an editable Cron Task schedule",
+            ),
+            (
+                "409 Conflict",
+                "schedule_no_future_occurrence",
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                "schedule_not_found",
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                "unknown_route",
+                "Editing a Cron expression requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                "method_not_allowed",
+                "Editing a Cron expression requires a newer Host",
+            ),
+            (
+                "503 Service Unavailable",
+                "internal_error",
+                "Could not update the Cron expression (HTTP 503)",
+            ),
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}});
+            assert_eq!(
+                cron_expression_reply(CRON_EXPRESSION, status, "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert_eq!(
+            cron_expression_reply(
+                CRON_EXPRESSION,
+                "307 Temporary Redirect",
+                "Location: /api/v1/schedules/other\r\n",
+                ""
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "Could not update the Cron expression (HTTP 307)"
+        );
+    }
+
+    async fn cron_expression_reply(
+        input: &str,
+        status: &str,
+        extra: &str,
+        body: &str,
+    ) -> Result<Schedule> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/cron-expression HTTP/1.1")
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({"expr": CRON_EXPRESSION})
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            if status.starts_with("404") || status.starts_with("405") || status.starts_with("307") {
+                assert!(timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err());
+            }
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.update_schedule_cron_expression(TOGGLE_SCHEDULE_ID, input),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn update_schedule_interval_sends_only_the_period_and_projects_confirmed_state() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Status review",
+            "enabled": true,
+            "trigger": {
+                "type": "interval",
+                "every_seconds": 120,
+                "anchor_at": "2030-02-13T13:30:00Z"
+            },
+            "state": {"next_fire_at": "2030-02-13T13:32:00Z"},
+            "run_config": {"task_message": "Review progress"}
+        });
+        let schedule = schedule_interval_reply("200 OK", "", &body.to_string())
+            .await
+            .unwrap();
+        assert_eq!(schedule.id, TOGGLE_SCHEDULE_ID);
+        assert_eq!(schedule.interval_seconds, Some(120));
+        assert_eq!(
+            schedule.cadence_detail.as_deref(),
+            Some("Every 120 seconds")
+        );
+        assert_eq!(schedule.name.as_deref(), Some("Status review"));
+        assert_eq!(schedule.enabled, Some(true));
+        assert_eq!(schedule.prompt.as_deref(), Some("Review progress"));
+        assert_eq!(
+            schedule.next_run,
+            Some("2030-02-13T13:32:00Z".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn update_schedule_interval_rejects_mismatched_identity_kind_and_period() {
+        for (id, trigger) in [
+            (
+                "other",
+                serde_json::json!({"type":"interval","every_seconds":120}),
+            ),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"interval","every_seconds":60}),
+            ),
+            (TOGGLE_SCHEDULE_ID, serde_json::json!({"type":"interval"})),
+            (
+                TOGGLE_SCHEDULE_ID,
+                serde_json::json!({"type":"daily","every_seconds":120}),
+            ),
+        ] {
+            let body = serde_json::json!({"id": id, "trigger": trigger});
+            assert_eq!(
+                schedule_interval_reply("200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Schedule interval response does not match the request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_interval_preserves_typed_refusals_and_never_falls_back() {
+        for (status, code, expected) in [
+            (
+                "400 Bad Request",
+                Some("invalid_schedule_interval"),
+                "Schedule interval must be a positive representable number of seconds",
+            ),
+            (
+                "409 Conflict",
+                Some("schedule_trigger_changed"),
+                "Schedule is no longer an Interval schedule",
+            ),
+            (
+                "409 Conflict",
+                Some("schedule_no_future_occurrence"),
+                "Schedule has no future occurrence",
+            ),
+            (
+                "404 Not Found",
+                Some("schedule_not_found"),
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                None,
+                "Editing the interval requires a newer Host",
+            ),
+            (
+                "404 Not Found",
+                Some("not_found"),
+                "Editing the interval requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                None,
+                "Editing the interval requires a newer Host",
+            ),
+            (
+                "503 Service Unavailable",
+                Some("schedule_trigger_changed"),
+                "Could not update schedule interval (HTTP 503)",
+            ),
+        ] {
+            let body = code.map_or_else(
+                || "RAW_DETAILS".to_owned(),
+                |code| {
+                    serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}}).to_string()
+                },
+            );
+            assert_eq!(
+                schedule_interval_reply(status, "", &body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+
+        assert_eq!(
+            schedule_interval_reply(
+                "307 Temporary Redirect",
+                "Location: /api/v1/schedules/schedule-17\r\n",
+                "",
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "Could not update schedule interval (HTTP 307)"
+        );
+    }
+
+    async fn schedule_interval_reply(status: &str, extra: &str, body: &str) -> Result<Schedule> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/interval HTTP/1.1")
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({"every_seconds":120})
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.update_schedule_interval(TOGGLE_SCHEDULE_ID, 120),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    const SCHEDULE_TASK_PROMPT: &str =
+        "  Review the weekly report 🧪\r\n\n  Follow up in 中文.  \n";
+
+    #[tokio::test]
+    async fn set_schedule_prompt_sends_only_the_exact_multiline_task_and_accepts_the_echo() {
+        let body = serde_json::json!({
+            "id": TOGGLE_SCHEDULE_ID,
+            "name": "Weekly review",
+            "enabled": false,
+            "trigger": {"type":"interval","every_seconds":60},
+            "state": {"next_fire_at":null},
+            "run_config": {
+                "task_message": SCHEDULE_TASK_PROMPT,
+                "system_prompt": "Keep the report concise"
+            }
+        });
+        assert_eq!(
+            schedule_prompt_reply("200 OK", "", &body.to_string())
+                .await
+                .unwrap(),
+            SCHEDULE_TASK_PROMPT
+        );
+    }
+
+    #[tokio::test]
+    async fn set_schedule_prompt_rejects_wrong_identity_and_missing_or_changed_task() {
+        for (body, expected) in [
+            (
+                serde_json::json!({"id":"another-schedule","run_config":{"task_message":SCHEDULE_TASK_PROMPT}}),
+                "Schedule task prompt response does not match the request",
+            ),
+            (
+                serde_json::json!({"id":TOGGLE_SCHEDULE_ID,"run_config":{"task_message":SCHEDULE_TASK_PROMPT.trim()}}),
+                "Schedule task prompt response does not match the request",
+            ),
+            (
+                serde_json::json!({"schedule_id":TOGGLE_SCHEDULE_ID,"run_config":{"task_message":SCHEDULE_TASK_PROMPT}}),
+                "Invalid schedule task prompt response",
+            ),
+            (
+                serde_json::json!({"id":TOGGLE_SCHEDULE_ID,"task_message":SCHEDULE_TASK_PROMPT}),
+                "Invalid schedule task prompt response",
+            ),
+            (
+                serde_json::json!({"id":TOGGLE_SCHEDULE_ID,"run_config":{"task_message":null}}),
+                "Invalid schedule task prompt response",
+            ),
+        ] {
+            assert_eq!(
+                schedule_prompt_reply("200 OK", "", &body.to_string())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        assert_eq!(
+            BambooClient::new("unused")
+                .set_schedule_prompt("schedule-17", " \r\n\t")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Enter a task prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_schedule_prompt_reports_known_refusals_without_fallback_or_response_details() {
+        for (status, extra, code, expected) in [
+            (
+                "400 Bad Request",
+                "",
+                Some("invalid_schedule_prompt"),
+                "Enter a task prompt",
+            ),
+            (
+                "409 Conflict",
+                "",
+                Some("schedule_prompt_changed"),
+                "Schedule task prompt can no longer be edited",
+            ),
+            (
+                "404 Not Found",
+                "",
+                Some("schedule_not_found"),
+                "Schedule no longer exists",
+            ),
+            (
+                "404 Not Found",
+                "",
+                None,
+                "Editing the task prompt requires a newer Host",
+            ),
+            (
+                "405 Method Not Allowed",
+                "",
+                None,
+                "Editing the task prompt requires a newer Host",
+            ),
+            (
+                "503 Service Unavailable",
+                "",
+                Some("schedule_not_found"),
+                "Could not update task prompt (HTTP 503)",
+            ),
+            (
+                "307 Temporary Redirect",
+                "Location: /gateway/api/v1/schedules/schedule-17\r\n",
+                None,
+                "Could not update task prompt (HTTP 307)",
+            ),
+        ] {
+            let body = code.map_or_else(
+                || "RAW_DETAILS".to_owned(),
+                |code| {
+                    serde_json::json!({"error":{"code":code,"message":"RAW_DETAILS"}}).to_string()
+                },
+            );
+            assert_eq!(
+                schedule_prompt_reply(status, extra, &body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    async fn schedule_prompt_reply(status: &str, extra: &str, body: &str) -> Result<String> {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!(
+            "http://{}/gateway/",
+            listener.local_addr().unwrap()
+        ));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("PATCH /gateway/api/v1/schedules/schedule%2F17%20%3F%23%25/prompt HTTP/1.1")
+            );
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({"task_message": SCHEDULE_TASK_PROMPT})
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            if matches!(
+                status,
+                "404 Not Found" | "405 Method Not Allowed" | "307 Temporary Redirect"
+            ) {
+                assert!(timeout(Duration::from_millis(120), listener.accept())
+                    .await
+                    .is_err());
+            }
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.set_schedule_prompt(TOGGLE_SCHEDULE_ID, SCHEDULE_TASK_PROMPT),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
 
     #[tokio::test]
     async fn set_schedule_enabled_patches_only_the_saved_flag_and_projects_the_reply() {
