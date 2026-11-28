@@ -1937,6 +1937,92 @@ mod tests {
     }
 
     #[test]
+    fn testbackend_mermaid_sequence_uses_source_while_streaming_or_too_wide() {
+        use markdown::MermaidGlyphs::{Ascii, Unicode};
+
+        const BODY: &str = concat!(
+            "sequenceDiagram\r\n",
+            "participant C as 终端 🧭\r\n",
+            "participant H as Bamboo\r\n",
+            "participant P as Project 资料\r\n",
+            "C->>H: 审核请求\r\n",
+            "H->>P: 读取汇总\r\n",
+            "P-->>C: Totals ready\r\n",
+        );
+        let source = format!("~~~mermaid\r\n{BODY}~~~\r\n\r\nAfter the diagram.");
+        let (_, fences) = markdown::copyable_fences(&source);
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].source, BODY);
+
+        let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+        live.chat.streaming = true;
+        live.chat.current_turn_id = Some("run:mermaid-sequence".into());
+        live.chat.current_response = source.clone();
+        let mut saved = assistant_transcript(&source);
+
+        for (glyphs, left_arrow, right_arrow) in [(Unicode, '←', '→'), (Ascii, '<', '>')] {
+            live.mermaid_glyphs = glyphs;
+            saved.mermaid_glyphs = glyphs;
+            let mut terminal = Terminal::new(TestBackend::new(38, 24)).unwrap();
+            let narrow = transcript_rows(&mut terminal, &saved, false);
+            assert!(narrow
+                .iter()
+                .any(|row| row.trim() == "Mermaid source · diagram too wide"));
+            assert!(fence_rows(&narrow, "mermaid")[1].contains("sequenceDiagram"));
+
+            for width in [60, 80, 120] {
+                terminal.backend_mut().resize(width, 24);
+                let streaming = transcript_rows(&mut terminal, &live, true);
+                let fence = fence_rows(&streaming, "mermaid");
+                assert!(fence[1].contains("sequenceDiagram"));
+                assert!(fence
+                    .iter()
+                    .any(|line| line.contains("P-->>C: Totals ready")));
+                assert!(!streaming.iter().any(|row| row.contains(left_arrow)));
+
+                let rows = transcript_rows(&mut terminal, &saved, false);
+                let rendered = (0..rows.len())
+                    .map(|row| visible_transcript_row(&terminal, row))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for text in [
+                    "终端 🧭",
+                    "Bamboo",
+                    "Project 资料",
+                    "审核请求",
+                    "读取汇总",
+                    "Totals ready",
+                    "After the diagram.",
+                ] {
+                    assert!(rendered.contains(text), "missing {text:?}:\n{rendered}");
+                }
+                assert!(rendered.contains(left_arrow) && rendered.contains(right_arrow));
+                assert!(
+                    !rendered.contains("sequenceDiagram") && !rendered.contains("Mermaid source")
+                );
+                if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_SEQUENCE").is_some()
+                {
+                    eprintln!("MERMAID SEQUENCE {glyphs:?} PREVIEW\n{rendered}\nEND MERMAID SEQUENCE PREVIEW");
+                }
+            }
+        }
+        assert_eq!(live.chat.current_response, source);
+        assert_eq!(saved.chat.messages[0].content, source);
+
+        let unsupported = assistant_transcript(
+            "~~~mermaid\nsequenceDiagram\nA->>B: Run\nNote over A,B: Context\n~~~",
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+        let rows = transcript_rows(&mut terminal, &unsupported, false);
+        assert!(rows
+            .iter()
+            .any(|row| row.trim() == "Mermaid source · unsupported diagram"));
+        assert!(fence_rows(&rows, "mermaid")
+            .iter()
+            .any(|row| row.contains("Note over A,B: Context")));
+    }
+
+    #[test]
     fn testbackend_renders_assistant_checklist_and_neighboring_markdown_at_each_width() {
         let source = concat!(
             "# Launch checklist\n\n",

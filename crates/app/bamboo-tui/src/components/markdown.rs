@@ -51,7 +51,7 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
 /// links, image descriptions, ATX and single-line Setext headings, nested
 /// bullet and ordered lists, task lists, thematic breaks, quotes and tables.
 /// Top-level quote paragraphs can have two explicit quote markers.
-/// Completed top-level Mermaid fences can preview a short vertical or horizontal path.
+/// Completed top-level Mermaid fences can preview a bounded flowchart or sequence diagram.
 pub(crate) fn render_markdown_with_mermaid_glyphs(
     text: &str,
     width: u16,
