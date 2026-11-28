@@ -33,8 +33,10 @@ open it. A child session shows **← Parent** in the header. Click it or press
 `F4` to return to the immediate parent.
 
 Search for **Terminal settings** in Functions to adjust appearance, expansion of
-new tool blocks, and toolbar hints for the current terminal process. The server
-configuration and permission policy entries open the corresponding Bamboo views.
+new tool blocks, and toolbar hints for the current terminal process.
+**Mermaid diagrams** switches preview borders and connectors between Unicode and
+ASCII. The server configuration and permission policy entries open the
+corresponding Bamboo views.
 Press `Esc` to park an approval in chat and `Ctrl+Q` to reopen it. The current
 draft remains in the composer.
 

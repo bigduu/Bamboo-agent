@@ -24,7 +24,7 @@ use crate::api::sse::{SessionSseEvent, SseStream, SESSION_SSE_CHANNEL_CAPACITY};
 use crate::api::types::*;
 use crate::api::{BambooClient, LoopChatRecord, RespondFailure, SessionLoopPreview};
 use crate::clipboard::{self, ClipboardContents, ClipboardImage};
-use crate::components::markdown::copyable_fences;
+use crate::components::markdown::{copyable_fences, MermaidGlyphs};
 use crate::components::session_rows::SessionRows;
 use crate::event::{AnswerSubmissionOutcome, AppEvent};
 use crate::file_reference::{pasted_files, FileReference};
@@ -5261,6 +5261,7 @@ pub struct App {
     pub running: bool,
     pub tab: Tab,
     pub theme: crate::theme::ThemePalette,
+    pub(crate) mermaid_glyphs: MermaidGlyphs,
     pub(crate) terminal_settings: Option<SettingsMenu>,
     pub(crate) workspace_hints: bool,
     pub(crate) keymap: Keymap,
@@ -5561,6 +5562,7 @@ impl App {
             running: true,
             tab: Tab::Chat,
             theme: crate::theme::ThemePalette::TrueColor,
+            mermaid_glyphs: MermaidGlyphs::default(),
             terminal_settings: None,
             workspace_hints: true,
             keymap: Keymap::default(),
@@ -10411,6 +10413,12 @@ impl App {
             }),
             TerminalSetting::ToolDetails => self.toggle_default_tool_details(),
             TerminalSetting::KeyHints => self.workspace_hints = !self.workspace_hints,
+            TerminalSetting::MermaidGlyphs => {
+                self.mermaid_glyphs = match self.mermaid_glyphs {
+                    MermaidGlyphs::Unicode => MermaidGlyphs::Ascii,
+                    MermaidGlyphs::Ascii => MermaidGlyphs::Unicode,
+                };
+            }
             TerminalSetting::ServerConfig => {
                 self.terminal_settings = None;
                 self.config.view = ConfigView::Raw;
@@ -36502,6 +36510,119 @@ mod run_status_tests {
             if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_NESTED_BLOCKQUOTE").is_some() {
                 let preview = terminal_text(&terminal);
                 eprintln!("NESTED BLOCKQUOTE PREVIEW\n{preview}\nEND NESTED BLOCKQUOTE PREVIEW");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_settings_switch_mermaid_glyphs_in_the_transcript() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        const SOURCE: &str = concat!(
+            "**Mermaid preview**\r\n\r\n```mermaid\r\n",
+            "flowchart LR\r\nA[界] -->|ready| B(🚀)\r\n```\r\n",
+        );
+        const SETTING: &str = "Mermaid diagrams";
+        for width in [60, 80, 120] {
+            let mut app = running_app("session-mermaid-glyphs", "run-mermaid-glyphs");
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            assert_eq!(app.mermaid_glyphs, MermaidGlyphs::Unicode);
+            app.handle_sse_event(AgentEvent::Token {
+                content: SOURCE.to_owned(),
+            })
+            .unwrap();
+
+            app.handle_global_action(ActionId::OpenTerminalSettings);
+            for _ in 0..3 {
+                app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+                    .await
+                    .unwrap();
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+                .await
+                .unwrap();
+            assert_eq!(app.mermaid_glyphs, MermaidGlyphs::Ascii);
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+                .await
+                .unwrap();
+            assert_focused_assistant_copy_source(&mut app, SOURCE);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let streaming = terminal_text(&terminal);
+            assert!(streaming.contains("flowchart LR"), "{streaming}");
+            assert!(streaming.contains("-->|ready|"), "{streaming}");
+
+            app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+                .unwrap();
+            assert_focused_assistant_copy_source(&mut app, SOURCE);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let ascii = terminal_text(&terminal);
+            assert!(
+                ascii.lines().any(|line| {
+                    line.contains("| 界") && line.contains("-->") && line.contains('🚀')
+                }),
+                "{ascii}"
+            );
+            assert!(ascii.contains("ready"), "{ascii}");
+            assert!(!ascii.contains("flowchart LR"), "{ascii}");
+            let ascii_scroll = app.chat.max_scroll.get();
+
+            app.handle_global_action(ActionId::OpenTerminalSettings);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let menu = terminal_text(&terminal);
+            let row = menu
+                .lines()
+                .position(|line| line.contains(SETTING) && line.contains("ASCII"))
+                .unwrap_or_else(|| panic!("Mermaid setting missing\n{menu}"));
+            let buffer = terminal.backend().buffer();
+            let column = buffer
+                .content()
+                .chunks(usize::from(width))
+                .nth(row)
+                .unwrap()
+                .windows(SETTING.len())
+                .position(|cells| {
+                    cells
+                        .iter()
+                        .zip(SETTING.bytes())
+                        .all(|(cell, byte)| cell.symbol().as_bytes() == [byte])
+                })
+                .unwrap();
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.handle_mouse(MouseEvent {
+                    kind,
+                    column: column as u16,
+                    row: row as u16,
+                    modifiers: KeyModifiers::empty(),
+                });
+            }
+            assert_eq!(app.mermaid_glyphs, MermaidGlyphs::Unicode);
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+                .await
+                .unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let unicode = terminal_text(&terminal);
+            assert!(
+                unicode.lines().any(|line| {
+                    line.contains("│ 界") && line.contains('→') && line.contains('🚀')
+                }),
+                "{unicode}"
+            );
+            assert_eq!(app.chat.max_scroll.get(), ascii_scroll);
+            assert_focused_assistant_copy_source(&mut app, SOURCE);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_ASCII").is_some() {
+                eprintln!("MERMAID ASCII PREVIEW\n{ascii}\nEND MERMAID ASCII PREVIEW");
+                eprintln!("MERMAID ASCII SETTINGS\n{menu}\nEND MERMAID ASCII SETTINGS");
             }
         }
     }

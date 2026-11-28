@@ -15,6 +15,13 @@ const MAX_PREVIEW_SOURCE_LINES: usize = 2_048;
 const MAX_FENCE_PREVIEW_ROWS: usize = 64;
 const MAX_FENCE_LABEL_CELLS: usize = 24;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MermaidGlyphs {
+    #[default]
+    Unicode,
+    Ascii,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CopyableFence<'a> {
     pub language: Option<&'a str>,
@@ -45,15 +52,29 @@ pub(crate) fn copyable_fences(text: &str) -> (&str, Vec<CopyableFence<'_>>) {
 /// bullet and ordered lists, task lists, thematic breaks, quotes and tables.
 /// Top-level quote paragraphs can have two explicit quote markers.
 /// Completed top-level Mermaid fences can preview a short vertical or horizontal path.
-pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
-    render_markdown_preview(text, width, false)
+pub(crate) fn render_markdown_with_mermaid_glyphs(
+    text: &str,
+    width: u16,
+    mermaid_glyphs: MermaidGlyphs,
+) -> Vec<Line<'static>> {
+    render_markdown_preview(text, width, false, mermaid_glyphs)
+}
+
+#[cfg(test)]
+pub(crate) fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
+    render_markdown_with_mermaid_glyphs(text, width, MermaidGlyphs::Unicode)
 }
 
 pub(crate) fn render_streaming_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
-    render_markdown_preview(text, width, true)
+    render_markdown_preview(text, width, true, MermaidGlyphs::Unicode)
 }
 
-fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<'static>> {
+fn render_markdown_preview(
+    text: &str,
+    width: u16,
+    streaming: bool,
+    mermaid_glyphs: MermaidGlyphs,
+) -> Vec<Line<'static>> {
     let width = width as usize;
     if width == 0 {
         return Vec::new();
@@ -86,7 +107,7 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
                     Some(if has_options {
                         Err(mermaid::Unavailable::Unsupported)
                     } else {
-                        mermaid::render(block.source, width)
+                        mermaid::render(block.source, width, mermaid_glyphs)
                     })
                 }
                 _ => None,
@@ -2143,6 +2164,22 @@ mod tests {
             let settled = render_markdown(source, 80);
             assert_eq!(text_of(&settled[0]), "Mermaid source · unsupported diagram");
             assert_eq!(settled[1..], render_streaming_markdown(source, 80));
+        }
+    }
+
+    #[test]
+    fn ascii_mermaid_glyphs_keep_source_fallbacks_and_other_markdown() {
+        for (source, width) in [
+            ("```mermaid\nflowchart RL\nA --> B\n```", 60),
+            ("```mermaid\nflowchart LR\nA[Wide] --> B[Long]\n```", 18),
+            ("```mermaid\nflowchart LR\nA --> B\n", 60),
+            ("## Notes\n\n```text\n┌─┐ →\n```", 60),
+        ] {
+            assert_eq!(
+                render_markdown_with_mermaid_glyphs(source, width, MermaidGlyphs::Ascii),
+                render_markdown(source, width),
+                "{source:?}"
+            );
         }
     }
 
