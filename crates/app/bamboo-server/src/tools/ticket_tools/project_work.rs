@@ -60,7 +60,7 @@ impl Tool for ProjectWorkTool {
         if self.name == CONTACT {
             "Supervisor only. List Projects, inspect one Project's Work, or send an instruction to its Project Manager. Delivery is asynchronous."
         } else {
-            "Project Manager only. List or inspect this Project's Work and sections; start an existing Work on explicit user instruction. Select a matching existing section ID and a registered prepared worktree, or omit it when there is only one."
+            "Project Manager only. List or inspect this Project's Work and sections. Pass board.next_cursor to read another page. Start an existing Work on explicit user instruction with a matching Section and registered prepared worktree."
         }
     }
 
@@ -81,6 +81,12 @@ impl Tool for ProjectWorkTool {
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "action":{"type":"string","enum":["list","inspect","start"]},
+                    "cursor":{"anyOf":[{"type":"null"},schema::object(json!({
+                        "commit":{"type":"string","minLength":1},
+                        "query_hash":{"type":"string","minLength":1},
+                        "offset":{"type":"integer","minimum":0}
+                    }), &["commit","query_hash","offset"])]},
+                    "fixed_commit":{"type":["string","null"],"description":"Optional fixed board snapshot for list"},
                     "work_id":{"type":"string","description":"Exact Work ID for inspect or start"},
                     "section_id":{"type":["string","null"],"description":"Existing Section ID for start, required when this Project has sections"},
                     "worktree":{"type":["string","null"],"description":"Registered isolated worktree for start"},

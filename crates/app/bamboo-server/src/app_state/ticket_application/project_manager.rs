@@ -38,75 +38,81 @@ async fn ensure_manager(
     config: &RwLock<Config>,
     project_id: &ProjectId,
 ) -> Result<Session> {
-    let project = active_project(projects, project_id)?;
-    let binding = match project.project_manager {
-        Some(binding) => binding,
-        None => {
-            let candidate = ProjectManagerBinding {
-                session_id: uuid::Uuid::new_v4(),
-                created_at: chrono::Utc::now(),
-            };
-            match projects.update(project_id, project.revision, |manifest| {
-                manifest.project_manager = Some(candidate.clone());
-                Ok(())
-            }) {
-                Ok(_) => candidate,
-                Err(error) => active_project(projects, project_id)?
-                    .project_manager
-                    .ok_or_else(|| Error::AuthorityUnavailable(error.to_string()))?,
-            }
-        }
-    };
-
-    let id = binding.session_id.to_string();
-    let _guard = persistence.acquire_lock(&id).await;
-    let project = active_project(projects, project_id)?;
-    if project.project_manager.as_ref() != Some(&binding) {
-        return Err(Error::ScopeDenied("Project Manager binding changed".into()));
-    }
     let storage = persistence.storage();
-    match storage.load_session(&id).await? {
-        Some(session) if manager_matches(&project, &session) => Ok(session),
-        Some(_) => Err(Error::ScopeDenied(
-            "Project Manager lifetime changed".into(),
-        )),
-        None => {
-            let config = config.read().await;
-            let mut session = build_new_session(
-                &CreateSessionInput {
-                    id: id.clone(),
-                    project_id: Some(project_id.clone()),
-                    title: Some("Project Manager".into()),
-                    title_generated: Some(true),
-                    system_prompt: Some(MANAGER_PROMPT.into()),
-                    model: None,
-                    model_ref: config
-                        .defaults
-                        .as_ref()
-                        .map(|defaults| defaults.chat.clone()),
-                    reasoning_effort: None,
-                    gold_config_json: None,
-                    workspace_path: project.project_path.clone(),
-                    permission_mode: None,
-                },
-                &CreateSessionConfig {
-                    default_model: config.get_model(),
-                    default_reasoning_effort: config.get_reasoning_effort(),
-                    global_default_prompt: String::new(),
-                    builtin_fallback_prompt: MANAGER_PROMPT,
-                },
-            );
-            session.metadata.insert(
-                bamboo_domain::session::tool_authority::PROJECT_MANAGER_SESSION_HINT.into(),
-                id.clone(),
-            );
-            session.created_at = binding.created_at;
-            session.updated_at = binding.created_at;
-            drop(config);
-            storage.save_session(&session).await?;
-            Ok(session)
+    for _ in 0..3 {
+        let mut project = active_project(projects, project_id)?;
+        if let Some(binding) = project.project_manager.clone() {
+            let id = binding.session_id.to_string();
+            let _guard = persistence.acquire_lock(&id).await;
+            project = active_project(projects, project_id)?;
+            if project.project_manager.as_ref() != Some(&binding) {
+                continue;
+            }
+            if let Some(session) = storage.load_root_authority(&id).await? {
+                if manager_matches(&project, &session) {
+                    return Ok(session);
+                }
+                return Err(Error::ScopeDenied(
+                    "Project Manager lifetime changed".into(),
+                ));
+            }
+            // An absent canonical Root may be an interrupted reservation or a
+            // deleted lifetime. In either case the old ID is never restored.
         }
+
+        let binding = ProjectManagerBinding {
+            session_id: uuid::Uuid::new_v4(),
+            created_at: chrono::Utc::now(),
+        };
+        let id = binding.session_id.to_string();
+        // Concurrent openers must wait for publication before observing this
+        // binding's Session as missing and trying another reservation.
+        let _guard = persistence.acquire_lock(&id).await;
+        match projects.update(project_id, project.revision, |manifest| {
+            manifest.project_manager = Some(binding.clone());
+            Ok(())
+        }) {
+            Ok(_) => {}
+            Err(bamboo_projects::ProjectStoreError::Conflict { .. }) => continue,
+            Err(error) => return Err(Error::AuthorityUnavailable(error.to_string())),
+        }
+
+        let config = config.read().await;
+        let mut session = build_new_session(
+            &CreateSessionInput {
+                id: id.clone(),
+                project_id: Some(project_id.clone()),
+                title: Some("Project Manager".into()),
+                title_generated: Some(true),
+                system_prompt: Some(MANAGER_PROMPT.into()),
+                model: None,
+                model_ref: config
+                    .defaults
+                    .as_ref()
+                    .map(|defaults| defaults.chat.clone()),
+                reasoning_effort: None,
+                gold_config_json: None,
+                workspace_path: project.project_path.clone(),
+                permission_mode: None,
+            },
+            &CreateSessionConfig {
+                default_model: config.get_model(),
+                default_reasoning_effort: config.get_reasoning_effort(),
+                global_default_prompt: String::new(),
+                builtin_fallback_prompt: MANAGER_PROMPT,
+            },
+        );
+        session.metadata.insert(
+            bamboo_domain::session::tool_authority::PROJECT_MANAGER_SESSION_HINT.into(),
+            id,
+        );
+        session.created_at = binding.created_at;
+        session.updated_at = binding.created_at;
+        drop(config);
+        storage.save_session(&session).await?;
+        return Ok(session);
     }
+    Err(Error::RevisionConflict)
 }
 
 fn active_project(
@@ -135,7 +141,10 @@ fn manager_matches(project: &ProjectManifest, session: &Session) -> bool {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ManagerRequest {
-    List,
+    List {
+        cursor: Option<ReadCursor>,
+        fixed_commit: Option<String>,
+    },
     Inspect {
         work_id: String,
     },
@@ -316,7 +325,10 @@ impl TicketApplication {
         let project = self.verify_project_manager(caller).await?;
         let (service, authority) = self.authority(coordinator()).await?;
         match request {
-            ManagerRequest::List => {
+            ManagerRequest::List {
+                cursor,
+                fixed_commit,
+            } => {
                 let board = service.project_board(
                     &authority,
                     &ProjectBoardRequest {
@@ -326,8 +338,8 @@ impl TicketApplication {
                         sprint_filter: None,
                         overdue_as_of: None,
                         limit: 24,
-                        cursor: None,
-                        fixed_commit: None,
+                        cursor,
+                        fixed_commit,
                     },
                 )?;
                 Ok(json!({

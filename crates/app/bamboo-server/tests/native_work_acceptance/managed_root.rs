@@ -1252,6 +1252,83 @@ async fn existing_project_work_survives_restart_and_dispatches_into_section() {
     );
     assert_eq!(card["data"][0]["ticket"]["id"], work_id);
     assert_eq!(card["data"][0]["submissions"][0]["id"], submission_id);
+    let base_contract = service.published().unwrap().1.tickets[&work_id]
+        .contract
+        .clone();
+    let populate = service
+        .prepare_command(
+            &owner,
+            "project-manager-paginated-board",
+            (0..24)
+                .flat_map(|index| {
+                    let temp = format!("paged-{index}");
+                    let mut contract = base_contract.clone();
+                    contract.title = format!("Paged Work {index}");
+                    [
+                        Operation::Create {
+                            temp_id: temp.clone(),
+                            kind: TicketKind::Work,
+                            parent: None,
+                            contract,
+                            depends_on: BTreeSet::new(),
+                        },
+                        Operation::AssociateProject {
+                            ticket_id: temp,
+                            project_id: project_id.clone(),
+                        },
+                    ]
+                })
+                .collect(),
+        )
+        .unwrap();
+    service.work_update(&owner, &populate).unwrap();
+    let first = project_tool(
+        &state,
+        &manager,
+        "project_manager_work",
+        json!({"action":"list"}),
+        true,
+    )
+    .await;
+    assert_eq!(first["board"]["data"]["rows"].as_array().unwrap().len(), 24);
+    let next = project_tool(&state, &manager, "project_manager_work",
+        json!({"action":"list", "cursor":first["board"]["next_cursor"], "fixed_commit":first["board"]["snapshot"]["commit"]}), true).await;
+    assert_eq!(next["board"]["data"]["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(next["board"]["snapshot"], first["board"]["snapshot"]);
+    assert!(next["board"]["next_cursor"].is_null());
+
+    let deleted = test::call_service(
+        &app,
+        test::TestRequest::delete()
+            .uri(&format!("/api/v1/sessions/{manager_id}"))
+            .peer_addr("127.0.0.1:5700".parse().unwrap())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let uri = format!("/api/v1/projects/{project_id}/manager");
+    let (left, right) = tokio::join!(
+        async { owner_post!(app, &uri, &json!({}), StatusCode::OK) },
+        async { owner_post!(app, &uri, &json!({}), StatusCode::OK) },
+    );
+    assert_eq!(left["session_id"], right["session_id"]);
+    assert_ne!(left["session_id"], manager_id);
+    assert!(state
+        .storage
+        .load_root_authority(&manager_id)
+        .await
+        .unwrap()
+        .is_none());
+    let replacement = state
+        .storage
+        .load_root_authority(left["session_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        replacement.project_id_meta().as_deref(),
+        Some(project_id.as_str())
+    );
     drop(app);
     state.shutdown().await;
 }
