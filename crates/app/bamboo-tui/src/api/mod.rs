@@ -71,16 +71,34 @@ pub(crate) struct LoopChatRecord {
 }
 
 #[derive(serde::Deserialize)]
-struct SessionLoopStatus {
+#[serde(bound(deserialize = "T: serde::Deserialize<'de>"))]
+struct SessionLoopStatus<T> {
     session_id: String,
     #[serde(rename = "loop", deserialize_with = "serde::Deserialize::deserialize")]
-    record: Option<LoopChatRecord>,
+    record: Option<T>,
+}
+
+#[derive(serde::Deserialize)]
+struct SelectedSessionLoopRecord {
+    #[serde(flatten)]
+    core: LoopChatRecord,
+    mode: Option<String>,
+    interval_seconds: Option<u64>,
+    iteration: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLoopPreview {
     pub state: SessionLoopPreviewState,
     pub next_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub mode: Option<SessionLoopPreviewMode>,
+    pub iteration: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLoopPreviewMode {
+    Fixed { interval_seconds: Option<u64> },
+    Adaptive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,7 +562,7 @@ impl BambooClient {
             let body = response.text().await.unwrap_or_default();
             anyhow::bail!("Session loop status failed ({status}): {}", body.trim());
         }
-        let status: SessionLoopStatus = response.json().await?;
+        let status: SessionLoopStatus<LoopChatRecord> = response.json().await?;
         anyhow::ensure!(
             status.session_id == session_id
                 && status
@@ -616,7 +634,7 @@ impl BambooClient {
             ),
             "Invalid Session loop status"
         );
-        let status: SessionLoopStatus = serde_json::from_slice(&body)
+        let status: SessionLoopStatus<SelectedSessionLoopRecord> = serde_json::from_slice(&body)
             .map_err(|_| anyhow::anyhow!("Invalid Session loop status"))?;
         anyhow::ensure!(
             status.session_id == session_id,
@@ -625,11 +643,20 @@ impl BambooClient {
         let Some(record) = status.record else {
             return Ok(None);
         };
-        let state = SessionLoopPreviewState::from_wire(&record.state)
+        let state = SessionLoopPreviewState::from_wire(&record.core.state)
             .ok_or_else(|| anyhow::anyhow!("Invalid Session loop status"))?;
+        let mode = match record.mode.as_deref() {
+            Some("fixed") => Some(SessionLoopPreviewMode::Fixed {
+                interval_seconds: record.interval_seconds.filter(|&seconds| seconds > 0),
+            }),
+            Some("adaptive") => Some(SessionLoopPreviewMode::Adaptive),
+            _ => None,
+        };
         Ok(Some(SessionLoopPreview {
             state,
-            next_fire_at: record.next_fire_at,
+            next_fire_at: record.core.next_fire_at,
+            mode,
+            iteration: record.iteration,
         }))
     }
 
@@ -2384,6 +2411,11 @@ mod tests {
             ("200 OK", r#"{"session_id":"chat"}"#, false),
             ("200 OK", r#"{"session_id":"other","loop":null}"#, false),
             ("200 OK", r#"{"session_id":"chat","loop":null}"#, true),
+            (
+                "200 OK",
+                r#"{"session_id":"chat","loop":{"state":"scheduled","mode":"future","interval_seconds":"unrecognized","iteration":null}}"#,
+                true,
+            ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
@@ -2502,6 +2534,8 @@ mod tests {
                 Some(SessionLoopPreview {
                     state,
                     next_fire_at: next_fire_at.map(|value| value.parse().unwrap()),
+                    mode: None,
+                    iteration: None,
                 })
             );
         }
@@ -2515,6 +2549,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_session_loop_status_projects_optional_paced_details() {
+        use serde_json::json;
+        use SessionLoopPreviewMode::{Adaptive, Fixed};
+        use SessionLoopPreviewState::Scheduled;
+
+        for (details, mode, iteration) in [
+            (
+                json!({ "mode": "fixed", "interval_seconds": 300, "iteration": 7 }),
+                Some(Fixed {
+                    interval_seconds: Some(300),
+                }),
+                Some(7),
+            ),
+            (
+                json!({ "mode": "adaptive", "interval_seconds": 91, "iteration": 2 }),
+                Some(Adaptive),
+                Some(2),
+            ),
+            (
+                json!({ "mode": "fixed", "interval_seconds": 0, "iteration": 0 }),
+                Some(Fixed {
+                    interval_seconds: None,
+                }),
+                Some(0),
+            ),
+            (
+                json!({ "mode": "fixed", "interval_seconds": null, "iteration": null }),
+                Some(Fixed {
+                    interval_seconds: None,
+                }),
+                None,
+            ),
+            (
+                json!({ "mode": "fixed" }),
+                Some(Fixed {
+                    interval_seconds: None,
+                }),
+                None,
+            ),
+            (
+                json!({ "mode": "future", "interval_seconds": 60, "iteration": 1 }),
+                None,
+                Some(1),
+            ),
+            (
+                json!({ "mode": null, "interval_seconds": null, "iteration": null }),
+                None,
+                None,
+            ),
+            (
+                json!({ "interval_seconds": 300, "iteration": 3 }),
+                None,
+                Some(3),
+            ),
+        ] {
+            let mut record = details;
+            record["state"] = json!("scheduled");
+            record["next_fire_at"] = json!("2026-11-28T02:03:04Z");
+            let body = json!({ "session_id": LOOP_PREVIEW_SESSION, "loop": record });
+            assert_eq!(
+                loop_preview_reply("200 OK", &body.to_string())
+                    .await
+                    .unwrap(),
+                Some(SessionLoopPreview {
+                    state: Scheduled,
+                    next_fire_at: Some("2026-11-28T02:03:04Z".parse().unwrap()),
+                    mode,
+                    iteration,
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn selected_session_loop_status_rejects_invalid_receipts_and_sanitizes_errors() {
         for body in [
             r#"{"session_id":"other","loop":null}"#,
@@ -2522,6 +2630,11 @@ mod tests {
             r#"{"session_id":"other","session_id":"session/one ?#%","loop":null}"#,
             r#"{"session_id":"session/one ?#%","loop":null,"loop":{"state":"scheduled"}}"#,
             r#"{"session_id":"session/one ?#%","loop":{"state":"stopped","state":"scheduled"}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","id":null,"id":"loop-one"}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","next_fire_at":null,"next_fire_at":null}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","mode":"future","mode":"fixed"}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","interval_seconds":null,"interval_seconds":60}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","iteration":null,"iteration":0}}"#,
             r#"["session/one ?#%",null]"#,
             r#"{"session_id":"session/one ?#%","loop":[null,"scheduled",null,null,null]}"#,
             r#"{"session_id":"session/one ?#%","loop":{"state":"RAW_HOST_DETAILS"}}"#,
