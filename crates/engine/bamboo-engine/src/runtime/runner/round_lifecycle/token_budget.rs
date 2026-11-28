@@ -21,6 +21,12 @@ enum WindowMode {
     Summary,
 }
 
+struct ResolvedModelBudget {
+    budget: TokenBudget,
+    provider_default_output: bool,
+    uses_context_fallback: bool,
+}
+
 static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
     LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
@@ -86,13 +92,34 @@ pub(super) async fn resolve_auxiliary_token_budget(
         resolve_configured_model_limit(config, model_name, &model_limits_path, "summarization")
             .await;
     let reported = reported_model_limits(llm, model_name).await;
-    let (budget, _) = resolve_window(
+    resolve_window(
         configured_limit.as_ref(),
         reported.as_ref(),
         WindowMode::Summary,
     )
-    .expect("summary budget has compatibility defaults");
-    budget
+    .expect("summary budget has compatibility defaults")
+    .budget
+}
+
+/// Resolve the same model window as an ordinary chat round, before any
+/// session-specific budget override.
+pub(crate) async fn resolve_chat_context_window(
+    config: &AgentLoopConfig,
+    model: &str,
+    provider: &dyn LLMProvider,
+) -> (u32, bool) {
+    let resolved = resolve_model_token_budget(
+        config,
+        &model_limits_path(config),
+        model,
+        provider,
+        WindowMode::AgentRound,
+    )
+    .await;
+    (
+        resolved.budget.max_context_tokens,
+        resolved.uses_context_fallback,
+    )
 }
 
 pub(super) async fn resolve_token_budget(
@@ -170,39 +197,24 @@ async fn resolve_token_budget_with_model_limits_path(
         return (resolved, false);
     }
 
-    // Resolve the existing per-model settings first, then intersect them with
-    // limits reported by the selected route. An omitted field can be filled by
-    // the route without replacing the configured fields of the same row.
-    let configured_limit =
-        resolve_configured_model_limit(config, model_name, model_limits_path, "chat").await;
-    let provider_limit = resolve_provider_runtime_limit(config, llm, model_name).await;
     let mode = if dynamic {
         WindowMode::AgentRound
     } else {
         WindowMode::Child
     };
-    let (budget, provider_default_output) =
-        resolve_window(configured_limit.as_ref(), provider_limit.as_ref(), mode).unwrap_or_else(
-            || {
-                let fallback = default_model_limit();
-                tracing::info!(
-                    model = model_name,
-                    context = fallback.max_context_tokens,
-                    output = fallback.get_max_output_tokens(),
-                    "Using compatibility token limits because the route supplied no capacity"
-                );
-                (
-                    TokenBudget::with_safety_margin(
-                        fallback.max_context_tokens,
-                        fallback.get_max_output_tokens(),
-                        bamboo_compression::BudgetStrategy::default(),
-                        fallback.get_safety_margin(),
-                    ),
-                    false,
-                )
-            },
+    let model_budget =
+        resolve_model_token_budget(config, model_limits_path, model_name, llm, mode).await;
+    if model_budget.uses_context_fallback {
+        tracing::info!(
+            model = model_name,
+            context = model_budget.budget.max_context_tokens,
+            output = model_budget.budget.max_output_tokens,
+            "Using the compatibility context window because the route supplied no context or input limit"
         );
-    let resolved = config.context_management.apply_compression_policy(budget);
+    }
+    let resolved = config
+        .context_management
+        .apply_compression_policy(model_budget.budget);
 
     // Publish the freshly resolved budget on the session so every downstream
     // reader in this round — `build_context_pressure` (tool-output truncation),
@@ -214,7 +226,34 @@ async fn resolve_token_budget_with_model_limits_path(
     // takes effect in an already-running session.
     session.resolved_token_budget = Some((model_name.to_string(), resolved.clone()));
 
-    (resolved, provider_default_output)
+    (resolved, model_budget.provider_default_output)
+}
+
+async fn resolve_model_token_budget(
+    config: &AgentLoopConfig,
+    model_limits_path: &Path,
+    model_name: &str,
+    llm: &dyn LLMProvider,
+    mode: WindowMode,
+) -> ResolvedModelBudget {
+    // An omitted configured field can be filled by the selected route without
+    // replacing configured fields on the same row.
+    let configured_limit =
+        resolve_configured_model_limit(config, model_name, model_limits_path, "chat").await;
+    let provider_limit = resolve_provider_runtime_limit(config, llm, model_name).await;
+    resolve_window(configured_limit.as_ref(), provider_limit.as_ref(), mode).unwrap_or_else(|| {
+        let fallback = default_model_limit();
+        ResolvedModelBudget {
+            budget: TokenBudget::with_safety_margin(
+                fallback.max_context_tokens,
+                fallback.get_max_output_tokens(),
+                bamboo_compression::BudgetStrategy::default(),
+                fallback.get_safety_margin(),
+            ),
+            provider_default_output: false,
+            uses_context_fallback: true,
+        }
+    })
 }
 
 /// Resolve user-configured limits without mixing source precedence into a
@@ -379,7 +418,7 @@ fn resolve_window(
     configured: Option<&ModelLimit>,
     reported: Option<&ProviderModelInfo>,
     mode: WindowMode,
-) -> Option<(TokenBudget, bool)> {
+) -> Option<ResolvedModelBudget> {
     fn tighter(left: Option<u32>, right: Option<u32>) -> Option<u32> {
         match (left, right) {
             (Some(left), Some(right)) => Some(left.min(right)),
@@ -454,7 +493,11 @@ fn resolve_window(
         planning_window = context,
         "Resolved model token limits"
     );
-    Some((budget, provider_default_output))
+    Some(ResolvedModelBudget {
+        budget,
+        provider_default_output,
+        uses_context_fallback: joint_window.is_none() && input_limit.is_none(),
+    })
 }
 
 #[cfg(test)]
@@ -901,8 +944,9 @@ mod tests {
         };
 
         let fallback = resolve_token_budget(&mut session, &config, model, &provider).await;
-        assert_eq!(fallback.max_context_tokens, 32_768);
+        assert_eq!(fallback.max_context_tokens, 475_000);
         assert_eq!(fallback.max_output_tokens, 4_096);
+        assert_eq!(fallback.max_request_input_tokens(), 466_154);
 
         let path = model_limits_path(&config);
         let stored = r#"[{"model_pattern":"metadata-free-model","max_context_tokens":1000000,"max_output_tokens":32000}]"#;
@@ -1244,9 +1288,10 @@ mod tests {
             max_input_tokens: Some(67_000),
             max_output_tokens: Some(48_000),
         };
-        let (budget, provider_default) =
+        let resolved =
             resolve_window(Some(&explicit), Some(&provider), WindowMode::AgentRound).unwrap();
-        assert!(!provider_default);
+        assert!(!resolved.provider_default_output);
+        let budget = resolved.budget;
         assert_eq!(budget.max_context_tokens, 96_000);
         assert_eq!(budget.max_request_input_tokens(), 66_000);
         assert_eq!(budget.output_limit_for_input(10_000), 48_000);
@@ -1258,15 +1303,14 @@ mod tests {
     fn unlimited_output_respects_route_ceilings_and_allows_provider_defaults() {
         let mut configured = ModelLimit::new("fixture-model", 256_000);
         configured.safety_margin = Some(1_000);
-        let (automatic, provider_default) =
-            resolve_window(Some(&configured), None, WindowMode::AgentRound).unwrap();
-        assert!(!provider_default);
-        assert_eq!(automatic.output_limit_for_input(32_000), 64_000);
+        let automatic = resolve_window(Some(&configured), None, WindowMode::AgentRound).unwrap();
+        assert!(!automatic.provider_default_output);
+        assert_eq!(automatic.budget.output_limit_for_input(32_000), 64_000);
 
         configured.unlimited_output = true;
-        let (unlimited, provider_default) =
-            resolve_window(Some(&configured), None, WindowMode::AgentRound).unwrap();
-        assert!(provider_default);
+        let unlimited = resolve_window(Some(&configured), None, WindowMode::AgentRound).unwrap();
+        assert!(unlimited.provider_default_output);
+        let unlimited = unlimited.budget;
         assert_eq!(unlimited.max_request_input_tokens(), 254_000);
         assert_eq!(unlimited.output_limit_for_input(32_000), 64_000);
         assert_eq!(unlimited.output_limit_for_input(255_000), 0);
@@ -1277,22 +1321,23 @@ mod tests {
             max_input_tokens: Some(110_000),
             max_output_tokens: Some(80_000),
         };
-        let (with_metadata, provider_default) =
+        let with_metadata =
             resolve_window(Some(&configured), Some(&reported), WindowMode::AgentRound).unwrap();
-        assert!(!provider_default);
+        assert!(!with_metadata.provider_default_output);
+        let with_metadata = with_metadata.budget;
         assert_eq!(with_metadata.output_limit_for_input(32_000), 80_000);
         assert_eq!(with_metadata.output_limit_for_input(108_000), 51_000);
         assert_eq!(with_metadata.output_limit_for_input(110_000), 0);
 
         reported.max_output_tokens = None;
-        let (joint_only, provider_default) =
+        let joint_only =
             resolve_window(Some(&configured), Some(&reported), WindowMode::AgentRound).unwrap();
-        assert!(provider_default);
-        assert_eq!(joint_only.output_limit_for_input(32_000), 40_000);
+        assert!(joint_only.provider_default_output);
+        assert_eq!(joint_only.budget.output_limit_for_input(32_000), 40_000);
 
-        let (fixed, provider_default) =
-            resolve_window(Some(&configured), None, WindowMode::Child).unwrap();
-        assert!(!provider_default);
+        let fixed = resolve_window(Some(&configured), None, WindowMode::Child).unwrap();
+        assert!(!fixed.provider_default_output);
+        let fixed = fixed.budget;
         assert_eq!(fixed.max_output_tokens, 64_000);
         assert_eq!(fixed.output_reserve_tokens, None);
     }

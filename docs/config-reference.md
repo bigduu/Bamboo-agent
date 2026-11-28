@@ -898,7 +898,7 @@ section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
 The file stores explicit overrides. With no matching user or provider limit,
-ordinary Agent turns and the defaults API use 32,768 total context tokens and
+ordinary Agent turns and the defaults API use 475,000 total context tokens and
 4,096 output tokens. If only the provider's input or combined window is known,
 Bamboo uses at most 4,096 output tokens. For a user-configured window with no
 output ceiling, the fallback is one quarter of the window, up to 64,000. Set
