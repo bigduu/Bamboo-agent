@@ -167,10 +167,18 @@ fn render_markdown_preview(text: &str, width: u16, streaming: bool) -> Vec<Line<
         // Blockquote.
         let quote = body.strip_prefix('>');
         let quote_can_continue = quote.is_some_and(paragraph_can_be_lazy);
-        if let Some(content) = body
-            .strip_prefix("> ")
-            .or_else(|| body.eq("> ").then_some(""))
-        {
+        let quote_content = body.strip_prefix("> ").or_else(|| {
+            let content = quote?;
+            if block_container != ParagraphContainer::None || top_level_body(raw_line) != Some(body)
+            {
+                return None;
+            }
+            let content = content.strip_prefix('\t').unwrap_or(content);
+            (!content.is_empty()
+                && !content.starts_with(|ch: char| ch == '>' || ch.is_whitespace()))
+            .then_some(content)
+        });
+        if let Some(content) = quote_content {
             let mut spans = vec![Span::styled(
                 format!("{indent}│ "),
                 Style::default().fg(colors::thinking()),
@@ -1790,6 +1798,79 @@ mod tests {
         assert!(out[0].contains("│ "));
         assert!(out[0].contains("quoted"));
         assert!(out[0].contains("bold"));
+    }
+
+    #[test]
+    fn compact_and_tab_blockquotes_match_spaced_styled_text_at_each_width() {
+        const CONTENT: &str = "复核 **重点** 🧭 and `code`";
+        for width in [60, 80, 120] {
+            for spaces in 0..=3 {
+                let indent = " ".repeat(spaces);
+                let spaced = format!("{indent}> {CONTENT}");
+                let expected = render_markdown(&spaced, width);
+                assert_eq!(
+                    text_of(&expected[0]),
+                    format!("{indent}│ 复核 重点 🧭 and code")
+                );
+                assert!(expected[0].spans.iter().any(|span| {
+                    span.content == "重点" && span.style.add_modifier.contains(Modifier::BOLD)
+                }));
+                for marker in [">", ">\t"] {
+                    let source = format!("{indent}{marker}{CONTENT}");
+                    assert_eq!(render_markdown(&source, width), expected);
+                    assert_eq!(render_streaming_markdown(&source, width), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_blockquotes_keep_table_cells_and_following_breaks_independent() {
+        const TABLE: &str = "| Notes | State |\n| --- | --- |\n| >cell | Ready |\n";
+        for marker in [">", ">\t"] {
+            let source = format!("{TABLE}{marker}quote | text\n---");
+            let expected = render_markdown(&format!("{TABLE}> quote | text\n---"), 60);
+            let rows = render_markdown(&source, 60);
+            assert_eq!(rows, expected);
+            assert_eq!(rows.len(), 5);
+            assert!(text_of(&rows[2]).contains(">cell"));
+            assert_eq!(text_of(&rows[3]), "│ quote | text");
+            assert_eq!(text_of(&rows[4]), "─".repeat(60));
+
+            let source = format!("{marker}first\n{marker}second\ncontinued\n---");
+            assert_eq!(
+                render_markdown(&source, 60),
+                render_markdown("> first\n> second\ncontinued\n---", 60)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_blockquotes_keep_existing_literal_contexts() {
+        for (source, expected) in [
+            (">", ">"),
+            (">\t", ">\t"),
+            (">>nested", ">>nested"),
+            (">\t>nested", ">\t>nested"),
+            (">\t\ttwo tabs", ">\t\ttwo tabs"),
+            (">\t extra whitespace", ">\t extra whitespace"),
+            ("    >indented", "    >indented"),
+            ("\t>indented", "  >indented"),
+        ] {
+            assert_eq!(render(source), [expected]);
+            assert_eq!(
+                render_streaming_markdown(source, 60)
+                    .iter()
+                    .map(text_of)
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+        }
+        assert_eq!(render("- item\n  >inside"), ["  • item", "  >inside"]);
+        let fenced = render("~~~text\n>compact\n>\ttab\n~~~");
+        assert!(fenced[1].contains(">compact"));
+        assert!(fenced[2].contains(">"));
+        assert!(fenced[2].contains("tab"));
     }
 
     #[test]
