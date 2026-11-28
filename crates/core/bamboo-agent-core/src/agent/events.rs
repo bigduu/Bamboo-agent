@@ -579,6 +579,15 @@ pub enum AgentEvent {
         updated_at: chrono::DateTime<chrono::Utc>,
     },
 
+    /// The Root's manual category changed. A null category clears the value.
+    SessionCategoryUpdated {
+        session_id: String,
+        project_id: Option<String>,
+        category: Option<String>,
+        metadata_version: u64,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    },
+
     /// A new session was created.
     ///
     /// Change-feed event: durable, journaled, carried on the account `/stream`
@@ -997,6 +1006,7 @@ impl AgentEvent {
             | AgentEvent::PermissionPostureActivated { session_id, .. }
             | AgentEvent::SessionTitleUpdated { session_id, .. }
             | AgentEvent::SessionPinnedUpdated { session_id, .. }
+            | AgentEvent::SessionCategoryUpdated { session_id, .. }
             | AgentEvent::SessionCreated { session_id, .. }
             | AgentEvent::SessionDeleted { session_id, .. }
             | AgentEvent::SessionCleared { session_id, .. }
@@ -1047,6 +1057,7 @@ impl AgentEvent {
                     | AgentEvent::BashCompleted { .. }
                     | AgentEvent::SessionTitleUpdated { .. }
                     | AgentEvent::SessionPinnedUpdated { .. }
+                    | AgentEvent::SessionCategoryUpdated { .. }
                     | AgentEvent::PlanModeEntered { .. }
                     | AgentEvent::PlanModeExited { .. }
                     | AgentEvent::BudgetExceeded { .. }
@@ -1076,6 +1087,7 @@ impl AgentEvent {
                 | AgentEvent::SessionCleared { .. }
                 | AgentEvent::SessionTitleUpdated { .. }
                 | AgentEvent::SessionPinnedUpdated { .. }
+                | AgentEvent::SessionCategoryUpdated { .. }
                 | AgentEvent::TaskListUpdated { .. }
                 | AgentEvent::TaskListItemProgress { .. }
                 | AgentEvent::TaskListCompleted { .. }

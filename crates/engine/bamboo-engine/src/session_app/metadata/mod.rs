@@ -32,13 +32,16 @@
 //!   tool execution paths are non-authoritative and must stay on
 //!   `merge_save_session` / `merge_save_runtime` without touching `title`
 //!   directly.
-//! - `set_pinned`: the only authoritative writer for `pinned`.
+//! - `set_pinned` and `set_category`: authoritative writers for pin and category.
 //! - Only these methods bump `metadata_version`.  Runtime paths never bump it,
 //!   so `merge_save_session` / `merge_save_runtime` can use it as a staleness
 //!   signal for the entire authoritative metadata group.
 
-use bamboo_agent_core::{AgentEvent, Session, TitleSource};
-use bamboo_domain::SessionPresentationMutation;
+use bamboo_agent_core::{AgentEvent, Session, SessionKind, TitleSource};
+use bamboo_domain::{
+    normalize_session_category, InvalidSessionCategory, SessionPresentationMutation,
+    SESSION_CATEGORY_METADATA_KEY,
+};
 use bamboo_storage::v2::SIDE_CHAT_CLEAR_EPOCH_KEY;
 use chrono::{DateTime, Utc};
 
@@ -55,6 +58,10 @@ pub enum MetadataError {
     Storage(String),
     #[error("session update event queue unavailable: {0}")]
     EventQueueUnavailable(#[from] std::io::Error),
+    #[error(transparent)]
+    InvalidCategory(#[from] InvalidSessionCategory),
+    #[error("Only Root Sessions have a manual category")]
+    CategoryRequiresRoot,
     /// The caller's `If-Match` precondition (expected `metadata_version`) did
     /// not match the current persisted version — a concurrent write won.
     #[error("version conflict: expected {expected}, current {current}")]
@@ -325,6 +332,56 @@ impl SessionMetadataService {
         publish_reserved_session_mutation(state, session_id, event, event_slot).await;
 
         Ok(Some(pinned))
+    }
+
+    /// Set or clear the Root's category through the presentation transaction.
+    pub async fn set_category(
+        state: &dyn AgentSessionContext,
+        session_id: &str,
+        category: Option<&str>,
+        if_match: u64,
+    ) -> Result<MetadataChange<Option<String>>, MetadataError> {
+        let category = category.map(normalize_session_category).transpose()?;
+        let _guard = state.persistence().acquire_lock(session_id).await;
+        let mut session = load_latest(state, session_id).await?;
+        ensure_if_match(&session, Some(if_match))?;
+        if session.kind != SessionKind::Root {
+            return Err(MetadataError::CategoryRequiresRoot);
+        }
+        if session.category() == category {
+            validate_presentation_metadata(state, &session).await?;
+            return Ok(None);
+        }
+
+        if let Some(category) = category {
+            session
+                .metadata
+                .insert(SESSION_CATEGORY_METADATA_KEY.into(), category.into());
+        } else {
+            session.metadata.remove(SESSION_CATEGORY_METADATA_KEY);
+        }
+        session.metadata_version = session
+            .metadata_version
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Storage("metadata version overflow".into()))?;
+        session.updated_at = Utc::now();
+
+        let event_slot = state.account_sink().reserve_session_mutation().await?;
+        session =
+            commit_presentation_metadata(state, &session, SessionPresentationMutation::Category)
+                .await?;
+        refresh_in_memory_cache(state, session_id, session.clone()).await;
+
+        let category = session.category().map(str::to_owned);
+        let event = AgentEvent::SessionCategoryUpdated {
+            session_id: session.id.clone(),
+            project_id: session.project_id_meta(),
+            category: category.clone(),
+            metadata_version: session.metadata_version,
+            updated_at: session.updated_at,
+        };
+        publish_reserved_session_mutation(state, session_id, event, event_slot).await;
+        Ok(Some(category))
     }
 
     /// Set or clear the session-level Gold configuration JSON.

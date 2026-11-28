@@ -1,9 +1,12 @@
-//! Title and pinned commits advance existing observations, never Actor authority.
+//! Presentation commits advance existing Root and Actor observations.
 //! All reads/preflight and publication use the caller's existing Root tree
 //! writer scope. No descendant Session lock, ensure_actor, marker or repair.
 
 use super::*;
-use bamboo_domain::{ActorDirectoryEntry, ActorSession, SessionAuthorityConflict};
+use bamboo_domain::{
+    normalize_session_category, ActorDirectoryEntry, ActorSession, SessionAuthorityConflict,
+    SESSION_CATEGORY_METADATA_KEY,
+};
 
 fn conflict(message: &str) -> io::Error {
     io::Error::new(
@@ -44,6 +47,27 @@ fn validate_presentation_change(
             comparison.pinned = previous.pinned;
             if previous.pinned == incoming.pinned {
                 return Err(conflict("pinned commit requires a changed pinned value"));
+            }
+        }
+        SessionPresentationMutation::Category => {
+            let previous_category = previous.metadata.get(SESSION_CATEGORY_METADATA_KEY);
+            let incoming_category = incoming.metadata.get(SESSION_CATEGORY_METADATA_KEY);
+            if previous.kind != SessionKind::Root
+                || previous_category == incoming_category
+                || incoming_category.is_some_and(|name| {
+                    !normalize_session_category(name).is_ok_and(|trimmed| trimmed == name.as_str())
+                })
+            {
+                return Err(conflict(
+                    "category commit requires a changed, valid Root category",
+                ));
+            }
+            if let Some(name) = previous_category {
+                comparison
+                    .metadata
+                    .insert(SESSION_CATEGORY_METADATA_KEY.into(), name.clone());
+            } else {
+                comparison.metadata.remove(SESSION_CATEGORY_METADATA_KEY);
             }
         }
     }

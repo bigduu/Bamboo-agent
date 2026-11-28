@@ -7,10 +7,13 @@ use bamboo_engine::session_app::provider_model::{
     derive_model_ref, persist_legacy_model_provider, persist_model_ref,
 };
 
-use super::super::super::types::PatchSessionRequest;
+use super::super::super::types::SessionPatchBody;
 use super::query::get_session;
 use super::running::is_session_running;
 use crate::permission_audit::record_bamboo_runtime_permission_transition_metadata;
+
+#[cfg(test)]
+mod category_tests;
 
 #[cfg(test)]
 mod patch_test_hooks {
@@ -215,9 +218,22 @@ pub async fn patch_session(
     state: web::Data<AppState>,
     path: web::Path<String>,
     http_req: HttpRequest,
-    req: web::Json<PatchSessionRequest>,
+    req: web::Json<SessionPatchBody>,
 ) -> Result<HttpResponse> {
     let session_id = path.into_inner();
+    let req = match req.into_inner() {
+        SessionPatchBody::Category(patch) => {
+            return patch_category(state, session_id, &http_req, patch.category.as_deref()).await;
+        }
+        SessionPatchBody::General(req) if req.category.is_none() => req,
+        SessionPatchBody::General(_) => {
+            return Ok(crate::error::json_error_with_code(
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "Send category as a string or null in its own PATCH request".into(),
+                Some("invalid_session_category_patch"),
+            ));
+        }
+    };
     if req.thinking_mode.is_some() {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "error": {
@@ -970,6 +986,54 @@ pub async fn patch_session(
 
     // Report the permission posture and its ETag from the same durable read.
     get_session(state, web::Path::from(session_id)).await
+}
+
+async fn patch_category(
+    state: web::Data<AppState>,
+    session_id: String,
+    http_req: &HttpRequest,
+    category: Option<&str>,
+) -> Result<HttpResponse> {
+    let Some(expected_version) = parse_if_match(http_req) else {
+        return Ok(crate::error::json_error_with_code(
+            actix_web::http::StatusCode::PRECONDITION_REQUIRED,
+            "If-Match with the current session metadata_version is required for category changes"
+                .into(),
+            Some("session_category_precondition_required"),
+        ));
+    };
+
+    match SessionMetadataService::set_category(
+        state.get_ref(),
+        &session_id,
+        category,
+        expected_version,
+    )
+    .await
+    {
+        Ok(_) => get_session(state, web::Path::from(session_id)).await,
+        Err(MetadataError::VersionConflict { current, .. }) => {
+            Ok(precondition_failed(&session_id, current))
+        }
+        Err(MetadataError::NotFound(_)) => Ok(HttpResponse::NotFound().json(serde_json::json!({
+            "error": crate::error::error_value("Session not found"),
+            "session_id": session_id
+        }))),
+        Err(MetadataError::InvalidCategory(error)) => Ok(crate::error::json_error_with_code(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            error.to_string(),
+            Some("invalid_session_category"),
+        )),
+        Err(MetadataError::CategoryRequiresRoot) => Ok(crate::error::json_error_with_code(
+            actix_web::http::StatusCode::CONFLICT,
+            MetadataError::CategoryRequiresRoot.to_string(),
+            Some("session_category_requires_root"),
+        )),
+        Err(MetadataError::EventQueueUnavailable(error)) => {
+            Ok(crate::events::session_event_queue_unavailable(error))
+        }
+        Err(error) => Err(crate::error::json_internal_server_error(error.to_string())),
+    }
 }
 
 #[cfg(test)]
