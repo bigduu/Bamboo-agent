@@ -752,6 +752,29 @@ for a Host upgrade in that case.
 
 ---
 
+### Skill management availability
+
+```http
+GET /api/v1/skills?include_management=true&include_disabled=true
+```
+
+The response adds `management` with the catalog `revision`, row `total`, and
+`entries` from the same publication. Each winning Skill row contains `id`,
+`name`, `description`, `source`, `revision`, and `availability`.
+
+| Availability | Meaning |
+| --- | --- |
+| `ready` | The current definition is readable. |
+| `retained` | The current source failed to load and the store retained a readable previous definition. |
+| `view_only` | The catalog records the Skill and the store has no readable definition for it. |
+
+The management entries include disabled Skills. `search` and `include_disabled`
+continue to filter `skills` and its top-level `total`. Skill enablement comes
+from the existing configuration. Omitting `include_management` or setting it to
+`false` returns the original list shape.
+
+---
+
 ### Health Check
 
 #### Health Check Endpoint

@@ -157,6 +157,159 @@ async fn get_available_workflows_maps_listing_failures_to_internal_error() {
 }
 
 #[actix_web::test]
+async fn skill_management_lists_one_complete_publication_without_changing_legacy_filters() {
+    use serde_json::{json, Value};
+
+    let temp_dir = tempfile::tempdir().expect("temp data directory");
+    let data = temp_dir.path();
+    for (directory, contents) in [
+        (
+            "skills/management-ready",
+            "---\nname: Review ready\ndescription: selection-needle winning instructions\n---\nReady instruction fixture.\n",
+        ),
+        (
+            "skills/management-disabled",
+            "---\nname: Review disabled\ndescription: selection-needle disabled instructions\n---\nDisabled instruction fixture.\n",
+        ),
+        (
+            "skills/management-retained",
+            "---\nname: Review retained\ndescription: Last usable description\n---\nRetained instruction fixture.\n",
+        ),
+        (
+            "skills/management-migrated",
+            "---\nname: Review migrated\ndescription: Explicitly migrated skill\nmetadata:\n  legacy_migration: true\n  legacy_name: management-migrated\n  original_source: workflows/management-migrated.md\n---\nMigrated instruction fixture.\n",
+        ),
+        (
+            "plugins/management-shadow/skills/management-ready",
+            "---\nname: Shadowed review\ndescription: selection-needle shadowed instructions\n---\nShadow instruction fixture.\n",
+        ),
+    ] {
+        let directory = data.join(directory);
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        tokio::fs::write(directory.join("SKILL.md"), contents)
+            .await
+            .unwrap();
+    }
+    let state = web::Data::new(AppState::new(data.to_path_buf()).await.unwrap());
+    state.config.write().await.skills.disabled = vec!["management-disabled".into()];
+    let store = state.skill_manager.store();
+    let before = store.skill_catalog_snapshot().await;
+    assert_eq!(
+        store
+            .get_skill("management-retained")
+            .await
+            .unwrap()
+            .description,
+        "Last usable description"
+    );
+
+    let invalid = "---\nname: Broken review\ndescription: Omitted parser details\nallowed-tools: [\n---\nOmitted invalid instructions.\n";
+    let new_invalid = data.join("skills/management-view-only");
+    tokio::fs::create_dir_all(&new_invalid).await.unwrap();
+    for file in [
+        data.join("skills/management-retained/SKILL.md"),
+        new_invalid.join("SKILL.md"),
+    ] {
+        tokio::fs::write(file, invalid).await.unwrap();
+    }
+
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state.clone())
+            .configure(super::config),
+    )
+    .await;
+    let get = |uri: &str| {
+        let request = actix_web::test::TestRequest::get().uri(uri).to_request();
+        let app = &app;
+        async move {
+            let response = actix_web::test::call_service(app, request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            actix_web::test::read_body_json::<Value, _>(response).await
+        }
+    };
+
+    let opted_in =
+        get("/skills?search=selection-needle&refresh=true&include_management=true").await;
+    let current = store.skill_catalog_snapshot().await;
+    assert!(current.revision > before.revision);
+    assert_eq!(opted_in.as_object().unwrap().len(), 3);
+    let management = &opted_in["management"];
+    let rows = management["entries"].as_array().unwrap();
+    assert_eq!(
+        *management,
+        json!({"revision": current.revision, "total": rows.len(), "entries": rows}),
+    );
+    let winners: Vec<_> = current
+        .entries
+        .iter()
+        .filter(|entry| entry.winner)
+        .collect();
+    assert_eq!(rows.len(), winners.len());
+    assert!(winners.windows(2).all(|pair| pair[0].id < pair[1].id));
+    for (row, entry) in rows.iter().zip(winners) {
+        assert_eq!(
+            row,
+            &json!({
+                "id": entry.id,
+                "name": entry.name,
+                "description": entry.description,
+                "source": entry.source,
+                "revision": entry.revision,
+                "availability": row["availability"],
+            })
+        );
+        assert!(matches!(
+            row["availability"].as_str(),
+            Some("ready" | "retained" | "view_only")
+        ));
+    }
+    let row = |id| rows.iter().find(|row| row["id"] == id).unwrap();
+    for (id, availability) in [
+        ("management-ready", "ready"),
+        ("management-disabled", "ready"),
+        ("management-migrated", "ready"),
+        ("management-retained", "retained"),
+        ("management-view-only", "view_only"),
+    ] {
+        assert_eq!(row(id)["availability"], availability, "{id}");
+    }
+    assert_eq!(row("management-ready")["source"], "user");
+    assert_eq!(
+        row("management-ready")["description"],
+        "selection-needle winning instructions"
+    );
+    assert_eq!(
+        row("management-retained")["description"],
+        "Last usable description"
+    );
+    let ready = current
+        .entries
+        .iter()
+        .find(|entry| entry.id == "management-ready")
+        .unwrap();
+    assert_eq!(ready.shadowed_candidates.len(), 1);
+    assert_eq!(opted_in["total"], 1);
+    assert_eq!(opted_in["skills"][0]["id"], "management-ready");
+
+    let legacy = get("/skills?search=selection-needle").await;
+    assert_eq!(
+        legacy,
+        json!({"total": opted_in["total"], "skills": opted_in["skills"]})
+    );
+    assert_eq!(
+        get("/skills?search=selection-needle&include_management=false").await,
+        legacy
+    );
+    let including_disabled =
+        get("/skills?search=selection-needle&include_disabled=true&include_management=true").await;
+    assert_eq!(including_disabled["total"], 2);
+    assert_eq!(including_disabled["skills"][0]["id"], "management-disabled");
+    assert_eq!(including_disabled["skills"][1]["id"], "management-ready");
+    assert_eq!(&including_disabled["management"], management);
+}
+
+#[actix_web::test]
 async fn historical_legacy_import_bundle_is_not_a_public_skill() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let source = temp_dir.path().join("workflows/legacy.md");
