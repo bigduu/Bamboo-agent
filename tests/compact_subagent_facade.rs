@@ -658,7 +658,7 @@ async fn fixture(role: Option<&'static str>, fast_grandchild: bool) {
         assert!(!child.agent_runtime_state.as_ref().unwrap().read_only);
         assert_eq!(
             binding["tools"],
-            json!(["exec_command", "write_stdin", "Glob", "Read"])
+            json!(["exec_command", "write_stdin", "Glob", "Read", "ViewImage"])
         );
         assert!(child.messages[0]
             .content

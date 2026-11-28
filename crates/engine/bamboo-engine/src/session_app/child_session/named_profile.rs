@@ -141,9 +141,10 @@ impl ResolvedChildProfile {
             .copied()
             .filter(|&name| {
                 let shell = matches!(name, "exec_command" | "write_stdin");
-                // Explicit denies and the Host's runtime ceiling still narrow
-                // the role's baseline shell access.
-                (shell || allowed.is_empty() || declares_tool(allowed, name))
+                // An empty allow list keeps the existing role defaults.
+                // ViewImage is selected by an explicit profile declaration.
+                let default_grant = allowed.is_empty() && name != "ViewImage";
+                (shell || default_grant || declares_tool(allowed, name))
                     && !matches!(name, "Bash" | "bash")
                     && !declares_tool(denied, name)
                     && !(foreground_denied && shell)
@@ -509,14 +510,19 @@ mod tests {
             std::fs::write(&file, definition("explorer", tools)).unwrap();
             bound(selected(&home, "explorer", &parent), &parent)
         };
-        let denied = create_child("tools:\n  deny: [Bash, ViewImage]");
+        let implicit = create_child("tools:\n  deny: [Bash]");
+        let denied = create_child("tools:\n  allow: [Read]\n  deny: [Bash, ViewImage]");
         let allowed = create_child("tools:\n  allow: [Read, ViewImage]\n  deny: [Bash]");
 
         assert!(read_binding(&denied).unwrap().unwrap().read_only);
         assert!(read_binding(&allowed).unwrap().unwrap().read_only);
         assert_eq!(
-            named_profile_tool_names(&denied).unwrap().unwrap(),
+            named_profile_tool_names(&implicit).unwrap().unwrap(),
             ["Glob", "Read"]
+        );
+        assert_eq!(
+            named_profile_tool_names(&denied).unwrap().unwrap(),
+            ["Read"]
         );
         assert_eq!(
             named_profile_tool_names(&allowed).unwrap().unwrap(),
@@ -560,7 +566,7 @@ mod tests {
             ),
             (
                 "tools:\n  deny: [bash]",
-                vec!["Edit", "Glob", "Read", "ViewImage", "Write"],
+                vec!["Edit", "Glob", "Read", "Write"],
             ),
         ] {
             std::fs::write(
