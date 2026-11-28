@@ -826,6 +826,13 @@ The response adds `management` with the catalog `revision`, row `total`, and
 | `retained` | The current source failed to load and the store retained a readable previous definition. |
 | `view_only` | The catalog records the Skill and the store has no readable definition for it. |
 
+Ordinary instruction Skills can use plain Markdown or omit display fields in
+YAML frontmatter. Discovery derives a missing name from an opening Markdown
+heading or the directory slug and a missing description from the first prose
+paragraph or display name. Inferred descriptions are limited to 256 characters.
+The directory slug remains the Skill ID, and discovery reads the original file
+in place.
+
 The management entries include disabled Skills. `search` and `include_disabled`
 continue to filter `skills` and its top-level `total`. Skill enablement comes
 from the existing configuration. Omitting `include_management` or setting it to

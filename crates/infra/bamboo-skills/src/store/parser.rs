@@ -13,6 +13,14 @@ use super::codex_frontmatter::{self, SkillFrontmatter as CodexFrontmatter};
 static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
     LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
+const LEGACY_FLAGS: [&str; 4] = [
+    "legacy_manual_only",
+    "legacy_adapter",
+    "legacy_migration",
+    "legacy_import",
+];
+const INFERRED_DESCRIPTION_LIMIT: usize = 256;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SkillFrontmatter {
     #[serde(flatten)]
@@ -80,9 +88,44 @@ impl AllowedTools {
 }
 
 pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefinition> {
-    let (frontmatter_raw, body) = split_frontmatter(content)?;
-    let frontmatter: SkillFrontmatter = codex_frontmatter::parse_frontmatter(
-        &frontmatter_raw,
+    let (raw, body) = codex_frontmatter::split_frontmatter(content).map_err(validation_error)?;
+    build_skill(path, body, parse_frontmatter(&raw)?, false)
+}
+
+/// Parses an ordinary instruction from a captured SkillStore source.
+pub(super) fn parse_discovered_instruction_skill(
+    path: &Path,
+    content: &str,
+) -> SkillResult<SkillDefinition> {
+    let (raw, body) =
+        codex_frontmatter::split_discovery_frontmatter(content).map_err(validation_error)?;
+    let raw = if raw
+        .lines()
+        .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+    {
+        "{}"
+    } else {
+        &raw
+    };
+    let frontmatter = parse_frontmatter(raw)?;
+    if frontmatter.core.metadata.as_ref().is_some_and(|metadata| {
+        metadata.get("workflow_definition_authoring").is_some()
+            || LEGACY_FLAGS
+                .iter()
+                .any(|key| metadata.get(*key).and_then(serde_json::Value::as_bool) == Some(true))
+    }) {
+        return parse_markdown_skill(path, content);
+    }
+    build_skill(path, body, frontmatter, true)
+}
+
+fn validation_error(error: codex_frontmatter::SkillParseError) -> SkillError {
+    SkillError::Validation(error.to_string())
+}
+
+fn parse_frontmatter(raw: &str) -> SkillResult<SkillFrontmatter> {
+    codex_frontmatter::parse_frontmatter(
+        raw,
         &[
             "allowed-tools",
             "allowed_tools",
@@ -93,9 +136,17 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
             "legacy_import",
         ],
     )
-    .map_err(|error| SkillError::Validation(error.to_string()))?;
+    .map_err(validation_error)
+}
+
+fn build_skill(
+    path: &Path,
+    body: &str,
+    frontmatter: SkillFrontmatter,
+    infer_display_fields: bool,
+) -> SkillResult<SkillDefinition> {
     let SkillFrontmatter {
-        core,
+        mut core,
         license,
         compatibility,
         allowed_tools,
@@ -116,22 +167,23 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
     }
 
     if core.metadata.as_ref().is_some_and(|metadata| {
-        [
-            "legacy_manual_only",
-            "legacy_adapter",
-            "legacy_migration",
-            "legacy_import",
-        ]
-        .iter()
-        .any(|flag| metadata.get(*flag).is_some_and(|value| !value.is_boolean()))
+        LEGACY_FLAGS
+            .iter()
+            .any(|key| metadata.get(*key).is_some_and(|value| !value.is_boolean()))
     }) {
         return Err(SkillError::Validation(
             "Invalid host control flag in metadata".to_string(),
         ));
     }
 
+    if infer_display_fields {
+        if body.trim().is_empty() {
+            return Err(SkillError::Validation("missing instruction text".into()));
+        }
+        infer_discovery_display_fields(&mut core, dir_name, body);
+    }
     let parsed = codex_frontmatter::normalize_metadata(&core, || dir_name.to_string())
-        .map_err(|error| SkillError::Validation(error.to_string()))?;
+        .map_err(validation_error)?;
 
     let compatibility = compatibility
         .as_deref()
@@ -185,10 +237,182 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
     })
 }
 
+fn infer_discovery_display_fields(core: &mut CodexFrontmatter, id: &str, body: &str) {
+    let missing_name = core
+        .name
+        .as_deref()
+        .is_none_or(|name| name.trim().is_empty());
+    let missing_description = core
+        .description
+        .as_deref()
+        .is_none_or(|description| description.trim().is_empty());
+    if !missing_name && !missing_description {
+        return;
+    }
+    let (title, summary) = markdown_display_fields(body);
+    if missing_name {
+        core.name = Some(display_excerpt(
+            title.unwrap_or(id).split_whitespace(),
+            codex_frontmatter::MAX_NAME_LEN,
+        ));
+    }
+    if missing_description {
+        core.description = if summary.is_empty() {
+            core.name.clone()
+        } else {
+            Some(summary)
+        };
+    }
+}
+
+fn markdown_display_fields(body: &str) -> (Option<&str>, String) {
+    let mut lines = body
+        .split_inclusive('\n')
+        .scan(0, |offset, line| {
+            let start = *offset;
+            *offset += line.len();
+            Some((start, line))
+        })
+        .peekable();
+    let mut title = None;
+    while let Some((start, line)) = lines.next() {
+        let text = line.trim();
+        if let Some((marker, length)) = markdown_fence(line) {
+            let _ = lines.by_ref().find(|(_, line)| {
+                let text = line.trim();
+                !indented_code(line)
+                    && text.len() >= length
+                    && text.chars().all(|character| character == marker)
+            });
+        } else if text.starts_with("<!--") {
+            if !text.contains("-->") {
+                let _ = lines.by_ref().find(|(_, line)| line.contains("-->"));
+            }
+        } else if let Some(heading) = markdown_heading(line) {
+            if !heading.is_empty() {
+                title.get_or_insert(heading);
+            }
+        } else if !thematic_break(text) && list_or_quote(text) {
+            // Keep wrapped list and quote text out of the display excerpt.
+            while lines
+                .next_if(|(_, line)| {
+                    let text = line.trim();
+                    !text.is_empty()
+                        && !text.starts_with("<!--")
+                        && !thematic_break(text)
+                        && markdown_heading(line).is_none()
+                        && markdown_fence(line).is_none()
+                })
+                .is_some()
+            {}
+        } else if prose_line(line) {
+            let mut end = start + line.len();
+            while let Some((offset, line)) =
+                lines.next_if(|(_, line)| !setext_underline(line) && prose_line(line))
+            {
+                end = offset + line.len();
+            }
+            let block = &body[start..end];
+            if lines.next_if(|(_, line)| setext_underline(line)).is_some() {
+                title.get_or_insert(block);
+                continue;
+            }
+            let summary = display_excerpt(block.split_whitespace(), INFERRED_DESCRIPTION_LIMIT);
+            return (title, summary);
+        }
+    }
+    (title, String::new())
+}
+
+fn markdown_fence(line: &str) -> Option<(char, usize)> {
+    if indented_code(line) {
+        return None;
+    }
+    let text = line.trim_start();
+    let marker = text
+        .chars()
+        .next()
+        .filter(|marker| matches!(marker, '`' | '~'))?;
+    let length = text
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (length >= 3).then_some((marker, length))
+}
+
+fn setext_underline(line: &str) -> bool {
+    if indented_code(line) {
+        return false;
+    }
+    let text = line.trim();
+    text.bytes().next().is_some_and(|marker| {
+        matches!(marker, b'=' | b'-') && text.bytes().all(|byte| byte == marker)
+    })
+}
+
+fn markdown_heading(line: &str) -> Option<&str> {
+    if indented_code(line) {
+        return None;
+    }
+    let line = line.trim();
+    let title = line.trim_start_matches('#');
+    let level = line.len() - title.len();
+    if !(1..=6).contains(&level) || (!title.is_empty() && !title.starts_with(char::is_whitespace)) {
+        return None;
+    }
+    let without_closing = title.trim_end_matches('#');
+    if without_closing.ends_with(char::is_whitespace) {
+        return Some(without_closing.trim());
+    }
+    Some(title.trim())
+}
+
+fn prose_line(line: &str) -> bool {
+    let text = line.trim();
+    let block_prefixes = ["```", "~~~", "<!--", "![", "[!["];
+    !text.is_empty()
+        && !indented_code(line)
+        && markdown_heading(line).is_none()
+        && !list_or_quote(text)
+        && !thematic_break(text)
+        && !block_prefixes.iter().any(|prefix| text.starts_with(prefix))
+}
+
+fn list_or_quote(text: &str) -> bool {
+    text.starts_with('>')
+        || text.split_whitespace().next().is_some_and(|prefix| {
+            matches!(prefix, "-" | "+" | "*")
+                || prefix.strip_suffix(['.', ')']).is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
+}
+
+fn thematic_break(text: &str) -> bool {
+    let mut markers = text.bytes().filter(|byte| !byte.is_ascii_whitespace());
+    let Some(marker @ (b'-' | b'*' | b'_')) = markers.next() else {
+        return false;
+    };
+    markers.clone().take(2).count() == 2 && markers.all(|byte| byte == marker)
+}
+
+fn indented_code(line: &str) -> bool {
+    line.starts_with("    ") || line.trim_start_matches(' ').starts_with('\t')
+}
+
+fn display_excerpt<'a>(words: impl Iterator<Item = &'a str>, limit: usize) -> String {
+    words
+        .flat_map(|word| word.chars().chain(std::iter::once(' ')))
+        .take(limit)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
 pub fn split_frontmatter(content: &str) -> SkillResult<(String, String)> {
     codex_frontmatter::split_frontmatter(content)
         .map(|(frontmatter, body)| (frontmatter, body.to_string()))
-        .map_err(|error| SkillError::Validation(error.to_string()))
+        .map_err(validation_error)
 }
 
 pub fn render_skill_markdown(skill: &SkillDefinition) -> SkillResult<String> {
@@ -234,9 +458,108 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    use super::{is_valid_skill_id, parse_markdown_skill};
+    use super::{is_valid_skill_id, parse_discovered_instruction_skill, parse_markdown_skill};
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Level, Metadata, Subscriber};
+
+    #[test]
+    fn ordinary_discovery_infers_unicode_display_fields_from_plain_markdown() {
+        let path = Path::new("review-skill/SKILL.md");
+        let prompt = "## 本地 审阅 ##\r\n\r\n先读取 <计划>。\r\n再运行检查。\r\n\r\n后续步骤。";
+        let raw = format!("\u{feff}\r\n\r\n{prompt}\r\n");
+        let skill = parse_discovered_instruction_skill(path, &raw).unwrap();
+        assert_eq!(skill.id, "review-skill");
+        assert_eq!(skill.name, "本地 审阅");
+        assert_eq!(skill.description, "先读取 <计划>。 再运行检查。");
+        assert_eq!(skill.prompt, prompt);
+        assert!(parse_markdown_skill(path, &raw).is_err());
+    }
+
+    #[test]
+    fn ordinary_discovery_finds_prose_after_leading_markdown_blocks() {
+        let path = Path::new("review-skill/SKILL.md");
+        let raw = concat!(
+            "发布检查\n使用指南\n=====\n\n",
+            "[![Status](badge.svg)](status.md)\n\n",
+            "1. Introductory list\n",
+            "<!--\n# Comment text\n-->\n\n",
+            "- Opening checklist\n  Wrapped item\n",
+            "~~~~ example\n# Fenced heading\n~~~\nExample text.\n~~~~\n\n",
+            "- Final list item\n- - -\n",
+            "Review the changed files.\nCheck the release notes.\n\nLater paragraph."
+        );
+        let skill = parse_discovered_instruction_skill(path, raw).unwrap();
+        assert_eq!(skill.name, "发布检查 使用指南");
+        assert_eq!(
+            skill.description,
+            "Review the changed files. Check the release notes."
+        );
+        assert_eq!(skill.prompt, raw);
+    }
+
+    #[test]
+    fn ordinary_discovery_fills_only_blank_display_fields() {
+        let path = Path::new("review-skill/SKILL.md");
+        let description = format!("{} <详细>", "说明".repeat(180));
+        let raw = format!(
+            "\u{feff}\n \n---\nname: '  '\ndescription: {description}\nextra-field: accepted\n---\n# 标题\n\nUnchanged body.\n"
+        );
+        let skill = parse_discovered_instruction_skill(path, &raw).unwrap();
+        assert_eq!(skill.name, "标题");
+        assert_eq!(skill.description, description);
+        assert_eq!(skill.prompt, "# 标题\n\nUnchanged body.");
+
+        let named = "---\nname: Explicit name\ndescription: ''\n---\n# Ignored title\n\nOpening paragraph.\n";
+        let skill = parse_discovered_instruction_skill(path, named).unwrap();
+        assert_eq!(skill.name, "Explicit name");
+        assert_eq!(skill.description, "Opening paragraph.");
+
+        for raw in [
+            "---\n---\nOpening paragraph.",
+            "---\n# comment\n---\nOpening paragraph.",
+        ] {
+            let skill = parse_discovered_instruction_skill(path, raw).unwrap();
+            assert_eq!(skill.name, "review-skill");
+            assert_eq!(skill.description, "Opening paragraph.");
+        }
+    }
+
+    #[test]
+    fn ordinary_discovery_bounds_display_text_and_skips_code_blocks() {
+        let id = "x".repeat(70);
+        let path = std::path::PathBuf::from(&id).join("SKILL.md");
+        let raw = format!("# {}\n\n{}", "名".repeat(70), "描".repeat(300));
+        let skill = parse_discovered_instruction_skill(&path, &raw).unwrap();
+        assert_eq!(skill.id, id);
+        assert_eq!(skill.name, "名".repeat(64));
+        assert_eq!(skill.description, "描".repeat(256));
+        assert_eq!(skill.prompt, raw);
+
+        for raw in ["```text\n# Example heading\n```", "    # Example heading"] {
+            let skill = parse_discovered_instruction_skill(&path, raw).unwrap();
+            assert_eq!(skill.name, "x".repeat(64));
+            assert_eq!(skill.description, skill.name);
+        }
+    }
+
+    #[test]
+    fn ordinary_discovery_reports_invalid_headers_and_empty_bodies() {
+        let path = Path::new("review-skill/SKILL.md");
+        for raw in [
+            "\u{feff} \n---\nname: Unclosed\n\nInstruction text.",
+            "---\nallowed-tools: [\n---\nInstruction text.",
+            "---\nmetadata:\n  legacy_manual_only: wrong\n---\nInstruction text.",
+            "---\nmetadata:\n  legacy_manual_only: true\n---\nInstruction text.",
+            "---\nmetadata:\n  workflow_definition_authoring: 1\n---\nInstruction text.",
+            "\u{feff}\n\t",
+            "---\ndescription: A description\n---\n  \n",
+        ] {
+            assert!(
+                parse_discovered_instruction_skill(path, raw).is_err(),
+                "{raw:?}"
+            );
+        }
+    }
 
     struct LevelSubscriber(Arc<Mutex<Vec<Level>>>);
 

@@ -6,7 +6,7 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
-const MAX_NAME_LEN: usize = 64;
+pub(super) const MAX_NAME_LEN: usize = 64;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(super) struct SkillFrontmatter {
@@ -233,6 +233,28 @@ fn validate_len(
 
 /// Uses the pinned delimiter rules while retaining the untouched body slice.
 pub(super) fn split_frontmatter(contents: &str) -> Result<(String, &str), SkillParseError> {
+    split_frontmatter_block(contents, false)
+}
+
+pub(super) fn split_discovery_frontmatter(
+    contents: &str,
+) -> Result<(String, &str), SkillParseError> {
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    let start = contents.trim_start();
+    if start
+        .lines()
+        .next()
+        .is_some_and(|line| line.trim() == "---")
+    {
+        return split_frontmatter_block(start, true);
+    }
+    Ok((String::new(), contents))
+}
+
+fn split_frontmatter_block(
+    contents: &str,
+    allow_empty: bool,
+) -> Result<(String, &str), SkillParseError> {
     let mut lines = contents.split_inclusive('\n');
     let first = lines.next().ok_or(SkillParseError::MissingFrontmatter)?;
     if first.trim() != "---" {
@@ -243,7 +265,7 @@ pub(super) fn split_frontmatter(contents: &str) -> Result<(String, &str), SkillP
     for line in lines {
         offset += line.len();
         if line.trim() == "---" {
-            if frontmatter_lines.is_empty() {
+            if frontmatter_lines.is_empty() && !allow_empty {
                 return Err(SkillParseError::MissingFrontmatter);
             }
             return Ok((frontmatter_lines.join("\n"), &contents[offset..]));
