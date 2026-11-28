@@ -6,6 +6,8 @@ use crate::theme::colors;
 
 use super::MermaidGlyphs;
 
+mod sequence;
+
 const MAX_SOURCE_BYTES: usize = 4 * 1024;
 const MAX_NODES: usize = 8;
 
@@ -24,16 +26,27 @@ impl Unavailable {
     }
 }
 
-/// Preview one path in its declared direction, including chains on a single
-/// line. The source picker can still access the original fence.
+/// Render a bounded flowchart or sequence preview. The source picker retains
+/// the original fence.
 pub(super) fn render(
     source: &str,
     width: usize,
     glyphs: MermaidGlyphs,
 ) -> Result<Vec<Line<'static>>, Unavailable> {
-    let (direction, nodes) = parse_path(source).ok_or(Unavailable::Unsupported)?;
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(Unavailable::Unsupported);
+    }
     let border = Style::default().fg(colors::code_border());
     let glyphs = DiagramGlyphs::for_mode(glyphs);
+    let mut statements = source
+        .lines()
+        .map(str::trim_ascii)
+        .filter(|line| !line.is_empty());
+    if statements.next() == Some("sequenceDiagram") {
+        return sequence::render(statements, width, border, &glyphs);
+    }
+
+    let (direction, nodes) = parse_path(source).ok_or(Unavailable::Unsupported)?;
     match direction {
         Direction::TopDown => render_vertical(nodes, width, border, &glyphs),
         Direction::LeftToRight => render_horizontal(nodes, width, border, &glyphs),
@@ -49,6 +62,9 @@ struct DiagramGlyphs {
     right_junction: char,
     down_arrow: char,
     right_arrow: char,
+    left_arrow: char,
+    solid_connector: char,
+    dotted_connector: char,
     rectangle: [char; 4],
     rounded: [char; 4],
     decision: [char; 4],
@@ -66,6 +82,9 @@ impl DiagramGlyphs {
                 right_junction: '├',
                 down_arrow: '↓',
                 right_arrow: '→',
+                left_arrow: '←',
+                solid_connector: '─',
+                dotted_connector: '┄',
                 rectangle: ['┌', '┐', '└', '┘'],
                 rounded: ['╭', '╮', '╰', '╯'],
                 decision: ['╱', '╲', '╲', '╱'],
@@ -79,6 +98,9 @@ impl DiagramGlyphs {
                 right_junction: '+',
                 down_arrow: 'v',
                 right_arrow: '>',
+                left_arrow: '<',
+                solid_connector: '-',
+                dotted_connector: '.',
                 rectangle: ['+'; 4],
                 rounded: ['.', '.', '\'', '\''],
                 decision: ['/', '\\', '\\', '/'],
@@ -284,9 +306,6 @@ impl PathStep<'_> {
 }
 
 fn parse_path(source: &str) -> Option<(Direction, Vec<PathStep<'_>>)> {
-    if source.len() > MAX_SOURCE_BYTES {
-        return None;
-    }
     let mut statements = source
         .lines()
         .map(str::trim_ascii)

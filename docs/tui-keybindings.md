@@ -41,8 +41,23 @@ corresponding Bamboo views.
 Settled Mermaid flowcharts can preview one connected path in `TD` or `LR`.
 For example, `A[Start] -->|ready| B{Check} --> C(Done)` shows a rectangle, a
 decision node, and a rounded node. A bare ID uses its label when one was
-defined. The transcript shows the source while the reply streams, when the
-syntax is unsupported, or when the diagram is wider than the terminal.
+defined.
+
+Settled Mermaid sequence diagrams show participant lifelines and messages in
+source order. Use `participant ID` or `participant ID as Display name`. An
+undeclared participant appears at its first message. Use `->>` for a solid
+message or `-->>` for a dotted message between distinct participants. The
+preview supports up to six participants and twelve messages within 4 KiB.
+Labels are single-line plain text. Participant IDs begin with a letter or
+underscore and may contain letters, digits, underscores, and single internal
+hyphens, as in `edge-api`, `_worker2`, and `缓存`. Use a first segment outside
+Mermaid's reserved keywords and keep `x` or `X` away from the position after a
+hyphen, where it can denote an arrow. [Mermaid sequence syntax](https://mermaid.js.org/syntax/sequenceDiagram.html)
+
+The transcript shows the original diagram source while the reply streams, when
+the syntax is unsupported, or when the diagram is wider than the terminal.
+Select the Mermaid fence to copy its source after the reply settles.
+
 Press `Esc` to park an approval in chat and `Ctrl+Q` to reopen it. The current
 draft remains in the composer.
 
