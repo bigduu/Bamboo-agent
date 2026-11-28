@@ -455,6 +455,36 @@ eventSource.onmessage = (event) => {
 
 ### Session Management
 
+#### Manual Session Categories
+
+`GET /api/v1/bootstrap` advertises `sessions.manual_categories.v1`.
+Session list and detail entries include `category`, a string or `null`.
+
+```http
+PATCH /api/v1/sessions/{session_id}
+If-Match: "7"
+Content-Type: application/json
+
+{"category":"Support"}
+```
+
+Send a category edit in its own PATCH request. Use `null` to clear it. The name
+is trimmed, preserves spelling and case, and accepts 1–80 Unicode characters
+without control characters. The category belongs to the Root Session and
+follows it across Project and workspace changes. The response returns the
+current Session and ETag. A missing precondition returns `428`, a stale version
+returns `412` with the current ETag, and a Child category edit returns `409`.
+
+`GET /api/v1/projects/{project_id}/session-categories` returns the category
+names in ascending order with Root Session counts from the complete Project
+index. An existing Project with no assignments returns `{"categories":[]}`.
+Each category is shaped as `{"name":"Support","session_count":2}`.
+
+Actual changes publish a durable `SessionCategoryUpdated` account event with
+`session_id`, `project_id`, `category`, `metadata_version`, and `updated_at`.
+Unassigned Projects and cleared categories serialize as `null`. Repeating a
+matching edit retains the current ETag and emits no category event.
+
 #### Copy Session
 
 ```http

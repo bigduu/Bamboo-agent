@@ -197,6 +197,7 @@ pub type RootActorRuntimeEventPublisher =
 pub enum SessionPresentationMutation {
     Title,
     Pinned,
+    Category,
 }
 
 /// Trait for session storage backends.
@@ -206,7 +207,7 @@ pub enum SessionPresentationMutation {
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
-    /// Commit one title (manual, automatic or fallback) or pinned mutation.
+    /// Commit one title, pin, or category mutation.
     /// Actor-aware backends compare the complete candidate with canonical
     /// state under their writer guards, require exact revision advances, and
     /// propagate only already-current observations. Return the exact committed
@@ -218,7 +219,7 @@ pub trait Storage: Send + Sync {
     ) -> std::io::Result<Session> {
         match mutation {
             SessionPresentationMutation::Title => self.save_manual_title_committed(session).await,
-            SessionPresentationMutation::Pinned => {
+            SessionPresentationMutation::Pinned | SessionPresentationMutation::Category => {
                 self.save_session(session).await?;
                 Ok(session.clone())
             }

@@ -44,11 +44,13 @@ use bamboo_domain::{
     latest_response_occurrence, permission_request_generation, PermissionAuditSeed,
     PermissionAuditSnapshot, ResponseOccurrence, RetrievalWindowCheckpointOutcome,
     RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY, CONSUMED_RESPONSE_OCCURRENCES_KEY,
+    SESSION_CATEGORY_METADATA_KEY,
 };
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const AUTHORITATIVE_METADATA_KEYS: &[&str] = &[
+    SESSION_CATEGORY_METADATA_KEY,
     "gold_config",
     "workflow.run_ids.v1",
     "ticket.runtime.dispatch.v1",

@@ -361,6 +361,15 @@ fn change_presentation(mut session: Session, mutation: SessionPresentationMutati
             session.updated_at = Utc::now();
             session
         }
+        SessionPresentationMutation::Category => {
+            session.metadata.insert(
+                bamboo_domain::SESSION_CATEGORY_METADATA_KEY.into(),
+                "Support".into(),
+            );
+            session.metadata_version += 1;
+            session.updated_at = Utc::now();
+            session
+        }
     }
 }
 
@@ -552,6 +561,7 @@ async fn presentation_commits_reject_unrelated_changes_without_publication() {
     for mutation in [
         SessionPresentationMutation::Title,
         SessionPresentationMutation::Pinned,
+        SessionPresentationMutation::Category,
     ] {
         for changed in [
             "title-or-pinned",
@@ -570,6 +580,7 @@ async fn presentation_commits_reject_unrelated_changes_without_publication() {
                     SessionPresentationMutation::Pinned => {
                         candidate.title = "unadmitted title".into()
                     }
+                    SessionPresentationMutation::Category => candidate.pinned = !candidate.pinned,
                 },
                 "transcript" => candidate.add_message(Message::user("unadmitted input")),
                 "model" => candidate.model = "unadmitted model".into(),

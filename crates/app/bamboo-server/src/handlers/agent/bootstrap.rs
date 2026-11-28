@@ -44,6 +44,7 @@ const CAPABILITIES: &[&str] = &[
     // This describes implemented transport support, never owner authority.
     "http.native_receipt_run.v1",
     "http.session_message_fork.v1",
+    "sessions.manual_categories.v1",
 ];
 
 const SUBPROTOCOLS: &[BootstrapSubprotocol] = &[
@@ -201,6 +202,7 @@ mod tests {
                     "realtime.stop_control.v1",
                     "http.native_receipt_run.v1",
                     "http.session_message_fork.v1",
+                    "sessions.manual_categories.v1",
                 ],
                 "auth": {
                     "policy": "open",

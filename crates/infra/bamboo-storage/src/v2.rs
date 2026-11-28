@@ -17,7 +17,7 @@
 //!   boot-fatal and never orphans intact sessions. Directory scanning is used
 //!   only for this recovery path, never in hot paths.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1158,6 +1158,9 @@ pub struct SessionIndexEntry {
     /// Stable Project identity mirrored from typed session runtime metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// User-assigned Root category mirrored from the authoritative Session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     /// Raw session-level Gold config JSON mirrored from `session.metadata["gold_config"]`.
     /// Kept as a string here to avoid making infrastructure depend on bamboo-engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3641,6 +3644,23 @@ impl SessionStoreV2 {
             }
         }
         summaries
+    }
+
+    pub async fn project_session_category_counts(
+        &self,
+        project_id: &ProjectId,
+    ) -> BTreeMap<String, usize> {
+        let index = self.index.read().await;
+        let mut counts = BTreeMap::new();
+        for entry in index.sessions.values().filter(|entry| {
+            entry.kind == SessionKind::Root
+                && entry.project_id.as_deref() == Some(project_id.as_str())
+        }) {
+            if let Some(category) = &entry.category {
+                *counts.entry(category.clone()).or_default() += 1;
+            }
+        }
+        counts
     }
 
     pub async fn recent_index_entries_matching(
@@ -6196,6 +6216,7 @@ impl SessionStoreV2 {
             reasoning_effort: session.reasoning_effort,
             workspace_path,
             project_id,
+            category: session.category().map(str::to_owned),
             gold_config_json,
             created_by_schedule_id,
             session_origin,

@@ -181,6 +181,7 @@ pub async fn get_session(
                     ));
                 }
             };
+            summary.category = durable_session.category().map(str::to_owned);
             // Pair this optional receipt with its exact canonical error; keep
             // the existing index presentation for legacy failures without one.
             if let Some(diagnostic) = durable_session.last_run_diagnostic() {
