@@ -3,7 +3,7 @@ schema_version: 1
 name: explorer
 description: Investigate a bounded question and return evidence without changing files.
 tools:
-  allow: [Read, Glob, exec_command, write_stdin]
+  allow: [Read, Glob, ViewImage, exec_command, write_stdin]
   deny: [Edit, Write]
 ---
 Builtin role package v1: explorer.

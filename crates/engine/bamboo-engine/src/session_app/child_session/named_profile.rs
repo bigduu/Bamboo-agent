@@ -14,7 +14,7 @@ use super::ChildSessionError;
 pub const NAMED_PROFILE_BINDING_KEY: &str = "child.named_profile.v1";
 /// Host creator signal derived from the existing explicit create.model input.
 pub const PROFILE_EXPLICIT_MODEL_KEY: &str = "child.named_profile.explicit_model.v1";
-const NATIVE_NAMES: [&str; 8] = [
+const NATIVE_NAMES: [&str; 9] = [
     "Bash",
     "exec_command",
     "write_stdin",
@@ -22,8 +22,10 @@ const NATIVE_NAMES: [&str; 8] = [
     "Edit",
     "Glob",
     "Read",
+    "ViewImage",
     "Write",
 ];
+const INSPECTION_TOOLS: [&str; 3] = ["Read", "Glob", "ViewImage"];
 
 /// Apply only while resolving source declarations; frozen grants stay exact.
 fn declares_tool(declarations: &[String], tool: &str) -> bool {
@@ -145,7 +147,7 @@ impl ResolvedChildProfile {
                     && !matches!(name, "Bash" | "bash")
                     && !declares_tool(denied, name)
                     && !(foreground_denied && shell)
-                    && (!inspection_role || shell || matches!(name, "Read" | "Glob"))
+                    && (!inspection_role || shell || INSPECTION_TOOLS.contains(&name))
             })
             .map(str::to_owned)
             .collect();
@@ -182,7 +184,7 @@ impl ResolvedChildProfile {
                 && self
                     .tools
                     .iter()
-                    .all(|tool| matches!(tool.as_str(), "Read" | "Glob"))
+                    .all(|tool| INSPECTION_TOOLS.contains(&tool.as_str()))
     }
 
     pub(super) fn append_prompt(&self, base: &str) -> String {
@@ -468,7 +470,7 @@ mod tests {
                 home.join(format!("agents/{name}.md")),
                 definition(
                     name,
-                    "tools:\n  allow: [Read, Glob, Write, Bash, exec_command, write_stdin]",
+                    "tools:\n  allow: [Read, Glob, ViewImage, Write, Bash, exec_command, write_stdin]",
                 ),
             )
             .unwrap();
@@ -476,7 +478,7 @@ mod tests {
             assert!(!read_binding(&child).unwrap().unwrap().read_only);
             assert_eq!(
                 named_profile_tool_names(&child).unwrap().unwrap(),
-                ["exec_command", "write_stdin", "Glob", "Read"]
+                ["exec_command", "write_stdin", "Glob", "Read", "ViewImage"]
             );
             for case in 0..4 {
                 let mut changed = child.clone();
@@ -494,6 +496,32 @@ mod tests {
                 assert!(validate_named_profile(&changed).is_err());
             }
         }
+    }
+
+    #[test]
+    fn image_access_respects_read_only_profiles_and_explicit_denials() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(home.join("agents")).unwrap();
+        let file = home.join("agents/explorer.md");
+        let parent = Session::new("profile-parent", "parent-model");
+        let create_child = |tools: &str| {
+            std::fs::write(&file, definition("explorer", tools)).unwrap();
+            bound(selected(&home, "explorer", &parent), &parent)
+        };
+        let denied = create_child("tools:\n  deny: [Bash, ViewImage]");
+        let allowed = create_child("tools:\n  allow: [Read, ViewImage]\n  deny: [Bash]");
+
+        assert!(read_binding(&denied).unwrap().unwrap().read_only);
+        assert!(read_binding(&allowed).unwrap().unwrap().read_only);
+        assert_eq!(
+            named_profile_tool_names(&denied).unwrap().unwrap(),
+            ["Glob", "Read"]
+        );
+        assert_eq!(
+            named_profile_tool_names(&allowed).unwrap().unwrap(),
+            ["Read", "ViewImage"]
+        );
     }
 
     #[test]
@@ -532,7 +560,7 @@ mod tests {
             ),
             (
                 "tools:\n  deny: [bash]",
-                vec!["Edit", "Glob", "Read", "Write"],
+                vec!["Edit", "Glob", "Read", "ViewImage", "Write"],
             ),
         ] {
             std::fs::write(
