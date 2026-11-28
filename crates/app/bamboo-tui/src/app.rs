@@ -35446,6 +35446,110 @@ mod run_status_tests {
     }
 
     #[test]
+    fn compact_blockquotes_render_in_live_and_saved_replies_and_copy_exact_source() {
+        use crate::api::types::HistoryMessage;
+        use ratatui::style::Modifier;
+
+        let deltas = [
+            ">",
+            "**Reviewed** 界\r\n>",
+            "\tNext `plan` 🚀\r\n> Same quote\r\n\r\nOutside the quote.",
+        ];
+        let assert_quotes =
+            |terminal: &Terminal<TestBackend>| {
+                let text = terminal_text(terminal);
+                let rows: Vec<_> = text.lines().map(str::trim).collect();
+                let first = rows
+                    .iter()
+                    .position(|row| row.starts_with("│ Reviewed") && row.contains('界'))
+                    .unwrap_or_else(|| panic!("missing compact quote\n{text}"));
+                let second = rows
+                    .iter()
+                    .position(|row| row.starts_with("│ Next plan") && row.contains('🚀'))
+                    .unwrap_or_else(|| panic!("missing tab-separated quote\n{text}"));
+                assert_eq!(second, first + 1, "{text}");
+                assert_eq!(rows.get(second + 1), Some(&"│ Same quote"), "{text}");
+                assert!(rows.contains(&"Outside the quote."), "{text}");
+                assert!(!rows.contains(&">"), "{text}");
+
+                let buffer = terminal.backend().buffer();
+                let cells = buffer.content();
+                let width = usize::from(buffer.area.width);
+                assert!(cells.chunks(width).nth(first).unwrap().iter().any(|cell| {
+                    cell.symbol() == "R" && cell.modifier.contains(Modifier::BOLD)
+                }));
+                assert!(cells.chunks(width).nth(second).unwrap().iter().any(|cell| {
+                    cell.symbol() == "p" && cell.modifier.contains(Modifier::REVERSED)
+                }));
+            };
+        // Resolve the focused Copy payload before it reaches the host clipboard.
+        let assert_copy_source = |app: &mut App, source: &str| {
+            app.focus_conversation_block_at(0);
+            let focused = app.chat.focused_block.as_deref().unwrap();
+            let block = app
+                .conversation_blocks()
+                .into_iter()
+                .find(|block| block.id == focused)
+                .unwrap();
+            assert!(matches!(
+                block.kind,
+                ConversationBlockKind::AssistantMarkdown { .. }
+            ));
+            assert_eq!(block.copy_text().as_bytes(), source.as_bytes());
+        };
+
+        let source = deltas.concat();
+        for width in [60, 80, 120] {
+            let mut app = running_app("session-compact-quote", "run-compact-quote");
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            for (index, delta) in deltas.into_iter().enumerate() {
+                app.handle_sse_event(AgentEvent::Token {
+                    content: delta.to_owned(),
+                })
+                .unwrap();
+                terminal
+                    .draw(|frame| crate::ui::render(frame, &app))
+                    .unwrap();
+                if index < 2 {
+                    let text = terminal_text(&terminal);
+                    assert!(text.lines().any(|row| row.trim() == ">"), "{text}");
+                }
+            }
+            assert!(app.chat.streaming);
+            assert_quotes(&terminal);
+            assert_copy_source(&mut app, &source);
+
+            app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+                .unwrap();
+            assert!(!app.chat.streaming);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            assert_quotes(&terminal);
+            assert_copy_source(&mut app, &source);
+
+            let mut saved = App::new(BambooClient::new("http://127.0.0.1:0"));
+            saved.chat.history_loaded = true;
+            saved.connected = true;
+            saved.chat.messages = crate::history::map_history(vec![HistoryMessage {
+                id: "history-compact-quote".into(),
+                role: "assistant".into(),
+                content: source.clone(),
+                ..Default::default()
+            }]);
+            terminal
+                .draw(|frame| crate::ui::render(frame, &saved))
+                .unwrap();
+            assert_quotes(&terminal);
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_COMPACT_BLOCKQUOTE").is_some() {
+                let preview = terminal_text(&terminal);
+                eprintln!("COMPACT BLOCKQUOTE PREVIEW\n{preview}\nEND COMPACT BLOCKQUOTE PREVIEW");
+            }
+            assert_copy_source(&mut saved, &source);
+        }
+    }
+
+    #[test]
     fn table_preview_clips_the_transcript_and_copies_the_complete_report() {
         use crate::api::types::HistoryMessage;
 
