@@ -521,6 +521,10 @@ pub struct CreateSessionRequest {
     /// the CAS-guarded PATCH contract like any other session.
     #[serde(default)]
     pub permission_mode: Option<bamboo_domain::SessionPermissionMode>,
+    /// Category written with the new Root. An omitted or null value preserves
+    /// the typed request serialization used by existing idempotency receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -793,6 +797,7 @@ mod tests {
             gold_config: None,
             workspace_path: None,
             permission_mode: None,
+            category: None,
         };
 
         let debug_str = format!("{:?}", req);

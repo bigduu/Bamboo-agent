@@ -736,6 +736,7 @@ impl SupervisedRootCreator {
             &CreateSessionInput {
                 id: operation.session_id.clone(),
                 project_id: request.project_id.clone(),
+                category: None,
                 title: request.title.clone(),
                 title_generated: None,
                 system_prompt: None,
@@ -832,6 +833,7 @@ impl SupervisedRootCreator {
         let event = bamboo_agent_core::AgentEvent::SessionCreated {
             session_id: id.into(),
             project_id: session.project_id_meta(),
+            category: session.category().map(str::to_owned),
             title: session.title.clone(),
             kind: session.kind,
             created_at: session.created_at,

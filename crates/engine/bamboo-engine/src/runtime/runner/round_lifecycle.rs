@@ -30,7 +30,9 @@ mod context_preparation;
 mod prefix_drift;
 mod stream_execution;
 mod token_budget;
-pub(crate) use token_budget::{configured_model_ceilings, resolve_known_token_ceilings};
+pub(crate) use token_budget::{
+    configured_model_ceilings, resolve_chat_context_window, resolve_known_token_ceilings,
+};
 mod token_estimation;
 #[cfg(test)]
 mod tool_loading_http_tests;

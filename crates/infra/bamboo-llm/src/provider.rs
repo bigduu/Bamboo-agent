@@ -247,6 +247,7 @@ pub struct CompletionDiagnostics {
     model_window_limit: Option<u32>,
     provider_default_output: bool,
     tools_disabled: bool,
+    single_answer: bool,
 }
 
 pub const OUTPUT_LIMIT_CONVERGENCE_HINT: &str =
@@ -328,6 +329,10 @@ struct CompletionDiagnosticState {
     finish_reason: Option<&'static str>,
     messages_stopped: bool,
     provider_tool_seen: bool,
+    invalid_single_answer: bool,
+    first_answer_index: Option<u64>,
+    first_answer_identity: Option<String>,
+    first_answer_part: Option<u64>,
     response_progress_seen: bool,
     pending_usage: Option<ProviderUsageReplacement>,
     compatible_messages: bool,
@@ -335,6 +340,29 @@ struct CompletionDiagnosticState {
     changed_protocol: bool,
     output_limit: Option<u64>,
     recovery: Option<OutputLimitRecovery>,
+}
+
+impl CompletionDiagnosticState {
+    fn observe_answer_location(
+        &mut self,
+        index: Option<u64>,
+        identity: Option<&str>,
+        part: Option<u64>,
+    ) {
+        if let Some(index) = index {
+            self.invalid_single_answer |= *self.first_answer_index.get_or_insert(index) != index;
+        }
+        if let Some(id) = identity.filter(|id| !id.is_empty()) {
+            let identity = crate::providers::common::log_identity(id);
+            let first = self
+                .first_answer_identity
+                .get_or_insert_with(|| identity.clone());
+            self.invalid_single_answer |= *first != identity;
+        }
+        if let Some(part) = part {
+            self.invalid_single_answer |= *self.first_answer_part.get_or_insert(part) != part;
+        }
+    }
 }
 
 tokio::task_local! {
@@ -366,6 +394,24 @@ pub(crate) fn optional_protocol_output_limit(limit: Option<u32>) -> Option<u32> 
 }
 
 impl CompletionDiagnostics {
+    pub(crate) fn for_single_answer() -> Self {
+        Self {
+            single_answer: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn invalid_single_answer(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .invalid_single_answer
+    }
+
+    pub(crate) fn observes_single_answer(&self) -> bool {
+        self.single_answer
+    }
+
     pub fn for_agent_round(recovery: Option<OutputLimitRecovery>) -> Self {
         Self {
             agent_round: true,
@@ -593,6 +639,9 @@ impl CompletionDiagnostics {
             .get("type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(event);
+        if self.single_answer {
+            self.observe_single_answer(event, value);
+        }
         // Responses can announce a tool before producing a normalized call
         // or transcript item. Its pending work takes priority over a cutoff
         // even if the next frame contains only reasoning.
@@ -666,6 +715,153 @@ impl CompletionDiagnostics {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .finish_reason = Some(safe);
+        }
+    }
+
+    // Preserve native output boundaries before adapters select or merge text.
+    fn observe_single_answer(&self, event: &str, value: &serde_json::Value) {
+        use serde_json::Value;
+
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.invalid_single_answer {
+            return;
+        }
+        let competing_choice = ["choices", "candidates"]
+            .into_iter()
+            .filter_map(|field| value.get(field).and_then(Value::as_array))
+            .any(|choices| {
+                choices.len() > 1
+                    || choices.first().is_some_and(|choice| {
+                        choice["index"].as_i64().is_some_and(|index| index != 0)
+                    })
+            });
+        let invalid_chat_delta = value.pointer("/choices/0/delta").is_some_and(|delta| {
+            !delta["function_call"].is_null()
+                || delta["refusal"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+        });
+        let invalid_gemini_parts = value
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                let tool_fields = [
+                    "functionCall",
+                    "functionResponse",
+                    "executableCode",
+                    "codeExecutionResult",
+                ];
+                parts
+                    .iter()
+                    .any(|part| tool_fields.iter().any(|key| part.get(*key).is_some()))
+                    || parts
+                        .iter()
+                        .filter(|part| {
+                            part["text"].as_str().is_some_and(|text| !text.is_empty())
+                                && part["thought"] != true
+                                && part.get("thinking").is_none()
+                        })
+                        .nth(1)
+                        .is_some()
+            });
+        let is_tool = |item: &Value| {
+            item["type"].as_str().is_some_and(|kind| {
+                kind.ends_with("_call")
+                    || kind.ends_with("_call_output")
+                    || kind.starts_with("mcp_")
+            })
+        };
+        let invalid_message = |item: &Value| {
+            item["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| part["type"] == "refusal")
+                    || parts
+                        .iter()
+                        .filter(|part| part["type"] == "output_text")
+                        .nth(1)
+                        .is_some()
+            })
+        };
+        let first_text_part = |item: &Value| {
+            item["content"]
+                .as_array()?
+                .iter()
+                .position(|part| part["type"] == "output_text")
+                .map(|index| index as u64)
+        };
+        state.invalid_single_answer =
+            competing_choice || invalid_chat_delta || invalid_gemini_parts;
+        match event {
+            "response.completed" => {
+                if let Some(items) = value
+                    .pointer("/response/output")
+                    .or_else(|| value.get("output"))
+                    .and_then(Value::as_array)
+                {
+                    state.invalid_single_answer |= items.iter().any(is_tool);
+                    for (index, item) in items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| item["type"] == "message")
+                    {
+                        state.invalid_single_answer |= invalid_message(item);
+                        state.observe_answer_location(
+                            Some(index as u64),
+                            item["id"].as_str(),
+                            first_text_part(item),
+                        );
+                    }
+                }
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                let item = &value["item"];
+                state.invalid_single_answer |= is_tool(item);
+                if event == "response.output_item.done" && item["type"] == "message" {
+                    state.invalid_single_answer |= invalid_message(item);
+                    state.observe_answer_location(
+                        value["output_index"].as_u64(),
+                        value["item_id"].as_str().or_else(|| item["id"].as_str()),
+                        first_text_part(item),
+                    );
+                }
+            }
+            "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.content_part.added"
+            | "response.content_part.done" => {
+                let part = value.get("part").or_else(|| value.get("content_part"));
+                if matches!(
+                    event,
+                    "response.content_part.added" | "response.content_part.done"
+                ) {
+                    if part.is_some_and(|part| part["type"] == "refusal") {
+                        state.invalid_single_answer = true;
+                    }
+                    if !part.is_some_and(|part| part["type"] == "output_text") {
+                        return;
+                    }
+                }
+                state.observe_answer_location(
+                    value["output_index"].as_u64(),
+                    value["item_id"]
+                        .as_str()
+                        .or_else(|| value["item"]["id"].as_str()),
+                    value["content_index"]
+                        .as_u64()
+                        .or_else(|| part.and_then(|part| part["index"].as_u64())),
+                );
+            }
+            "content_block_delta" if value["delta"]["type"] == "text_delta" => {
+                let index = value["index"].as_u64();
+                state.invalid_single_answer |= index.is_none();
+                state.observe_answer_location(index, None, None);
+            }
+            "content_block_delta" if value["delta"]["type"] == "input_json_delta" => {
+                state.invalid_single_answer = true;
+            }
+            "response.refusal.delta" | "response.refusal.done" => {
+                state.invalid_single_answer = true;
+            }
+            _ => {}
         }
     }
 

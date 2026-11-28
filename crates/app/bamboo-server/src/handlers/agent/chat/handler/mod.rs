@@ -972,6 +972,7 @@ async fn handle_chat(
             &bamboo_agent_core::AgentEvent::SessionCreated {
                 session_id: session_id.clone(),
                 project_id: session.project_id_meta(),
+                category: durable_base.category().map(str::to_owned),
                 title: session.title.clone(),
                 kind: session.kind,
                 created_at: session.created_at,

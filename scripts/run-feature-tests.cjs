@@ -310,7 +310,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Project scan uses native_work_acceptance in server-tests-1. Required-file
 // checks stay with default Tickets in packages-0, and summary parsing stays
 // with the default Orchestration owner. Additive case selections stay intact.
-const FEATURE_SOURCE_SHA256 = "e44ef6ef3611644e3fe3881f7f630f7dc7b328fe6b33a550193e1a861dfbf5af";
+const FEATURE_SOURCE_SHA256 = "9556d36ebdb3c4574485488845c4a39d64ca1bdf9148afbbe573e9442abe3385";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

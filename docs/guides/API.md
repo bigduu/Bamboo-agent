@@ -459,6 +459,8 @@ eventSource.onmessage = (event) => {
 
 `GET /api/v1/bootstrap` advertises `sessions.manual_categories.v1`.
 Session list and detail entries include `category`, a string or `null`.
+Bootstrap advertises `sessions.create_category.v1` when `POST /api/v1/sessions`
+accepts an initial category. See the [recoverable creation contract](../session-create-idempotency.md).
 
 ```http
 PATCH /api/v1/sessions/{session_id}
@@ -484,6 +486,32 @@ Actual changes publish a durable `SessionCategoryUpdated` account event with
 `session_id`, `project_id`, `category`, `metadata_version`, and `updated_at`.
 Unassigned Projects and cleared categories serialize as `null`. Repeating a
 matching edit retains the current ETag and emits no category event.
+
+#### Project Category Suggestions
+
+`GET /api/v1/bootstrap` advertises `projects.session_category_suggestion.v1`
+for the authenticated suggestion endpoint.
+
+```http
+POST /api/v1/projects/{project_id}/session-category-suggestion
+Content-Type: application/json
+
+{"task_text":"Help a customer restore access"}
+```
+
+An active Project and 1–2,000 Unicode characters of trimmed task text are
+required. Existing names in that Project are the candidates. An empty Project
+uses `开发`, `Support`, and `调查`. The fast-model request receives the task and
+candidate names. Requests abstain when the complete list exceeds the input
+limits of 32 names or 16 KiB of prompt data.
+
+A `200` response includes `project_id`, `category` and `outcome`. `selected`
+returns an exact candidate. `uncertain`, `unavailable`, and `timeout` return
+`null` for an unclear result, a failed or unavailable model, and a request
+that exceeds the two-second suggestion deadline, respectively. Project validation
+uses the standard HTTP errors, including `503 project_unavailable` while the
+Project is busy. Pass the chosen category in the normal recoverable creation
+request to assign it to the new session.
 
 #### Copy Session
 

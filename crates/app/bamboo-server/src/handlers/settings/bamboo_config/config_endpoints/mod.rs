@@ -8,7 +8,7 @@ mod set;
 mod tests;
 
 pub use get::get_bamboo_config;
-pub use model_limit_defaults::get_model_limit_defaults;
+pub use model_limit_defaults::{get_model_limit_defaults, resolve_model_limit_windows};
 pub use recovery::{confirm_config_recovery, get_config_recovery_status};
 pub use reset::reset_bamboo_config;
 pub use set::set_bamboo_config;

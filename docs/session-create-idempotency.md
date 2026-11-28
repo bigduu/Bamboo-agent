@@ -17,22 +17,32 @@ POST /api/v1/sessions
 Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
 Content-Type: application/json
 
-{"title":"New session"}
+{"title":"New session","category":"Support"}
 ```
 
-The first successful request returns the existing `201` response:
+The first successful request returns `201` with the Session summary.
 
 ```json
-{"session": {"id": "..."}}
+{"session": {"id": "...", "category": "Support"}}
 ```
 
 An equivalent replay returns `200` with the same response shape and session
 ID. Reusing a key with a different payload returns `409` with error code
 `idempotency_key_conflict`. The fingerprint includes every caller-controlled
 `CreateSessionRequest` field (`project_id`, title lifecycle, prompt, model,
-provider, model reference, reasoning effort, Gold config and workspace), using
-recursively canonical JSON. Server defaults and runtime credentials are not
+provider, model reference, reasoning effort, Gold config, workspace,
+permission mode and non-null category), using recursively canonical JSON. Server defaults and runtime credentials are not
 part of the fingerprint.
+
+Bootstrap advertises `sessions.create_category.v1` for the optional initial
+Root category. Names follow the same trimming and validation rules as manual
+category edits. The first authoritative save includes the category. The
+creation response and `SessionCreated` account event include the persisted
+value. An omitted or `null` category creates an uncategorized Root and keeps
+its pre-upgrade request fingerprint. A non-null category participates in the
+fingerprint. Successful replay and operation status return the current Root
+summary after any later category edits or Project moves. Older creation events
+without `category` still decode as uncategorized.
 
 After an uncertain response, query the authenticated status endpoint:
 

@@ -16,8 +16,8 @@ use std::path::PathBuf;
 /// Sentinel pattern used for the single global fallback limit.
 pub const DEFAULT_MODEL_PATTERN: &str = "default";
 
-/// Conservative window for models with no reported limit or user override.
-pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 32_768;
+/// Compatibility window for models with no reported window or user override.
+pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 475_000;
 
 /// Upper bound when deriving output allowance from a known window.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 64_000;
@@ -29,7 +29,7 @@ pub const UNKNOWN_MODEL_OUTPUT_TOKENS: u32 = 4_096;
 /// window via [`ModelLimit::get_safety_margin`]).
 pub const DEFAULT_SAFETY_MARGIN: u32 = 1000;
 
-/// Build the conservative fallback (32,768 context / 4,096 output).
+/// Build the fallback for models with unknown context and output limits.
 pub fn default_model_limit() -> ModelLimit {
     builtin_limit(
         DEFAULT_MODEL_PATTERN,
@@ -332,10 +332,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_limit_is_conservative_for_unknown_models() {
+    fn default_limit_uses_475k_context_for_unknown_models() {
         let limit = default_model_limit();
         assert_eq!(limit.model_pattern, DEFAULT_MODEL_PATTERN);
-        assert_eq!(limit.max_context_tokens, 32_768);
+        assert_eq!(limit.max_context_tokens, 475_000);
         assert_eq!(limit.get_max_output_tokens(), 4_096);
     }
 
@@ -374,7 +374,7 @@ mod tests {
         let registry = ModelLimitsRegistry::new();
         let limit = registry.get_or_default("unknown-model-xyz");
         assert_eq!(limit.model_pattern, DEFAULT_MODEL_PATTERN);
-        assert_eq!(limit.max_context_tokens, 32_768);
+        assert_eq!(limit.max_context_tokens, 475_000);
         assert_eq!(limit.get_max_output_tokens(), 4_096);
     }
 
@@ -533,7 +533,7 @@ mod tests {
         // Unknown model with no override falls back to the single global default.
         let unknown = registry.get_or_default("brand-new-frontier-model");
         assert_eq!(unknown.model_pattern, DEFAULT_MODEL_PATTERN);
-        assert_eq!(unknown.max_context_tokens, 32_768);
+        assert_eq!(unknown.max_context_tokens, 475_000);
         assert_eq!(unknown.get_max_output_tokens(), 4_096);
     }
 
@@ -674,7 +674,7 @@ mod tests {
         // it resolves to the global default, not the gpt-4o override.
         let other =
             create_budget_for_model("claude-sonnet", crate::BudgetStrategy::default(), &registry);
-        assert_eq!(other.max_context_tokens, 32_768);
+        assert_eq!(other.max_context_tokens, 475_000);
     }
 
     #[test]
@@ -686,7 +686,7 @@ mod tests {
             crate::BudgetStrategy::default(),
             &registry,
         );
-        assert_eq!(budget.max_context_tokens, 32_768);
+        assert_eq!(budget.max_context_tokens, 475_000);
         assert_eq!(budget.max_output_tokens, 4_096);
     }
 

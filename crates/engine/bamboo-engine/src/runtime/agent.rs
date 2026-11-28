@@ -412,6 +412,30 @@ impl SdkInputSubmission {
 }
 
 impl Agent {
+    /// Return the effective context size and whether it came from the fallback.
+    /// The selected route and legacy limits come from the same Host config.
+    #[doc(hidden)]
+    pub async fn effective_chat_context_window(
+        &self,
+        config: &bamboo_config::Config,
+        app_data_dir: &std::path::Path,
+        selected: &crate::model_config_helper::ResolvedPrimaryModel,
+    ) -> (u32, bool) {
+        let loop_config = crate::runtime::config::AgentLoopConfig {
+            legacy_model_limits: config.extra.get("model_limits").cloned(),
+            model_limits_section: self.runtime.model_limits_section.clone(),
+            app_data_dir: Some(app_data_dir.to_path_buf()),
+            provider_name: Some(selected.target.provider.clone()),
+            ..Default::default()
+        };
+        crate::runtime::runner::round_lifecycle::resolve_chat_context_window(
+            &loop_config,
+            &selected.target.model,
+            selected.provider.as_ref(),
+        )
+        .await
+    }
+
     #[doc(hidden)]
     pub fn begin_context_compaction(
         &self,

@@ -144,6 +144,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::get().to(settings::get_model_limit_defaults),
         )
         .route(
+            "/bamboo/model-limits/effective",
+            web::post().to(settings::resolve_model_limit_windows),
+        )
+        .route(
             "/bamboo/config/validate",
             web::post().to(settings::validate_bamboo_config_patch),
         )

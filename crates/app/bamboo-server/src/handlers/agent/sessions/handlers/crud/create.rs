@@ -812,6 +812,7 @@ fn session_created_event(session: &Session) -> bamboo_agent_core::AgentEvent {
     bamboo_agent_core::AgentEvent::SessionCreated {
         session_id: session.id.clone(),
         project_id: session.project_id_meta(),
+        category: session.category().map(str::to_owned),
         title: session.title.clone(),
         kind: session.kind,
         created_at: session.created_at,
@@ -1004,6 +1005,21 @@ async fn create_session_once(
             };
         }
     };
+    let category = match req
+        .category
+        .as_deref()
+        .map(bamboo_domain::normalize_session_category)
+        .transpose()
+    {
+        Ok(category) => category.map(str::to_owned),
+        Err(error) => {
+            return Ok(crate::error::json_error_with_code(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                Some("invalid_session_category"),
+            ));
+        }
+    };
     let final_workspace_display = final_workspace
         .as_deref()
         .map(bamboo_config::paths::path_to_display_string);
@@ -1031,6 +1047,7 @@ async fn create_session_once(
     let mut session = build_new_session(
         &id,
         req,
+        category,
         gold_config_json,
         global_default_prompt.as_str(),
         &config_snapshot,
@@ -1217,6 +1234,7 @@ async fn create_session_once(
 fn build_new_session(
     id: &str,
     req: &CreateSessionRequest,
+    category: Option<String>,
     gold_config_json: Option<String>,
     global_default_prompt: &str,
     config: &bamboo_llm::Config,
@@ -1240,6 +1258,7 @@ fn build_new_session(
     let input = CreateSessionInput {
         id: id.to_string(),
         project_id: req.project_id.clone(),
+        category,
         title: req.title.clone(),
         title_generated: req.title_generated,
         system_prompt: req.system_prompt.clone(),
@@ -1259,6 +1278,10 @@ fn build_new_session(
 
     crate_build(&input, &create_config)
 }
+
+#[cfg(test)]
+#[path = "create/initial_category_tests.rs"]
+mod initial_category_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1555,7 +1578,8 @@ mod tests {
         )
         .await;
         let key = "lost-response-retry";
-        let payload = serde_json::json!({"title": "Response will be discarded"});
+        let payload =
+            serde_json::json!({"title": "Response will be discarded", "category": "Planning"});
 
         let discarded = test::call_service(
             &app,
@@ -1581,6 +1605,7 @@ mod tests {
         assert_eq!(retry.status(), StatusCode::OK);
         let retry: Value = test::read_body_json(retry).await;
         let session_id = retry["session"]["id"].as_str().unwrap();
+        assert_eq!(retry["session"]["category"], "Planning");
         assert_eq!(
             state
                 .session_store
@@ -1695,7 +1720,7 @@ mod tests {
             test::TestRequest::post()
                 .uri("/api/v1/sessions")
                 .insert_header((IDEMPOTENCY_KEY_HEADER, "concurrent-key"))
-                .set_json(serde_json::json!({"title": "Concurrent logical create"}))
+                .set_json(serde_json::json!({"title": "Concurrent logical create", "category": "Planning"}))
                 .to_request()
         });
         let responses =
@@ -1711,6 +1736,7 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::OK);
             }
             let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["session"]["category"], "Planning");
             ids.push(body["session"]["id"].as_str().unwrap().to_string());
         }
         assert_eq!(created, 1);
@@ -1766,7 +1792,8 @@ mod tests {
     async fn operation_only_pending_survives_restart_and_reuses_reserved_uuid() {
         let data_dir = tempdir().expect("data dir").keep();
         let key = "pending-restart";
-        let payload = serde_json::json!({"title": "Retry after restart"});
+        let payload =
+            serde_json::json!({"title": "Retry after restart", "category": "  Planning  "});
         let request: CreateSessionRequest = serde_json::from_value(payload.clone()).unwrap();
         let reserved_id = Uuid::new_v4().to_string();
         {
@@ -1814,6 +1841,7 @@ mod tests {
         assert_eq!(retry.status(), StatusCode::CREATED);
         let retry: Value = test::read_body_json(retry).await;
         assert_eq!(retry["session"]["id"], reserved_id);
+        assert_eq!(retry["session"]["category"], "Planning");
     }
 
     #[actix_web::test]
@@ -1868,10 +1896,17 @@ mod tests {
         let reserved_id = Uuid::new_v4().to_string();
         {
             let state = AppState::new(data_dir.clone()).await.expect("first state");
-            let session = Session::new(reserved_id.clone(), "model");
+            let mut session = Session::new(reserved_id.clone(), "model");
+            session.metadata.insert(
+                bamboo_domain::SESSION_CATEGORY_METADATA_KEY.into(),
+                "Planning".into(),
+            );
             state.storage.save_session(&session).await.unwrap();
-            let request: CreateSessionRequest =
-                serde_json::from_value(serde_json::json!({"title": "Committed"})).unwrap();
+            let request: CreateSessionRequest = serde_json::from_value(serde_json::json!({
+                "title": "Committed",
+                "category": "Planning",
+            }))
+            .unwrap();
             let digest = key_digest(key);
             let operation = SessionCreateOperationRecord::pending(
                 digest,
@@ -1920,11 +1955,20 @@ mod tests {
         let status: Value = test::read_body_json(status).await;
         assert_eq!(status["status"], "succeeded");
         assert_eq!(status["session"]["id"], reserved_id);
-        assert!(state
+        assert_eq!(status["session"]["category"], "Planning");
+        let entry = state
             .session_store
             .get_index_entry(&reserved_id)
             .await
-            .is_some());
+            .unwrap();
+        assert_eq!(entry.category.as_deref(), Some("Planning"));
+        let projected =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        assert!(projected.iter().any(|record| matches!(
+            &record.event,
+            bamboo_agent_core::AgentEvent::SessionCreated { session_id, category: Some(category), .. }
+                if session_id == &reserved_id && category == "Planning"
+        )));
     }
 
     #[actix_web::test]
@@ -2397,7 +2441,7 @@ mod tests {
         )
         .await;
         let key = "deleted-success";
-        let payload = serde_json::json!({"title": "Delete after create"});
+        let payload = serde_json::json!({"title": "Delete after create", "category": "Planning"});
         let created = test::call_service(
             &app,
             test::TestRequest::post()
@@ -2576,6 +2620,7 @@ mod tests {
             serde_json::json!({"gold_config": {"gold": true}}),
             serde_json::json!({"workspace_path": "/workspace"}),
             serde_json::json!({"permission_mode": "auto"}),
+            serde_json::json!({"category": "Planning"}),
         ];
         for value in variants {
             let request: CreateSessionRequest = serde_json::from_value(value.clone()).unwrap();
