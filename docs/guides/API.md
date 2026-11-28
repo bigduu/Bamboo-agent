@@ -459,6 +459,8 @@ eventSource.onmessage = (event) => {
 
 `GET /api/v1/bootstrap` advertises `sessions.manual_categories.v1`.
 Session list and detail entries include `category`, a string or `null`.
+Bootstrap advertises `sessions.create_category.v1` when `POST /api/v1/sessions`
+accepts an initial category. See the [recoverable creation contract](../session-create-idempotency.md).
 
 ```http
 PATCH /api/v1/sessions/{session_id}

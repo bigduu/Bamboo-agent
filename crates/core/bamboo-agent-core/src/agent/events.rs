@@ -600,6 +600,9 @@ pub enum AgentEvent {
         /// follow-up session fetch.
         #[serde(default)]
         project_id: Option<String>,
+        /// Manual category at creation time. Older journal records omit it.
+        #[serde(default)]
+        category: Option<String>,
         title: String,
         kind: bamboo_domain::SessionKind,
         created_at: chrono::DateTime<chrono::Utc>,
@@ -1236,6 +1239,28 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn legacy_session_created_event_defaults_to_uncategorized() {
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "session_created",
+            "session_id": "legacy-root",
+            "project_id": "legacy-project",
+            "title": "Legacy session",
+            "kind": "root",
+            "created_at": "2026-09-01T00:00:00Z",
+        }))
+        .unwrap();
+        assert!(matches!(
+            &event,
+            AgentEvent::SessionCreated { session_id, project_id: Some(project), category: None, .. }
+                if session_id == "legacy-root" && project == "legacy-project"
+        ));
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["category"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

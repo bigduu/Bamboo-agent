@@ -63,6 +63,7 @@ fn build_new_session_applies_title_and_system_prompt_metadata() {
     let input = CreateSessionInput {
         id: "session-1".to_string(),
         project_id: None,
+        category: None,
         title: Some("  Sprint Session  ".to_string()),
         title_generated: None,
         system_prompt: Some("  You are helpful  ".to_string()),
@@ -111,6 +112,7 @@ fn build_new_session_uses_global_default_template_when_request_prompt_is_missing
     let input = CreateSessionInput {
         id: "session-1".to_string(),
         project_id: None,
+        category: None,
         title: Some("New Session".to_string()),
         title_generated: None,
         system_prompt: None,

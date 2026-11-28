@@ -82,6 +82,7 @@ async fn ensure_manager(
             &CreateSessionInput {
                 id: id.clone(),
                 project_id: Some(project_id.clone()),
+                category: None,
                 title: Some("Project Manager".into()),
                 title_generated: Some(true),
                 system_prompt: Some(MANAGER_PROMPT.into()),
