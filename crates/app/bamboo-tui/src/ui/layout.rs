@@ -2448,7 +2448,8 @@ fn render_schedule_editor(
     error: Option<&str>,
     saving: bool,
 ) {
-    let (title, label) = match cadence.map(|edit| edit.kind) {
+    let kind = cadence.map(|edit| edit.kind);
+    let (title, label) = match kind {
         Some(ScheduleCadenceKind::Clock(ScheduleClockKind::Daily)) => {
             (" Edit daily time ", "  Time: ")
         }
@@ -2458,6 +2459,7 @@ fn render_schedule_editor(
         Some(ScheduleCadenceKind::Clock(ScheduleClockKind::Monthly)) => {
             (" Edit monthly time ", "  Time: ")
         }
+        Some(ScheduleCadenceKind::OnceAt) => (" Edit once time ", "  At: "),
         Some(ScheduleCadenceKind::Interval) => (" Edit interval ", "  Every (seconds): "),
         None => (" Rename schedule ", "  Name: "),
     };
@@ -2477,6 +2479,12 @@ fn render_schedule_editor(
             Style::default().fg(colors::brand()),
         ),
     ])];
+    if matches!(kind, Some(ScheduleCadenceKind::OnceAt)) {
+        lines.push(Line::styled(
+            "  Include Z or an offset such as +08:00.",
+            muted,
+        ));
+    }
     if let Some((kind, days)) =
         cadence.and_then(|edit| edit.calendar_days.as_deref().map(|days| (edit.kind, days)))
     {
@@ -2497,8 +2505,13 @@ fn render_schedule_editor(
         lines.push(Line::styled("  Saving…", muted));
     } else {
         if let Some(error) = error {
+            let error = if matches!(kind, Some(ScheduleCadenceKind::OnceAt)) {
+                error.to_owned()
+            } else {
+                clip_cells(error, width.saturating_sub(2))
+            };
             lines.push(Line::styled(
-                format!("  {}", clip_cells(error, width.saturating_sub(2))),
+                format!("  {error}"),
                 Style::default().fg(colors::error()),
             ));
         }
@@ -4253,9 +4266,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             if cfg!(target_os = "macos") {
-                [3_513_062_001_625_747_482, 15_347_621_753_759_940_732]
+                [16_745_512_446_883_444_986, 6_396_436_477_977_982_944]
             } else {
-                [18_304_756_250_246_231_972, 12_387_998_535_599_058_050]
+                [17_725_779_717_177_426_084, 15_964_508_660_357_980_262]
             },
             "complete help-overlay buffer golden changed"
         );

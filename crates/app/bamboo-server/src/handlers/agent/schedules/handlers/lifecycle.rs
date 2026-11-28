@@ -1,4 +1,5 @@
 use actix_web::{http::StatusCode, web, HttpResponse, Result};
+use chrono::{DateTime, Utc};
 
 use crate::app_state::AppState;
 use crate::schedule_app::store::{ScheduleClockKind, SchedulePatchRejection};
@@ -7,7 +8,7 @@ use crate::schedule_app::{ScheduleRunJob, ScheduleRunStatus};
 use super::super::types::{
     CreateScheduleRequest, PatchScheduleRequest, RenameScheduleRequest, ScheduleRunRecordView,
     ScheduleView, SetScheduleClockTimeRequest, SetScheduleDailyTimeRequest,
-    SetScheduleIntervalRequest, SetSchedulePromptRequest,
+    SetScheduleIntervalRequest, SetScheduleOnceAtRequest, SetSchedulePromptRequest,
 };
 use super::super::validation::{
     resolve_create_schedule_definition, resolve_patch_schedule_definition,
@@ -200,6 +201,64 @@ pub async fn set_schedule_interval(
                 SchedulePatchRejection::NoFutureOccurrence | SchedulePatchRejection::InvalidWindow,
             ) => Ok(schedule_no_future_occurrence()),
             _ => Err(internal_server_error("change schedule interval", error)),
+        },
+    }
+}
+
+fn invalid_schedule_once_at() -> HttpResponse {
+    crate::error::json_error_with_code(
+        StatusCode::BAD_REQUEST,
+        "Enter an RFC3339 timestamp with an offset".into(),
+        Some("invalid_schedule_once_at"),
+    )
+}
+
+/// `PATCH /api/v1/schedules/{schedule_id}/once-at`
+pub async fn set_schedule_once_at(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    req: Result<web::Json<SetScheduleOnceAtRequest>>,
+) -> Result<HttpResponse> {
+    let SetScheduleOnceAtRequest::Instant { at } = match req {
+        Ok(req) => req.into_inner(),
+        Err(error) if error.as_response_error().status_code() == StatusCode::BAD_REQUEST => {
+            return Ok(invalid_schedule_once_at());
+        }
+        Err(error) => return Err(error),
+    };
+    let Ok(at) = DateTime::parse_from_rfc3339(&at) else {
+        return Ok(invalid_schedule_once_at());
+    };
+    match state
+        .schedule_store
+        .patch_once_at(&path, at.with_timezone(&Utc))
+        .await
+    {
+        Ok(Some(schedule)) => Ok(HttpResponse::Ok().json(ScheduleView::from(schedule))),
+        Ok(None) => Ok(crate::error::json_error_with_code(
+            StatusCode::NOT_FOUND,
+            "Schedule not found".into(),
+            Some("schedule_not_found"),
+        )),
+        Err(error) => match error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<SchedulePatchRejection>())
+        {
+            Some(SchedulePatchRejection::TriggerChanged) => Ok(crate::error::json_error_with_code(
+                StatusCode::CONFLICT,
+                "Schedule no longer uses an editable Once trigger".into(),
+                Some("schedule_trigger_changed"),
+            )),
+            Some(SchedulePatchRejection::OnceNotPending) => Ok(crate::error::json_error_with_code(
+                StatusCode::CONFLICT,
+                "One-time occurrence is no longer pending".into(),
+                Some("schedule_once_not_pending"),
+            )),
+            Some(SchedulePatchRejection::NoFutureOccurrence) => Ok(schedule_no_future_occurrence()),
+            _ => Err(internal_server_error(
+                "change schedule once timestamp",
+                error,
+            )),
         },
     }
 }
@@ -1881,6 +1940,308 @@ mod tests {
             assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), saved);
             assert_eq!(store.get_schedule(&ended.id).await, Some(ended));
             assert_eq!(store.get_schedule(&bounded.id).await, Some(bounded));
+        }
+
+        async fn patch_once_at_request(
+            app: &impl Service<
+                actix_http::Request,
+                Response = ServiceResponse,
+                Error = actix_web::Error,
+            >,
+            schedule_id: &str,
+            payload: &str,
+        ) -> (StatusCode, Value) {
+            let response = test::call_service(
+                app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/schedules/{schedule_id}/once-at"))
+                    .insert_header(("Content-Type", "application/json"))
+                    .set_payload(payload.to_owned())
+                    .to_request(),
+            )
+            .await;
+            (response.status(), test::read_body_json(response).await)
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_once_at_preserves_disabled_legacy_pending_and_manual_run() {
+            use chrono::{Duration, FixedOffset, SecondsFormat, Timelike, Utc};
+
+            let temp_dir = tempdir().unwrap();
+            let home = temp_dir.path().to_path_buf();
+            bamboo_config::paths::init_bamboo_dir(home.clone());
+            let seed = ScheduleStore::new(home.clone()).await.unwrap();
+            let start = (Utc::now() + Duration::days(2))
+                .with_nanosecond(123_456_789)
+                .unwrap();
+            let end = start + Duration::hours(2);
+            let config = ScheduleRunConfig {
+                task_message: Some("Review the saved report".into()),
+                system_prompt: Some("Keep the saved format".into()),
+                auto_execute: true,
+                ..Default::default()
+            };
+            let entry = seed
+                .create_schedule_with_definition(
+                    "One-time review".into(),
+                    false,
+                    config.clone(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(ScheduleTrigger::Once { at: start }),
+                        timezone: Some("America/New_York".into()),
+                        start_at: Some(start),
+                        end_at: Some(end),
+                        misfire_policy: Some(MisFirePolicy::RunOnce),
+                        overlap_policy: Some(OverlapPolicy::Allow),
+                    },
+                )
+                .await
+                .unwrap();
+            let manual = seed.create_run_now(&entry.id).await.unwrap().unwrap();
+            assert_eq!(manual.run_config, config);
+            let records = seed.list_run_records_for_schedule(&entry.id).await;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].run_id, manual.run_id);
+            assert_eq!(records[0].status, ScheduleRunStatus::Queued);
+
+            // An earlier nominal trigger may have been clamped to the future window start.
+            let legacy_at = start - Duration::days(3);
+            let mut index: Value =
+                serde_json::from_slice(&tokio::fs::read(seed.index_path()).await.unwrap()).unwrap();
+            let row = index["schedules"][entry.id.as_str()]
+                .as_object_mut()
+                .unwrap();
+            row.remove("state");
+            row.insert("next_run_at".into(), serde_json::json!(start));
+            row.insert(
+                "trigger".into(),
+                serde_json::json!(ScheduleTrigger::Once { at: legacy_at }),
+            );
+            let overdue_id = "overdue-legacy-once";
+            let mut overdue = row.clone();
+            overdue.insert("id".into(), serde_json::json!(overdue_id));
+            overdue.insert("next_run_at".into(), serde_json::json!(legacy_at));
+            index["schedules"][overdue_id] = Value::Object(overdue);
+            tokio::fs::write(seed.index_path(), serde_json::to_vec(&index).unwrap())
+                .await
+                .unwrap();
+            drop(seed);
+
+            let state = web::Data::new(AppState::new(home.clone()).await.unwrap());
+            let store = &state.schedule_store;
+            let before = store.get_schedule(&entry.id).await.unwrap();
+            assert!(!before.enabled);
+            assert_eq!(before.trigger, ScheduleTrigger::Once { at: legacy_at });
+            assert_eq!(before.state.next_fire_at, Some(start));
+            let overdue = store.get_schedule(overdue_id).await.unwrap();
+            assert_eq!(overdue.state.next_fire_at, Some(legacy_at));
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+
+            let previous_bytes = tokio::fs::read(store.index_path()).await.unwrap();
+            let (status, body) =
+                patch_once_at_request(&app, overdue_id, &serde_json::json!({"at":end}).to_string())
+                    .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["error"]["code"], "schedule_once_not_pending");
+            assert_eq!(store.get_schedule(overdue_id).await, Some(overdue));
+            for outside in [
+                start - Duration::nanoseconds(1),
+                end + Duration::nanoseconds(1),
+            ] {
+                let (status, body) = patch_once_at_request(
+                    &app,
+                    &entry.id,
+                    &serde_json::json!({"at":outside}).to_string(),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert_eq!(body["error"]["code"], "schedule_no_future_occurrence");
+            }
+            assert_eq!(
+                tokio::fs::read(store.index_path()).await.unwrap(),
+                previous_bytes
+            );
+            assert_eq!(store.get_schedule(&entry.id).await, Some(before.clone()));
+
+            let offset = FixedOffset::east_opt(8 * 3600).unwrap();
+            let payload = serde_json::json!({
+                "at": end.with_timezone(&offset).to_rfc3339_opts(SecondsFormat::Nanos, false)
+            });
+            let (status, view) = patch_once_at_request(&app, &entry.id, &payload.to_string()).await;
+            assert_eq!(status, StatusCode::OK, "{view}");
+            let saved = store.get_schedule(&entry.id).await.unwrap();
+            let mut expected = before;
+            expected.trigger = ScheduleTrigger::Once { at: end };
+            expected.state.next_fire_at = Some(end);
+            assert_ne!(saved.updated_at, expected.updated_at);
+            expected.updated_at = saved.updated_at;
+            assert_eq!(saved, expected);
+            assert_eq!(
+                view,
+                serde_json::to_value(ScheduleView::from(expected.clone())).unwrap()
+            );
+
+            let saved_bytes = tokio::fs::read(store.index_path()).await.unwrap();
+            let (status, repeated) =
+                patch_once_at_request(&app, &entry.id, &serde_json::json!({"at":end}).to_string())
+                    .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(repeated, view);
+            assert_eq!(
+                tokio::fs::read(store.index_path()).await.unwrap(),
+                saved_bytes
+            );
+            assert_eq!(
+                store.list_run_records_for_schedule(&entry.id).await,
+                records
+            );
+            let reopened = ScheduleStore::new(home).await.unwrap();
+            assert_eq!(reopened.get_schedule(&entry.id).await, Some(expected));
+            assert_eq!(
+                reopened.list_run_records_for_schedule(&entry.id).await,
+                records
+            );
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_once_at_refuses_consumed_automatic_occurrence_after_reopen() {
+            use chrono::{Duration, Utc};
+
+            let temp_dir = tempdir().unwrap();
+            let home = temp_dir.path().to_path_buf();
+            bamboo_config::paths::init_bamboo_dir(home.clone());
+            let seed = ScheduleStore::new(home.clone()).await.unwrap();
+            let original_at = Utc::now() + Duration::hours(2);
+            let entry = seed
+                .create_schedule_with_definition(
+                    "Automatic one-time review".into(),
+                    true,
+                    ScheduleRunConfig {
+                        task_message: Some("Review the report".into()),
+                        ..Default::default()
+                    },
+                    ScheduleDefinitionChanges {
+                        trigger: Some(ScheduleTrigger::Once { at: original_at }),
+                        misfire_policy: Some(MisFirePolicy::RunOnce),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let claims = seed.claim_due_runs(original_at).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].scheduled_for, original_at);
+            let run_id = &claims[0].run_id;
+            drop(seed);
+
+            for run_status in [ScheduleRunStatus::Queued, ScheduleRunStatus::Running] {
+                let state = web::Data::new(AppState::new(home.clone()).await.unwrap());
+                let store = &state.schedule_store;
+                let before = store.get_schedule(&entry.id).await.unwrap();
+                assert!(Utc::now() < original_at);
+                assert!(!before.enabled);
+                assert_eq!(before.state.next_fire_at, None);
+                assert_eq!(before.state.last_scheduled_at, Some(original_at));
+                let records = store.list_run_records_for_schedule(&entry.id).await;
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].run_id, *run_id);
+                assert_eq!(records[0].status, run_status);
+                let bytes = tokio::fs::read(store.index_path()).await.unwrap();
+
+                let app = test::init_service(
+                    App::new()
+                        .app_data(state.clone())
+                        .configure(configure_routes),
+                )
+                .await;
+                for at in [original_at, original_at + Duration::hours(1)] {
+                    let (status, body) = patch_once_at_request(
+                        &app,
+                        &entry.id,
+                        &serde_json::json!({"at":at}).to_string(),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CONFLICT);
+                    assert_eq!(body["error"]["code"], "schedule_once_not_pending");
+                }
+                assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), bytes);
+                assert_eq!(store.get_schedule(&entry.id).await, Some(before));
+                assert_eq!(
+                    store.list_run_records_for_schedule(&entry.id).await,
+                    records
+                );
+
+                if run_status == ScheduleRunStatus::Queued {
+                    store.mark_run_started(&entry.id, run_id).await.unwrap();
+                }
+            }
+        }
+
+        #[actix_web::test]
+        async fn set_schedule_once_at_rejects_malformed_requests_and_other_targets() {
+            use chrono::{Duration, Utc};
+
+            let temp_dir = tempdir().unwrap();
+            let home = temp_dir.path().to_path_buf();
+            bamboo_config::paths::init_bamboo_dir(home.clone());
+            let state = web::Data::new(AppState::new(home).await.unwrap());
+            let store = &state.schedule_store;
+            let at = Utc::now() + Duration::hours(2);
+            let interval = store
+                .create_schedule_with_definition(
+                    "Existing recurrence".into(),
+                    false,
+                    ScheduleRunConfig::default(),
+                    ScheduleDefinitionChanges {
+                        trigger: Some(ScheduleTrigger::legacy_interval(60, None)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+            let bytes = tokio::fs::read(store.index_path()).await.unwrap();
+            for payload in [
+                "[]",
+                "{}",
+                r#"{"at":42}"#,
+                r#"{"at":"2099-06-01T12:00:00"}"#,
+                r#"{"at":"2099-06-01T12:00:00+0800"}"#,
+                r#"{"at":"2099-06-01T12:00:00Z","enabled":true}"#,
+            ] {
+                let (status, body) = patch_once_at_request(&app, &interval.id, payload).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{payload} {body}");
+                assert_eq!(body["error"]["code"], "invalid_schedule_once_at");
+            }
+            let payload = serde_json::json!({"at":at}).to_string();
+            for (id, expected_status, code) in [
+                (
+                    interval.id.as_str(),
+                    StatusCode::CONFLICT,
+                    "schedule_trigger_changed",
+                ),
+                (
+                    "missing-schedule",
+                    StatusCode::NOT_FOUND,
+                    "schedule_not_found",
+                ),
+            ] {
+                let (status, body) = patch_once_at_request(&app, id, &payload).await;
+                assert_eq!(status, expected_status, "{body}");
+                assert_eq!(body["error"]["code"], code);
+            }
+            assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), bytes);
+            assert_eq!(store.get_schedule(&interval.id).await, Some(interval));
         }
 
         #[actix_web::test]

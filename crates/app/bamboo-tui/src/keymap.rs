@@ -249,6 +249,7 @@ pub(crate) enum ActionId {
     EditScheduleDailyTime,
     EditScheduleWeeklyTime,
     EditScheduleMonthlyTime,
+    EditScheduleOnceTime,
     EditSchedulePrompt,
     SaveSchedulePrompt,
     OpenScheduleSessions,
@@ -1428,6 +1429,14 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [Schedules],
         [(Schedules, "m")]
+    ),
+    spec!(
+        EditScheduleOnceTime,
+        "Edit Once schedule time",
+        "Move an upcoming Once Task schedule to another date and time",
+        false,
+        [Schedules],
+        [(Schedules, "o")]
     ),
     spec!(
         EditSchedulePrompt,
