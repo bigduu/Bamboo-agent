@@ -160,20 +160,22 @@ async fn get_available_workflows_maps_listing_failures_to_internal_error() {
 async fn skill_management_lists_one_complete_publication_without_changing_legacy_filters() {
     use serde_json::{json, Value};
 
+    const PLAIN_SKILL: &str = concat!(
+        "\u{feff}\n\n# Review ready\n\n",
+        "![Status](badge.svg)\n\n",
+        "selection-needle winning instructions\n\nSecond paragraph.\n",
+    );
     let temp_dir = tempfile::tempdir().expect("temp data directory");
     let data = temp_dir.path();
     for (directory, contents) in [
-        (
-            "skills/management-ready",
-            "---\nname: Review ready\ndescription: selection-needle winning instructions\n---\nReady instruction fixture.\n",
-        ),
+        ("skills/management-ready", PLAIN_SKILL),
         (
             "skills/management-disabled",
             "---\nname: Review disabled\ndescription: selection-needle disabled instructions\n---\nDisabled instruction fixture.\n",
         ),
         (
             "skills/management-retained",
-            "---\nname: Review retained\ndescription: Last usable description\n---\nRetained instruction fixture.\n",
+            "---\nname: Review retained\n---\nLast usable description\n\nRetained instruction fixture.\n",
         ),
         (
             "skills/management-migrated",
@@ -190,6 +192,14 @@ async fn skill_management_lists_one_complete_publication_without_changing_legacy
             .await
             .unwrap();
     }
+    let agents = data.join("skills/management-ready/agents");
+    tokio::fs::create_dir_all(&agents).await.unwrap();
+    tokio::fs::write(
+        agents.join("bamboo.yaml"),
+        "invocation_policy:\n  automatic: false\n",
+    )
+    .await
+    .unwrap();
     let state = web::Data::new(AppState::new(data.to_path_buf()).await.unwrap());
     state.config.write().await.skills.disabled = vec!["management-disabled".into()];
     let store = state.skill_manager.store();
@@ -275,6 +285,7 @@ async fn skill_management_lists_one_complete_publication_without_changing_legacy
         assert_eq!(row(id)["availability"], availability, "{id}");
     }
     assert_eq!(row("management-ready")["source"], "user");
+    assert_eq!(row("management-ready")["name"], "Review ready");
     assert_eq!(
         row("management-ready")["description"],
         "selection-needle winning instructions"
@@ -289,8 +300,15 @@ async fn skill_management_lists_one_complete_publication_without_changing_legacy
         .find(|entry| entry.id == "management-ready")
         .unwrap();
     assert_eq!(ready.shadowed_candidates.len(), 1);
+    assert_eq!(ready.invocation_policy["automatic"], false);
     assert_eq!(opted_in["total"], 1);
     assert_eq!(opted_in["skills"][0]["id"], "management-ready");
+    assert_eq!(
+        tokio::fs::read(data.join("skills/management-ready/SKILL.md"))
+            .await
+            .unwrap(),
+        PLAIN_SKILL.as_bytes()
+    );
 
     let legacy = get("/skills?search=selection-needle").await;
     assert_eq!(

@@ -209,6 +209,33 @@ async fn codex_input_orchestration_keeps_classification_and_intersects_host_poli
         metadata.invocation_policy,
         serde_json::json!({"explicit": false, "automatic": false})
     );
+    let store = SkillStore::new(SkillStoreConfig {
+        skills_dir: temp.path().to_path_buf(),
+        ..Default::default()
+    });
+    store.initialize().await.unwrap();
+    let original = store.workflow_catalog_snapshot().await;
+    let original = original
+        .entries
+        .iter()
+        .find(|entry| entry.id == "compose")
+        .unwrap();
+    assert_eq!(original.status, WorkflowStatus::Valid);
+
+    fs::write(root.join("SKILL.md"), "# Compose\n\nOrdinary Markdown.\n")
+        .await
+        .unwrap();
+    store.reload().await.unwrap();
+    let refreshed = store.workflow_catalog_snapshot().await;
+    let retained = refreshed
+        .entries
+        .iter()
+        .find(|entry| entry.id == "compose")
+        .unwrap();
+    assert_eq!(retained.status, WorkflowStatus::Invalid);
+    assert_eq!(retained.content_digest, original.content_digest);
+    assert_eq!(retained.invocation_policy, original.invocation_policy);
+
     fs::write(
         root.join("agents/bamboo.yaml"),
         "invocation_policy:\n  explicit: wrong\n",

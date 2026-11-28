@@ -12,7 +12,9 @@ use crate::clone_publication::{
     clone_marker_name, parse_clone_marker_journal, std_file_identity, ClonePublicationPhase,
     MAX_CLONE_MARKER_BYTES,
 };
-use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
+use crate::store::parser::{
+    parse_discovered_instruction_skill, parse_markdown_skill, render_skill_markdown,
+};
 use crate::types::{SkillDefinition, SkillError, SkillResult};
 
 static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
@@ -634,8 +636,17 @@ pub(crate) async fn load_captured_records(
                     }
                 }
             };
+            // The coherent snapshot classifies ordinary instruction bundles.
+            let parse = if captured
+                .as_ref()
+                .is_some_and(|captured| captured.metadata.kind == crate::WorkflowKind::Instruction)
+            {
+                parse_discovered_instruction_skill
+            } else {
+                parse_markdown_skill
+            };
             match String::from_utf8(bytes) {
-                Ok(content) => match parse_markdown_skill(&skill_file, &content) {
+                Ok(content) => match parse(&skill_file, &content) {
                     Ok(skill) => {
                         if let Some(captured) = captured {
                             captures.insert(
