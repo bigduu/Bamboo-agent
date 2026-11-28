@@ -173,6 +173,12 @@ impl TicketApplication {
             command.expected_seq = original.expected_seq;
             command.expected_epoch = original.expected_epoch;
         }
+        let host = self.managed_work_host.get().ok_or_else(|| {
+            Error::AuthorityUnavailable("Project Work Host is unavailable".into())
+        })?;
+        // A Session move or permission change uses this same writer lock.
+        // Keep the verified caller in scope until the draft is committed.
+        let _guard = host.persistence.acquire_lock(&caller.session_id).await;
         let (project, current) = self.resolve_project_caller(caller).await?;
         if &project.id != project_id
             || current
