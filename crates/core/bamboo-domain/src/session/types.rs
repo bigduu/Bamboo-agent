@@ -21,6 +21,24 @@ const TOOL_MESSAGE_TRUNCATION_MARKER: &str = "[... tool output truncated ...]";
 /// Durable chat origin for sessions created by the Connect bridge.
 pub const CONNECT_SESSION_ORIGIN_KEY: &str = "created_by_connect_key";
 
+/// Durable, user-assigned presentation category on a Root Session.
+pub const SESSION_CATEGORY_METADATA_KEY: &str = "ui.category.v1";
+
+#[derive(Debug, thiserror::Error)]
+#[error("Session category must contain 1–80 characters after trimming and no control characters")]
+pub struct InvalidSessionCategory;
+
+pub fn normalize_session_category(value: &str) -> Result<&str, InvalidSessionCategory> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().take(81).count() > 80
+        || value.chars().any(char::is_control)
+    {
+        return Err(InvalidSessionCategory);
+    }
+    Ok(trimmed)
+}
+
 fn default_title_generated() -> bool {
     true
 }
@@ -901,6 +919,13 @@ pub enum SessionKind {
 }
 
 impl Session {
+    pub fn category(&self) -> Option<&str> {
+        if self.kind != SessionKind::Root {
+            return None;
+        }
+        normalize_session_category(self.metadata.get(SESSION_CATEGORY_METADATA_KEY)?).ok()
+    }
+
     /// Load-boundary migration: a persisted `Root` session's `token_budget` can
     /// only be a stale pre-#180 resolved-budget cache — genuine budgets flow
     /// through `config.token_budget`, and only a `Child` persists an assigned

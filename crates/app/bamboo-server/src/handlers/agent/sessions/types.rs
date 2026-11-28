@@ -128,9 +128,8 @@ where
     Option::<String>::deserialize(deserializer).map(Some)
 }
 
-/// Preserve even JSON null/invalid values so PATCH cannot silently ignore a
-/// mode selector. Mode changes belong to the recoverable Root operation.
-fn deserialize_thinking_mode_presence<'de, D>(
+/// Preserve explicit JSON null for PATCH fields where presence matters.
+fn deserialize_present_json_value<'de, D>(
     deserializer: D,
 ) -> Result<Option<serde_json::Value>, D::Error>
 where
@@ -151,6 +150,7 @@ pub struct SessionSummary {
     pub resume_interrupted: Option<bool>,
     #[serde(default)]
     pub project_id: Option<bamboo_domain::ProjectId>,
+    pub category: Option<String>,
     pub kind: bamboo_agent_core::SessionKind,
     pub title: String,
     pub title_version: u64,
@@ -322,6 +322,9 @@ impl SessionSummary {
             execution_compatibility: None,
             resume_interrupted: None,
             project_id,
+            category: entry
+                .category
+                .filter(|_| entry.kind == bamboo_agent_core::SessionKind::Root),
             kind: entry.kind,
             title: entry.title,
             title_version: entry.title_version,
@@ -602,6 +605,46 @@ pub struct SessionSystemPromptResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SessionPatchBody {
+    Category(#[serde(deserialize_with = "deserialize_category_patch_object")] CategorySessionPatch),
+    General(Box<PatchSessionRequest>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CategorySessionPatch {
+    #[serde(deserialize_with = "Option::<String>::deserialize")]
+    pub category: Option<String>,
+}
+
+fn deserialize_category_patch_object<'de, D>(
+    deserializer: D,
+) -> Result<CategorySessionPatch, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct CategoryObject;
+
+    impl<'de> serde::de::Visitor<'de> for CategoryObject {
+        type Value = CategorySessionPatch;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an object containing category")
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            fields: M,
+        ) -> Result<Self::Value, M::Error> {
+            CategorySessionPatch::deserialize(serde::de::value::MapAccessDeserializer::new(fields))
+        }
+    }
+
+    deserializer.deserialize_map(CategoryObject)
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PatchSessionRequest {
     #[serde(default)]
     pub title: Option<String>,
@@ -627,7 +670,7 @@ pub struct PatchSessionRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub clear_reasoning_effort: Option<bool>,
-    #[serde(default, deserialize_with = "deserialize_thinking_mode_presence")]
+    #[serde(default, deserialize_with = "deserialize_present_json_value")]
     pub thinking_mode: Option<serde_json::Value>,
     #[serde(default)]
     pub gold_config: Option<serde_json::Value>,
@@ -642,6 +685,10 @@ pub struct PatchSessionRequest {
     /// Optional precondition for the dispatch scope shown by the client.
     #[serde(default)]
     pub expected_supervisor_dispatch_inheritance: Option<bool>,
+    // Preserve key presence to reject malformed category-only requests.
+    // Keep it after the legacy fields so sequence input retains its positions.
+    #[serde(default, deserialize_with = "deserialize_present_json_value")]
+    pub category: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -668,6 +715,34 @@ pub struct CleanupRequest {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn session_patch_category_is_an_explicit_object_field() {
+        for (expression, expected_title) in [(r#"["Support"]"#, Some("Support")), ("[null]", None)]
+        {
+            let decoded: SessionPatchBody = serde_json::from_str(expression).unwrap();
+            let SessionPatchBody::General(fields) = decoded else {
+                panic!("legacy PATCH array must keep using the legacy fields");
+            };
+            assert_eq!(fields.title.as_deref(), expected_title);
+            assert!(fields.category.is_none());
+        }
+
+        for (expression, expected) in [
+            (r#"{"category":"Support"}"#, Some("Support")),
+            (r#"{"category":null}"#, None),
+        ] {
+            let decoded: SessionPatchBody = serde_json::from_str(expression).unwrap();
+            let SessionPatchBody::Category(patch) = decoded else {
+                panic!("named category mutation must use the category fields");
+            };
+            assert_eq!(patch.category.as_deref(), expected);
+        }
+        assert!(serde_json::from_str::<SessionPatchBody>(
+            r#"{"category":"Support","category":null}"#
+        )
+        .is_err());
+    }
 
     #[test]
     fn test_create_session_request_minimal() {
@@ -832,6 +907,7 @@ mod tests {
             resume_interrupted: None,
             id: "test-id".to_string(),
             project_id: Some("project-1".parse().unwrap()),
+            category: Some("Support".into()),
             bypass_permissions: false,
             permission_mode: bamboo_domain::SessionPermissionMode::Default,
             supervisor_dispatch_inherits_permission_mode: None,
@@ -896,6 +972,7 @@ mod tests {
             resume_interrupted: None,
             id: "session-123".to_string(),
             project_id: Some("project-1".parse().unwrap()),
+            category: None,
             bypass_permissions: false,
             permission_mode: bamboo_domain::SessionPermissionMode::Default,
             supervisor_dispatch_inherits_permission_mode: None,
@@ -1047,6 +1124,7 @@ mod tests {
             resume_interrupted: None,
             id: "test".to_string(),
             project_id: None,
+            category: None,
             bypass_permissions: false,
             permission_mode: bamboo_domain::SessionPermissionMode::Default,
             supervisor_dispatch_inherits_permission_mode: None,

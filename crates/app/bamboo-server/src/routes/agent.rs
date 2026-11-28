@@ -338,6 +338,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::projects::get_project),
         )
         .route(
+            "/projects/{project_id}/session-categories",
+            web::get().to(agent::projects::project_session_categories),
+        )
+        .route(
             "/projects/{project_id}",
             web::patch().to(agent::projects::patch_project),
         )

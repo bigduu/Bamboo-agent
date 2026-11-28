@@ -631,6 +631,36 @@ pub async fn get_project(
     }
 }
 
+pub async fn project_session_categories(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> Result<HttpResponse> {
+    let id = match parse_id(&path) {
+        Ok(id) => id,
+        Err(response) => return Ok(*response),
+    };
+    if let Err(error) = state.project_store.get(&id) {
+        return Ok(project_error(error));
+    }
+
+    #[derive(Serialize)]
+    struct CategoryCount {
+        name: String,
+        session_count: usize,
+    }
+    let categories: Vec<_> = state
+        .session_store
+        .project_session_category_counts(&id)
+        .await
+        .into_iter()
+        .map(|(name, session_count)| CategoryCount {
+            name,
+            session_count,
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "categories": categories })))
+}
+
 pub async fn patch_project(
     state: web::Data<AppState>,
     path: web::Path<String>,

@@ -302,7 +302,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #3266 adds Project Manager routing to the existing Server Ticket owner.
 // Restart, Section placement, and submission use native_work_acceptance in
 // server-tests-1. Cargo features and additive case selections stay the same.
-const FEATURE_SOURCE_SHA256 = "95e3d4ba31153b5c5463ebb5307ff0ec792ea4246dab5a48b44214e6cedd3860";
+const FEATURE_SOURCE_SHA256 = "fed95ead4bcce09a5a9d8efbe535b67f40341d0f3a0db0a40d029f634e67ede7";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
