@@ -1,3 +1,6 @@
+use super::super::{
+    maybe_apply_summary_context_compression_with_budget, retrieval_window_preflight,
+};
 use super::*;
 
 pub(super) fn history_schema() -> ToolSchema {
@@ -58,7 +61,7 @@ fn output(messages: &[Message], id: &str) -> String {
         .clone()
 }
 
-fn transcript() -> Session {
+fn transcript(log_lines: usize) -> Session {
     let mut session = Session::new("old-tools", "test-model");
     session
         .messages
@@ -68,21 +71,21 @@ fn transcript() -> Session {
         "build",
         "Bash",
         serde_json::json!({"command": "cargo build"}),
-        "compiler package instruction object source artifact\n".repeat(900),
+        "compiler package instruction object source artifact\n".repeat(log_lines),
     );
     add_batch(
         &mut session,
         "tests",
         "Bash",
         serde_json::json!({"command": "cargo test --locked"}),
-        "test workspace integration module assertion passed\n".repeat(900),
+        "test workspace integration module assertion passed\n".repeat(log_lines),
     );
     add_batch(
         &mut session,
         "search",
         "Grep",
         serde_json::json!({}),
-        "workspace module definition match marker source file\n".repeat(900),
+        "workspace module definition match marker source file\n".repeat(log_lines),
     );
     add_batch(
         &mut session,
@@ -110,7 +113,7 @@ fn transcript() -> Session {
 
 #[tokio::test]
 async fn pruning_reaches_its_own_target_without_summary_and_reuses_saved_preview() {
-    let mut session = transcript();
+    let mut session = transcript(900);
     let config = config(true);
     let (llm, calls) = recording_llm();
     let tools = [history_schema()];
@@ -165,8 +168,66 @@ async fn pruning_reaches_its_own_target_without_summary_and_reuses_saved_preview
 }
 
 #[tokio::test]
+async fn pruning_uses_fresh_provider_pressure_and_invalidates_usage_only_after_rewrite() {
+    let mut session = transcript(240);
+    let config = config(true);
+    let raw_budget = config.token_budget.as_ref().unwrap();
+    let budget = config
+        .context_management
+        .apply_compression_policy(raw_budget.clone());
+    let counter = TiktokenTokenCounter::default();
+    let tools = [history_schema()];
+    let (llm, calls) = recording_llm();
+
+    for expected_previews in 1..=2 {
+        let projection = retrieval_window_preflight(
+            &session,
+            &config,
+            "test-model",
+            &tools,
+            &llm,
+            &budget,
+            &counter,
+        )
+        .await
+        .unwrap();
+        assert!(projection.active_tokens < budget.compression_thresholds().trigger_tokens);
+        session.token_usage = Some(pressure_usage(14_000, 16_000));
+
+        let summarized = maybe_apply_summary_context_compression_with_budget(
+            &mut session,
+            &config,
+            "test-model",
+            "old-tools",
+            &tools,
+            &llm,
+            raw_budget,
+            None,
+            "test",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!summarized);
+        assert_eq!(
+            session
+                .model_context_state
+                .as_ref()
+                .unwrap()
+                .tool_output_previews
+                .len(),
+            expected_previews
+        );
+        assert!(session.token_usage.is_none());
+    }
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn pruning_that_cannot_fit_falls_back_to_summary_without_committing_previews() {
-    let mut session = transcript();
+    let mut session = transcript(900);
     for index in 0..6 {
         session.messages.insert(
             0,

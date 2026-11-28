@@ -92,6 +92,9 @@ pub(super) async fn try_apply(
                 target_tokens = target,
                 "staged tool-output pruning at the request boundary"
             );
+            // The previous usage snapshot measured a different prefix.
+            // The next completed request supplies usage for the new prefix.
+            staged.token_usage = None;
             *session = staged;
             return Ok(true);
         }

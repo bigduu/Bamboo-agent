@@ -1932,23 +1932,15 @@ async fn maybe_apply_summary_context_compression_with_budget(
         return Ok(false);
     }
     let pruning = tool_output_pruning::enabled(session, config) && preflight.history_slice_callable;
-    // A committed preview already saved tokens in this projection. Do not
-    // carry reported usage from the pre-prune prefix into a new summary trigger.
-    let active_tokens = if pruning {
-        preflight.active_tokens
-    } else {
-        exposure.active_tokens.max(preflight.active_tokens)
-    };
+    let active_tokens = exposure.active_tokens.max(preflight.active_tokens);
     let compression_window = budget.compression_window_tokens();
-    let projected_usage_percent = bamboo_compression::context_window_usage_percent(
-        preflight.active_tokens,
-        compression_window,
-    );
-    let usage_percent = if pruning {
-        projected_usage_percent
-    } else {
-        exposure.active_usage_percent.max(projected_usage_percent)
-    };
+    let usage_percent =
+        exposure
+            .active_usage_percent
+            .max(bamboo_compression::context_window_usage_percent(
+                preflight.active_tokens,
+                compression_window,
+            ));
     let auto_threshold =
         bamboo_compression::context_window_usage_percent(range.trigger_tokens, compression_window);
     let forced_requested = forced_trigger_type.is_some();
