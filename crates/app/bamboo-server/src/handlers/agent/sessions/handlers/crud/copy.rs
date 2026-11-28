@@ -147,6 +147,7 @@ async fn duplicate_session(
         bamboo_agent_core::AgentEvent::SessionCreated {
             session_id: new_id.clone(),
             project_id: copied.project_id_meta(),
+            category: copied.category().map(str::to_owned),
             title: copied.title.clone(),
             kind: copied.kind,
             created_at: copied.created_at,

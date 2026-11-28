@@ -6,7 +6,7 @@
 
 use bamboo_agent_core::{Message, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
-use bamboo_domain::ProviderModelRef;
+use bamboo_domain::{ProviderModelRef, SESSION_CATEGORY_METADATA_KEY};
 
 use super::provider_model::{persist_legacy_model_provider, persist_model_ref};
 use crate::model_config_helper::GOLD_CONFIG_METADATA_KEY;
@@ -16,6 +16,8 @@ pub struct CreateSessionInput {
     pub id: String,
     /// Stable Project membership for this root session.
     pub project_id: Option<bamboo_domain::ProjectId>,
+    /// Validated initial category for this Root session.
+    pub category: Option<String>,
     pub title: Option<String>,
     /// Explicit title lifecycle supplied by the client. When omitted, an
     /// explicit non-empty title is treated as finalized for backwards
@@ -94,6 +96,11 @@ pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfi
     }
     if let Some(project_id) = input.project_id.as_ref() {
         session.set_project_id_meta(project_id.to_string());
+    }
+    if let Some(category) = input.category.as_ref() {
+        session
+            .metadata
+            .insert(SESSION_CATEGORY_METADATA_KEY.into(), category.clone());
     }
     // Stamp the resolved initial permission mode exactly once at creation.
     // `set_permission_mode` keeps the typed mode and legacy boolean mirror
@@ -213,6 +220,7 @@ mod tests {
         let input = CreateSessionInput {
             id: "session-1".to_string(),
             project_id: None,
+            category: Some("Planning".into()),
             title: Some("  Sprint Session  ".to_string()),
             title_generated: None,
             system_prompt: Some("  You are helpful  ".to_string()),
@@ -226,6 +234,7 @@ mod tests {
         let session = build_new_session(&input, &default_config());
 
         assert_eq!(session.title, "Sprint Session");
+        assert_eq!(session.category(), Some("Planning"));
         assert!(session.title_generated);
         assert_eq!(
             session
@@ -246,6 +255,7 @@ mod tests {
         let input = CreateSessionInput {
             id: "session-placeholder".to_string(),
             project_id: None,
+            category: None,
             title: Some("Any UI Placeholder".to_string()),
             title_generated: Some(false),
             system_prompt: None,
@@ -267,6 +277,7 @@ mod tests {
         let input = CreateSessionInput {
             id: "session-2".to_string(),
             project_id: None,
+            category: None,
             title: None,
             title_generated: None,
             system_prompt: None,
@@ -299,6 +310,7 @@ mod tests {
         let input = CreateSessionInput {
             id: "session-3".to_string(),
             project_id: None,
+            category: None,
             title: None,
             title_generated: None,
             system_prompt: None,
@@ -325,6 +337,7 @@ mod tests {
         let input = CreateSessionInput {
             id: "session-4".to_string(),
             project_id: None,
+            category: None,
             title: None,
             title_generated: None,
             system_prompt: Some("Custom prompt".to_string()),
@@ -348,6 +361,7 @@ mod tests {
         let input = CreateSessionInput {
             id: "session-5".to_string(),
             project_id: None,
+            category: None,
             title: None,
             title_generated: None,
             system_prompt: None,
@@ -385,6 +399,7 @@ mod tests {
         let input = CreateSessionInput {
             id: "session-6".to_string(),
             project_id: None,
+            category: None,
             title: None,
             title_generated: None,
             system_prompt: None,
@@ -408,6 +423,7 @@ mod tests {
         let input = CreateSessionInput {
             id: "session-7".to_string(),
             project_id: None,
+            category: None,
             title: None,
             title_generated: None,
             system_prompt: None,
@@ -428,6 +444,7 @@ mod tests {
         let input = CreateSessionInput {
             id: "session-permission".to_string(),
             project_id: None,
+            category: None,
             title: None,
             title_generated: None,
             system_prompt: None,
@@ -453,6 +470,7 @@ mod tests {
             &CreateSessionInput {
                 id: "session-permission-unset".to_string(),
                 project_id: None,
+                category: None,
                 title: None,
                 title_generated: None,
                 system_prompt: None,

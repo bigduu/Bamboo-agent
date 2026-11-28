@@ -978,6 +978,7 @@ mod tests {
         AgentEvent::SessionCreated {
             session_id: session_id.to_string(),
             project_id: None,
+            category: None,
             title: "New Session".to_string(),
             kind: bamboo_agent_core::SessionKind::Root,
             created_at: Utc::now(),

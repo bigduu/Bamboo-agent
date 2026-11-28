@@ -45,6 +45,7 @@ const CAPABILITIES: &[&str] = &[
     "http.native_receipt_run.v1",
     "http.session_message_fork.v1",
     "sessions.manual_categories.v1",
+    "sessions.create_category.v1",
 ];
 
 const SUBPROTOCOLS: &[BootstrapSubprotocol] = &[
@@ -203,6 +204,7 @@ mod tests {
                     "http.native_receipt_run.v1",
                     "http.session_message_fork.v1",
                     "sessions.manual_categories.v1",
+                    "sessions.create_category.v1",
                 ],
                 "auth": {
                     "policy": "open",

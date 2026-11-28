@@ -361,6 +361,7 @@ async fn clear_feed_barrier(state: &crate::AppState) -> u64 {
                 &bamboo_agent_core::AgentEvent::SessionCreated {
                     session_id: marker.clone(),
                     project_id: None,
+                    category: None,
                     title: "clear feed barrier".into(),
                     kind: bamboo_domain::SessionKind::Root,
                     created_at: chrono::Utc::now(),
