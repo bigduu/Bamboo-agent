@@ -796,24 +796,25 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
 
         // Link: [text](url) — show the text (underlined) then the url dimmed.
         if ch == '[' {
-            if let Some((label, url)) = parse_link(&mut chars) {
-                flush!();
-                spans.push(Span::styled(
-                    label,
-                    Style::default()
-                        .fg(colors::brand())
-                        .add_modifier(Modifier::UNDERLINED),
-                ));
-                if !url.is_empty() {
+            match parse_link(&mut chars) {
+                Some(InlineLink::Complete { label, url }) => {
+                    flush!();
                     spans.push(Span::styled(
-                        format!(" ({url})"),
-                        Style::default().fg(colors::subtle()),
+                        label,
+                        Style::default()
+                            .fg(colors::brand())
+                            .add_modifier(Modifier::UNDERLINED),
                     ));
+                    if !url.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" ({url})"),
+                            Style::default().fg(colors::subtle()),
+                        ));
+                    }
                 }
-                continue;
+                Some(InlineLink::Unfinished(literal)) => current.push_str(&literal),
+                None => current.push('['),
             }
-            // Not a link — treat '[' as literal (the rest re-parses normally).
-            current.push('[');
             continue;
         }
 
@@ -957,18 +958,12 @@ fn take_image_label<'a>(chars: &mut InlineChars<'a>, literal: &mut String) -> Im
 }
 
 fn take_image_target(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
-    take_image_spaces(chars, literal);
-    let complete = if chars.next_if_eq(&'<').is_some() {
-        literal.push('<');
-        take_image_delimited(chars, literal, '<', '>')
-    } else {
-        take_image_bare_destination(chars, literal)
-    };
-    if !complete {
+    take_target_spaces(chars, literal);
+    if !take_destination(chars, literal) {
         return false;
     }
 
-    if !take_image_spaces(chars, literal) {
+    if !take_target_spaces(chars, literal) {
         return true;
     }
     // A title is optional. Leave other bytes for the surrounding inline scan.
@@ -977,14 +972,14 @@ fn take_image_target(chars: &mut InlineChars<'_>, literal: &mut String) -> bool 
     };
     literal.push(open);
     let close = if open == '(' { ')' } else { open };
-    if !take_image_delimited(chars, literal, open, close) {
+    if !take_target_delimited(chars, literal, open, close) {
         return false;
     }
-    take_image_spaces(chars, literal);
+    take_target_spaces(chars, literal);
     true
 }
 
-fn take_image_spaces(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
+fn take_target_spaces(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
     let start = literal.len();
     literal.extend(std::iter::from_fn(|| {
         chars.next_if(|ch| matches!(ch, ' ' | '\t'))
@@ -992,7 +987,12 @@ fn take_image_spaces(chars: &mut InlineChars<'_>, literal: &mut String) -> bool 
     literal.len() > start
 }
 
-fn take_image_bare_destination(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
+fn take_destination(chars: &mut InlineChars<'_>, literal: &mut String) -> bool {
+    if chars.next_if_eq(&'<').is_some() {
+        literal.push('<');
+        return take_target_delimited(chars, literal, '<', '>');
+    }
+
     let mut depth = 0;
     while let Some(ch) = chars.next_if(|ch| !matches!(ch, ' ' | '\t') && (*ch != ')' || depth > 0))
     {
@@ -1007,7 +1007,7 @@ fn take_image_bare_destination(chars: &mut InlineChars<'_>, literal: &mut String
     depth == 0
 }
 
-fn take_image_delimited(
+fn take_target_delimited(
     chars: &mut InlineChars<'_>,
     literal: &mut String,
     open: char,
@@ -1057,10 +1057,14 @@ fn take_until_pair(chars: &mut std::iter::Peekable<std::str::Chars>, marker: cha
     out
 }
 
-/// Parse the remainder of a link after the opening `[`: `text](url)`. Probes on
-/// a clone and only advances `chars` on a full match, so a bare `[` is left
-/// intact for literal rendering.
-fn parse_link(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<(String, String)> {
+enum InlineLink {
+    Complete { label: String, url: String },
+    Unfinished(String),
+}
+
+/// Parse a direct link following the opening `[`. An unfinished destination
+/// stays literal while any text after it keeps its surrounding inline styles.
+fn parse_link(chars: &mut InlineChars<'_>) -> Option<InlineLink> {
     let mut probe = chars.clone();
     let mut label = String::new();
     let mut closed = false;
@@ -1076,19 +1080,22 @@ fn parse_link(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<(Strin
     }
     probe.next(); // consume '('
     let mut url = String::new();
-    let mut url_closed = false;
-    for c in probe.by_ref() {
-        if c == ')' {
-            url_closed = true;
-            break;
+    take_target_spaces(&mut probe, &mut url);
+    if take_destination(&mut probe, &mut url) {
+        let mut closing = probe.clone();
+        let destination_end = url.len();
+        // Preserve the existing display of text after the destination.
+        url.extend(std::iter::from_fn(|| closing.next_if(|ch| *ch != ')')));
+        if closing.next_if_eq(&')').is_some() {
+            *chars = closing;
+            return Some(InlineLink::Complete { label, url });
         }
-        url.push(c);
-    }
-    if !url_closed {
+        url.truncate(destination_end);
+    } else if probe.peek().is_some() {
         return None;
     }
-    *chars = probe; // commit only on success
-    Some((label, url))
+    *chars = probe;
+    Some(InlineLink::Unfinished(format!("[{label}]({url}")))
 }
 
 #[cfg(test)]
@@ -1726,6 +1733,56 @@ mod tests {
         assert_eq!(out[0], "see docs (https://x.io) now");
         // A bare bracket is left literal.
         assert_eq!(render("[not a link"), vec!["[not a link"]);
+    }
+
+    #[test]
+    fn links_keep_parenthesized_destinations_in_the_destination_span() {
+        for width in [60, 80, 120] {
+            for destination in [
+                "pages/词条(指南(v2))",
+                r"pages/guide\).html",
+                " <pages/带空格 (草稿> ",
+                "guide/folder(v2) \"Title\"",
+            ] {
+                let source = format!("看 [手册 🧭]({destination}) 再读");
+                let rows = render_markdown(&source, width);
+                assert_eq!(rows.len(), 1, "{source}");
+                assert_eq!(
+                    text_of(&rows[0]),
+                    format!("看 手册 🧭 ({destination}) 再读")
+                );
+                assert!(rows[0].spans.iter().any(|span| {
+                    span.content == "手册 🧭"
+                        && span.style.add_modifier.contains(Modifier::UNDERLINED)
+                }));
+                let destination_span = format!(" ({destination})");
+                assert!(rows[0].spans.iter().any(|span| {
+                    span.content == destination_span && span.style.fg == Some(colors::subtle())
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_link_waits_for_the_outer_close_after_a_balanced_destination() {
+        let destination = "pages/词条_手册(指南(v2))";
+        let link = format!("[手册 🧭]({destination})");
+        for (end, _) in link.char_indices().skip(1) {
+            let partial = &link[..end];
+            let rows = render_streaming_markdown(partial, 60);
+            assert_eq!(rows.iter().map(text_of).collect::<Vec<_>>(), [partial]);
+        }
+        let rows = render_streaming_markdown(&link, 60);
+        assert_eq!(
+            rows.iter().map(text_of).collect::<Vec<_>>(),
+            [format!("手册 🧭 ({destination})")]
+        );
+        let surrounding = format!("[手册 🧭]({destination} **next**");
+        let rows = render_streaming_markdown(&surrounding, 60);
+        assert_eq!(text_of(&rows[0]), format!("[手册 🧭]({destination} next"));
+        assert!(rows[0].spans.iter().any(|span| {
+            span.content == "next" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
     }
 
     #[test]

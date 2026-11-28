@@ -2454,7 +2454,7 @@ mod tests {
     fn testbackend_renders_assistant_image_alt_text_alongside_links_and_code() {
         let source = concat!(
             "Build report\n\n",
-            "![build_route 输出 🧪](assets/run(2).png) · [notes](https://example.test/notes)\n",
+            "![build_route 输出 🧪](assets/run(2).png) · [notes](https://example.test/n(2)/Z)\n",
             "![See [guide](https://example.test/guide)](assets/chart.png)\n",
             "Missing description: ![](assets/empty.png)\n",
             "Inline example: `![inline](assets/code.png)`\n\n",
@@ -2483,7 +2483,19 @@ mod tests {
                 });
             assert_eq!(
                 description.replace(' ', ""),
-                "build_route输出🧪·notes(https://example.test/notes)"
+                "build_route输出🧪·notes(https://example.test/n(2)/Z)"
+            );
+            let destination_end = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .find(|cell| cell.symbol() == "Z")
+                .unwrap();
+            assert_eq!(
+                destination_end.fg,
+                colors::subtle(),
+                "{width} columns\n{rendered}"
             );
             assert!(rows.iter().any(|row| row.trim_end() == "See guide"));
             assert!(rendered.contains("Missing description: [Image]"));
