@@ -868,7 +868,7 @@ impl TicketApplication {
             return Ok(true);
         }
         let notice = notice.clone();
-        let manager = self.storage.load_session(&notice.manager_id).await?;
+        let manager = self.storage.load_root_authority(&notice.manager_id).await?;
         if !manager
             .as_ref()
             .is_some_and(|manager| project_manager::manager_matches(&project, manager))
