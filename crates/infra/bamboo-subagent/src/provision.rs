@@ -30,6 +30,8 @@ pub const NATIVE_TOOL_CEILING_WORKER_CAPABILITY: &str = "native_tool_ceiling_v1"
 /// Keep the original capability for workers that only understand legacy names.
 pub const EXEC_SESSION_NATIVE_CEILING_WORKER_CAPABILITY: &str =
     "native_tool_ceiling_exec_sessions_v1";
+/// Additive acknowledgement for ViewImage in a native ceiling.
+pub const VIEW_IMAGE_NATIVE_CEILING_WORKER_CAPABILITY: &str = "native_tool_ceiling_view_image_v1";
 pub const INITIAL_INPUT_RELEASE_WORKER_CAPABILITY: &str = "owned_initial_input_release_v1";
 pub const CHILD_CREATION_IDENTITY_WORKER_CAPABILITY: &str = "durable_child_creation_identity_v1";
 
@@ -54,6 +56,7 @@ impl WorkerCapabilityReport {
                 CHILD_CREATION_IDENTITY_WORKER_CAPABILITY.to_string(),
                 NATIVE_TOOL_CEILING_WORKER_CAPABILITY.to_string(),
                 EXEC_SESSION_NATIVE_CEILING_WORKER_CAPABILITY.to_string(),
+                VIEW_IMAGE_NATIVE_CEILING_WORKER_CAPABILITY.to_string(),
             ],
         }
     }
@@ -699,6 +702,7 @@ mod tests {
         let current = WorkerCapabilityReport::current();
         assert!(current.supports("native_tool_ceiling_v1"));
         assert!(current.supports("native_tool_ceiling_exec_sessions_v1"));
+        assert!(current.supports(VIEW_IMAGE_NATIVE_CEILING_WORKER_CAPABILITY));
         assert_eq!(current.provision_version, PROVISION_VERSION);
         let restored: WorkerCapabilityReport =
             serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();

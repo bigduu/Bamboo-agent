@@ -46,6 +46,7 @@ fn builtin_package_has_stable_private_revision_bounded_roles_and_native_declarat
                     "Edit",
                     "Glob",
                     "Read",
+                    "ViewImage",
                     "Write"
                 ]
             );
@@ -53,7 +54,7 @@ fn builtin_package_has_stable_private_revision_bounded_roles_and_native_declarat
         } else {
             assert_eq!(
                 definition.tool_allow(),
-                ["Read", "Glob", "exec_command", "write_stdin"]
+                ["Read", "Glob", "ViewImage", "exec_command", "write_stdin"]
             );
             assert_eq!(definition.tool_deny(), ["Edit", "Write"]);
         }

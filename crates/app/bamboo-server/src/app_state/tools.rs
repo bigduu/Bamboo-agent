@@ -311,16 +311,24 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
             .iter()
             .flat_map(|reference| self.resolve_disabled(reference))
             .collect();
-        for name in bamboo_subagent::proto::NativeToolCeiling::NAMES {
-            if self.base.owns_exact_tool(name) && self.base.exact_tool_owner(name).is_none() {
-                return Err("native_tool_ceiling_owner_unknown".into());
-            }
-        }
         let profile =
             bamboo_engine::session_app::child_session::named_profile::named_profile_tool_names(
                 session,
             )
             .map_err(|_| "named_profile_binding_invalid".to_string())?;
+        // The extended wire supports ViewImage for profiles that declare it.
+        // The default native ceiling retains its existing tools.
+        let grants_view_image = profile
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == "ViewImage"));
+        let candidates = bamboo_subagent::proto::NativeToolCeiling::NAMES
+            .into_iter()
+            .filter(|name| *name != "ViewImage" || grants_view_image);
+        for name in candidates.clone() {
+            if self.base.owns_exact_tool(name) && self.base.exact_tool_owner(name).is_none() {
+                return Err("native_tool_ceiling_owner_unknown".into());
+            }
+        }
         let child_denied: std::collections::BTreeSet<_> = session
             .metadata
             .get("disabled_tools")
@@ -345,28 +353,27 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
                     >(raw)
                     .ok()
             });
-        Ok(bamboo_subagent::proto::NativeToolCeiling::NAMES
-            .iter()
-            .filter(|name| {
-                if (!ticket_child && **name == "Task")
+        Ok(candidates
+            .filter(|&name| {
+                if (!ticket_child && name == "Task")
                     || (ticket_child
-                        && **name != "Task"
-                        && (!matches!(**name, "Read" | "Write")
+                        && name != "Task"
+                        && (!matches!(name, "Read" | "Write")
                             || ticket_packet.as_ref().is_none_or(|packet| {
                                 packet.workspace.is_none()
-                                    || !packet.contract.allowed_tools.contains(**name)
+                                    || !packet.contract.allowed_tools.contains(name)
                             })))
                 {
                     return false;
                 }
                 self.native_owner(name)
-                    && !disabled.contains(**name)
-                    && !child_denied.contains(**name)
+                    && !disabled.contains(name)
+                    && !child_denied.contains(name)
                     && profile
                         .as_ref()
-                        .is_none_or(|tools| tools.iter().any(|tool| tool == **name))
+                        .is_none_or(|tools| tools.iter().any(|tool| tool == name))
             })
-            .map(|name| (*name).to_string())
+            .map(str::to_owned)
             .collect())
     }
 }
@@ -608,6 +615,8 @@ mod native_ceiling_tests {
             (vec!["Bash"], false),
             (vec!["exec_command", "write_stdin"], false),
             (vec!["Glob", "Read"], true),
+            (vec!["Read", "ViewImage"], true),
+            (vec![], true),
         ] {
             let mut child =
                 bamboo_domain::Session::new_child_of("profile-child", &parent, "model", "role");
