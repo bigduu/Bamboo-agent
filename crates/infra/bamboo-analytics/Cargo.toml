@@ -11,7 +11,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 # Bundle the native engine and JSON extension in this crate for offline reports.
 duckdb = { version = "1", features = ["bundled", "json"] }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
