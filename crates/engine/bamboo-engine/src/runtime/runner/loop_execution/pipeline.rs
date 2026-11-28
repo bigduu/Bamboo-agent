@@ -11687,7 +11687,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/responses"))
-            .and(body_partial_json(json!({"reasoning":{"effort":"max"}})))
+            .and(body_partial_json(json!({"reasoning":{"effort":"low"}})))
             .respond_with(mock_completion_sse(&[
                 json!({"type":"response.output_text.delta","item_id":"msg_partial","delta":"Partial answer"}),
                 json!({"type":"response.incomplete",
@@ -11709,7 +11709,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = canonical_usage_pipeline_config();
         config.app_data_dir = Some(dir.path().into());
-        config.reasoning_effort = Some(ReasoningEffort::Max);
+        // At low effort the truncated call has no lower-effort retry.
+        config.reasoning_effort = Some(ReasoningEffort::Low);
         let mut session = Session::new("responses-truncated", "model");
         session.add_message(Message::user("Answer the original request."));
         session
