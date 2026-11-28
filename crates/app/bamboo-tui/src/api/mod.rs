@@ -77,6 +77,32 @@ struct SessionLoopStatus {
     record: Option<LoopChatRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLoopPreview {
+    pub state: SessionLoopPreviewState,
+    pub next_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLoopPreviewState {
+    Scheduled,
+    Paused,
+    Stopped,
+    Expired,
+}
+
+impl SessionLoopPreviewState {
+    fn from_wire(state: &str) -> Option<Self> {
+        match state {
+            "scheduled" => Some(Self::Scheduled),
+            "paused" => Some(Self::Paused),
+            "stopped" => Some(Self::Stopped),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
 impl LoopChatAcknowledgment {
     pub(crate) fn status_text(&self) -> String {
         let Some(record) = &self.record else {
@@ -306,27 +332,28 @@ fn parse_auto_resume_status(body: &str) -> std::result::Result<String, RespondFa
 }
 
 const MAX_SCHEDULE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SESSION_LOOP_PREVIEW_BYTES: usize = 128 * 1024;
 
-enum ScheduleBodyError {
+enum BoundedBodyError {
     TooLarge,
     Read(reqwest::Error),
 }
 
-async fn read_bounded_schedule_body(
+async fn read_bounded_body(
     mut response: reqwest::Response,
     limit: usize,
-) -> std::result::Result<Vec<u8>, ScheduleBodyError> {
+) -> std::result::Result<Vec<u8>, BoundedBodyError> {
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(ScheduleBodyError::TooLarge);
+        return Err(BoundedBodyError::TooLarge);
     }
 
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(ScheduleBodyError::Read)? {
+    while let Some(chunk) = response.chunk().await.map_err(BoundedBodyError::Read)? {
         if chunk.len() > limit - body.len() {
-            return Err(ScheduleBodyError::TooLarge);
+            return Err(BoundedBodyError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -335,9 +362,7 @@ async fn read_bounded_schedule_body(
 
 async fn schedule_response_code(response: reqwest::Response) -> Option<String> {
     const MAX_ERROR_BYTES: usize = 8 * 1024;
-    let body = read_bounded_schedule_body(response, MAX_ERROR_BYTES)
-        .await
-        .ok()?;
+    let body = read_bounded_body(response, MAX_ERROR_BYTES).await.ok()?;
     serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|error| {
@@ -463,18 +488,22 @@ impl BambooClient {
         self.submit_chat(&req).await
     }
 
-    pub(crate) async fn session_loop_status(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<LoopChatRecord>> {
+    fn session_loop_url(&self, session_id: &str) -> Result<reqwest::Url> {
         let mut url = reqwest::Url::parse(&self.base_url)?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("Bamboo base URL cannot contain Session paths"))?
             .pop_if_empty()
             .extend(["api", "v1", "sessions", session_id, "loop"]);
+        Ok(url)
+    }
+
+    pub(crate) async fn session_loop_status(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<LoopChatRecord>> {
         let response = self
             .client
-            .get(url)
+            .get(self.session_loop_url(session_id)?)
             .header(reqwest::header::CACHE_CONTROL, "no-store")
             .send()
             .await?;
@@ -486,13 +515,90 @@ impl BambooClient {
         let status: SessionLoopStatus = response.json().await?;
         anyhow::ensure!(
             status.session_id == session_id
-                && status.record.as_ref().is_none_or(|record| matches!(
-                    record.state.as_str(),
-                    "scheduled" | "paused" | "stopped" | "expired"
-                )),
+                && status
+                    .record
+                    .as_ref()
+                    .is_none_or(
+                        |record| SessionLoopPreviewState::from_wire(&record.state).is_some()
+                    ),
             "Invalid Session loop status"
         );
         Ok(status.record)
+    }
+
+    /// Read the selected Session's paced loop for display in the Session list.
+    pub(crate) async fn selected_session_loop_status(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionLoopPreview>> {
+        anyhow::ensure!(
+            !session_id.trim().is_empty() && !matches!(session_id, "." | ".."),
+            "Invalid Session ID"
+        );
+        let url = self
+            .session_loop_url(session_id)
+            .map_err(|_| anyhow::anyhow!("Invalid Bamboo URL"))?;
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not contact the Host for Session loop status"))?;
+        let response = client
+            .get(url)
+            .header(reqwest::header::CACHE_CONTROL, "no-store")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    anyhow::anyhow!("Timed out waiting for Session loop status")
+                } else {
+                    anyhow::anyhow!("Could not contact the Host for Session loop status")
+                }
+            })?;
+        let http_status = response.status();
+        anyhow::ensure!(
+            http_status == reqwest::StatusCode::OK,
+            "Could not fetch Session loop status (HTTP {})",
+            http_status.as_u16()
+        );
+        let body = read_bounded_body(response, MAX_SESSION_LOOP_PREVIEW_BYTES)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::TooLarge => {
+                    anyhow::anyhow!("Session loop status response is too large (128 KiB limit)")
+                }
+                BoundedBodyError::Read(error) if error.is_timeout() => {
+                    anyhow::anyhow!("Timed out waiting for Session loop status")
+                }
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid Session loop status"),
+            })?;
+        // Serde structs also accept sequences. Check the object shape, then
+        // decode the original bytes so duplicate known fields are rejected.
+        let shape: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Session loop status"))?;
+        anyhow::ensure!(
+            matches!(
+                shape.get("loop"),
+                Some(serde_json::Value::Null | serde_json::Value::Object(_))
+            ),
+            "Invalid Session loop status"
+        );
+        let status: SessionLoopStatus = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("Invalid Session loop status"))?;
+        anyhow::ensure!(
+            status.session_id == session_id,
+            "Invalid Session loop status"
+        );
+        let Some(record) = status.record else {
+            return Ok(None);
+        };
+        let state = SessionLoopPreviewState::from_wire(&record.state)
+            .ok_or_else(|| anyhow::anyhow!("Invalid Session loop status"))?;
+        Ok(Some(SessionLoopPreview {
+            state,
+            next_fire_at: record.next_fire_at,
+        }))
     }
 
     async fn submit_chat(&self, req: &ChatRequest) -> Result<ChatSubmission> {
@@ -1220,16 +1326,16 @@ impl BambooClient {
             status.as_u16()
         );
 
-        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
             .await
             .map_err(|error| match error {
-                ScheduleBodyError::TooLarge => {
+                BoundedBodyError::TooLarge => {
                     anyhow::anyhow!("Schedule rename response is too large (2 MiB limit)")
                 }
-                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                BoundedBodyError::Read(error) if error.is_timeout() => {
                     anyhow::anyhow!("Timed out waiting for the schedule rename response")
                 }
-                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid schedule rename response"),
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid schedule rename response"),
             })?;
         let reply: RenameReply = serde_json::from_slice(&body)
             .map_err(|_| anyhow::anyhow!("Invalid schedule rename response"))?;
@@ -1311,16 +1417,16 @@ impl BambooClient {
             anyhow::bail!("{message}");
         }
 
-        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
             .await
             .map_err(|error| match error {
-                ScheduleBodyError::TooLarge => {
+                BoundedBodyError::TooLarge => {
                     anyhow::anyhow!("Schedule interval response is too large (2 MiB limit)")
                 }
-                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                BoundedBodyError::Read(error) if error.is_timeout() => {
                     anyhow::anyhow!("Timed out waiting for the schedule interval response")
                 }
-                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid schedule interval response"),
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid schedule interval response"),
             })?;
         let view: ScheduleView = serde_json::from_slice(&body)
             .map_err(|_| anyhow::anyhow!("Invalid schedule interval response"))?;
@@ -1406,16 +1512,16 @@ impl BambooClient {
             }
         }
 
-        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
             .await
             .map_err(|error| match error {
-                ScheduleBodyError::TooLarge => {
+                BoundedBodyError::TooLarge => {
                     anyhow::anyhow!("{label} time response is too large (2 MiB limit)")
                 }
-                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                BoundedBodyError::Read(error) if error.is_timeout() => {
                     anyhow::anyhow!("Timed out waiting for the {label} time response")
                 }
-                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid {label} time response"),
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid {label} time response"),
             })?;
         let receipt: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|_| anyhow::anyhow!("Invalid {label} time response"))?;
@@ -1510,16 +1616,16 @@ impl BambooClient {
             }
         }
 
-        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
             .await
             .map_err(|error| match error {
-                ScheduleBodyError::TooLarge => {
+                BoundedBodyError::TooLarge => {
                     anyhow::anyhow!("Once time response is too large (2 MiB limit)")
                 }
-                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                BoundedBodyError::Read(error) if error.is_timeout() => {
                     anyhow::anyhow!("Timed out waiting for the Once time response")
                 }
-                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid Once time response"),
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid Once time response"),
             })?;
         let receipt: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|_| anyhow::anyhow!("Invalid Once time response"))?;
@@ -1655,16 +1761,16 @@ impl BambooClient {
             "Could not fetch schedule sessions (HTTP {})",
             status.as_u16()
         );
-        let body = read_bounded_schedule_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
+        let body = read_bounded_body(response, MAX_SCHEDULE_RESPONSE_BYTES)
             .await
             .map_err(|error| match error {
-                ScheduleBodyError::TooLarge => {
+                BoundedBodyError::TooLarge => {
                     anyhow::anyhow!("Schedule sessions response is too large (2 MiB limit)")
                 }
-                ScheduleBodyError::Read(error) if error.is_timeout() => {
+                BoundedBodyError::Read(error) if error.is_timeout() => {
                     anyhow::anyhow!("Timed out fetching schedule sessions")
                 }
-                ScheduleBodyError::Read(_) => anyhow::anyhow!("Invalid schedule sessions response"),
+                BoundedBodyError::Read(_) => anyhow::anyhow!("Invalid schedule sessions response"),
             })?;
         let reply: ListScheduleSessionsResponse = serde_json::from_slice(&body)
             .map_err(|_| anyhow::anyhow!("Invalid schedule sessions response"))?;
@@ -2142,6 +2248,206 @@ mod tests {
             .unwrap();
             backend.await.unwrap();
             assert_eq!(result.is_ok(), supported, "{http_status} {body}");
+        }
+    }
+
+    const LOOP_PREVIEW_SESSION: &str = "session/one ?#%";
+
+    async fn read_loop_preview_request(socket: &mut tokio::net::TcpStream) {
+        let request = read_request(socket).await;
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            headers.lines().next(),
+            Some("GET /api/v1/sessions/session%2Fone%20%3F%23%25/loop HTTP/1.1")
+        );
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("cache-control: no-store")));
+        assert!(body.is_empty());
+    }
+
+    async fn loop_preview_reply(status: &str, body: &str) -> Result<Option<SessionLoopPreview>> {
+        use tokio::{net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_loop_preview_request(&mut socket).await;
+            respond(&mut socket, status, "1", body).await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.selected_session_loop_status(LOOP_PREVIEW_SESSION),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_reads_the_exact_session_and_known_states() {
+        use SessionLoopPreviewState::{Expired, Paused, Scheduled, Stopped};
+
+        for (wire, state, next_fire_at) in [
+            ("scheduled", Scheduled, Some("2026-11-28T02:03:04.125Z")),
+            ("scheduled", Scheduled, None),
+            ("paused", Paused, None),
+            ("stopped", Stopped, None),
+            ("expired", Expired, None),
+        ] {
+            let body = serde_json::json!({
+                "session_id": LOOP_PREVIEW_SESSION,
+                "loop": {
+                    "state": wire, "next_fire_at": next_fire_at,
+                    "prompt": "Host prompt does not belong to the list preview",
+                    "last_run_id": "host-run",
+                },
+            });
+            assert_eq!(
+                loop_preview_reply("200 OK", &body.to_string())
+                    .await
+                    .unwrap(),
+                Some(SessionLoopPreview {
+                    state,
+                    next_fire_at: next_fire_at.map(|value| value.parse().unwrap()),
+                })
+            );
+        }
+        let body = serde_json::json!({ "session_id": LOOP_PREVIEW_SESSION, "loop": null });
+        assert_eq!(
+            loop_preview_reply("200 OK", &body.to_string())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_rejects_invalid_receipts_and_sanitizes_errors() {
+        for body in [
+            r#"{"session_id":"other","loop":null}"#,
+            r#"{"session_id":"session/one ?#%"}"#,
+            r#"{"session_id":"other","session_id":"session/one ?#%","loop":null}"#,
+            r#"{"session_id":"session/one ?#%","loop":null,"loop":{"state":"scheduled"}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"stopped","state":"scheduled"}}"#,
+            r#"["session/one ?#%",null]"#,
+            r#"{"session_id":"session/one ?#%","loop":[null,"scheduled",null,null,null]}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"RAW_HOST_DETAILS"}}"#,
+            r#"{"session_id":"session/one ?#%","loop":{"state":"scheduled","next_fire_at":"RAW_HOST_DETAILS"}}"#,
+            "RAW_HOST_DETAILS",
+        ] {
+            assert_eq!(
+                loop_preview_reply("200 OK", body)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid Session loop status"
+            );
+        }
+
+        for (status, code) in [
+            ("202 Accepted", 202),
+            ("403 Forbidden", 403),
+            ("404 Not Found", 404),
+        ] {
+            assert_eq!(
+                loop_preview_reply(status, "RAW_HOST_DETAILS")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                format!("Could not fetch Session loop status (HTTP {code})")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_does_not_redirect_or_wait_for_error_body() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let (release, held) = oneshot::channel();
+        let serve = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_loop_preview_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /unexpected\r\nContent-Length: 42\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            held.await.unwrap();
+            drop(socket);
+        };
+        let fetch = async {
+            let result = client
+                .selected_session_loop_status(LOOP_PREVIEW_SESSION)
+                .await;
+            release.send(()).unwrap();
+            result
+        };
+        let (result, ()) = timeout(Duration::from_secs(4), async { tokio::join!(fetch, serve) })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Could not fetch Session loop status (HTTP 302)"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_bounds_advertised_and_chunked_bodies() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        for advertised in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let (release, held) = oneshot::channel();
+            let serve = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_loop_preview_request(&mut socket).await;
+                if advertised {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        MAX_SESSION_LOOP_PREVIEW_BYTES + 1
+                    );
+                    socket.write_all(headers.as_bytes()).await.unwrap();
+                } else {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await
+                        .unwrap();
+                    const CHUNK_BYTES: usize = 16 * 1024;
+                    let mut frame = format!("{CHUNK_BYTES:x}\r\n").into_bytes();
+                    frame.resize(frame.len() + CHUNK_BYTES, b'x');
+                    frame.extend_from_slice(b"\r\n");
+                    for _ in 0..(MAX_SESSION_LOOP_PREVIEW_BYTES / CHUNK_BYTES) {
+                        socket.write_all(&frame).await.unwrap();
+                    }
+                    socket.write_all(b"1\r\nx\r\n").await.unwrap();
+                }
+                // Keep the body open until the byte limit rejects the response.
+                held.await.unwrap();
+                drop(socket);
+            };
+            let fetch = async {
+                let result = client
+                    .selected_session_loop_status(LOOP_PREVIEW_SESSION)
+                    .await;
+                release.send(()).unwrap();
+                result
+            };
+            let (result, ()) =
+                timeout(Duration::from_secs(5), async { tokio::join!(fetch, serve) })
+                    .await
+                    .unwrap();
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Session loop status response is too large (128 KiB limit)"
+            );
         }
     }
 

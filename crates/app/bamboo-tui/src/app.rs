@@ -22,7 +22,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::api::sse::{SessionSseEvent, SseStream, SESSION_SSE_CHANNEL_CAPACITY};
 use crate::api::types::*;
-use crate::api::{BambooClient, LoopChatRecord, RespondFailure};
+use crate::api::{BambooClient, LoopChatRecord, RespondFailure, SessionLoopPreview};
 use crate::clipboard::{self, ClipboardContents, ClipboardImage};
 use crate::components::markdown::copyable_fences;
 use crate::components::session_rows::SessionRows;
@@ -1855,6 +1855,17 @@ async fn observe_loop(
 
 // ── Per-tab states ──
 
+pub(crate) enum SessionListLoopStatus {
+    Loading,
+    Available(Option<SessionLoopPreview>),
+    Unavailable,
+}
+
+struct SessionLoopLookup {
+    session_id: String,
+    status: SessionListLoopStatus,
+}
+
 pub struct SessionsState {
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
@@ -1877,6 +1888,8 @@ pub struct SessionsState {
     /// Newest list request issued for this tab. A slower prior page must not
     /// replace newer rows after a rapid refresh.
     summary_observation_epoch: u64,
+    loop_status_generation: u64,
+    loop_lookup: Option<SessionLoopLookup>,
 }
 
 impl SessionsState {
@@ -1891,6 +1904,19 @@ impl SessionsState {
             page_limit: 0,
             next_offset: None,
             summary_observation_epoch: 0,
+            loop_status_generation: 0,
+            loop_lookup: None,
+        }
+    }
+
+    fn selected_id(&self) -> Option<&str> {
+        self.sessions.get(self.selected).map(|row| row.id.as_str())
+    }
+
+    fn select(&mut self, index: usize) {
+        if self.selected != index {
+            self.selected = index;
+            self.loop_lookup = None;
         }
     }
 }
@@ -5814,7 +5840,7 @@ impl App {
             self.schedule_rename = None;
             self.schedule_cadence = None;
             self.schedule_prompt = None;
-            self.tab = Tab::Chat;
+            self.set_tab(Tab::Chat);
             self.status_message = "Session already active".to_string();
             self.discover_active_loop();
             return true;
@@ -5830,7 +5856,7 @@ impl App {
         self.park_active_context();
         self.install_active_context(context);
         self.chat.background_unread = 0;
-        self.tab = Tab::Chat;
+        self.set_tab(Tab::Chat);
         self.status_message = if self.pending_question.is_some() {
             "Switched session — waiting for a decision".to_string()
         } else if self.chat.streaming {
@@ -6913,13 +6939,15 @@ impl App {
                 }
                 self.sessions.summary_observation_epoch = observation_epoch;
                 self.sessions.loading = false;
+                self.sessions.loop_lookup = None;
                 match r {
                     Ok(envelope) => {
                         self.observe_cached_summaries(&envelope.sessions, observation_epoch);
-                        self.sessions.selected = self
+                        let selected = self
                             .sessions
                             .selected
                             .min(envelope.sessions.len().saturating_sub(1));
+                        self.sessions.select(selected);
                         self.sessions.total = envelope.total;
                         self.sessions.offset = envelope.offset;
                         self.sessions.page_limit = envelope.limit;
@@ -6928,6 +6956,28 @@ impl App {
                         self.sessions.error = None;
                     }
                     Err(e) => self.sessions.error = Some(e),
+                }
+            }
+            AppEvent::SelectedSessionLoopStatusLoaded {
+                generation,
+                session_id,
+                result,
+            } => {
+                if generation == self.sessions.loop_status_generation
+                    && matches!(
+                        self.selected_session_loop_lookup(),
+                        Some(lookup)
+                            if lookup.session_id == session_id
+                                && matches!(lookup.status, SessionListLoopStatus::Loading)
+                    )
+                {
+                    self.sessions.loop_lookup = Some(SessionLoopLookup {
+                        session_id,
+                        status: match result {
+                            Ok(preview) => SessionListLoopStatus::Available(preview),
+                            Err(()) => SessionListLoopStatus::Unavailable,
+                        },
+                    });
                 }
             }
             AppEvent::McpServersLoaded(r) => {
@@ -7898,7 +7948,7 @@ impl App {
                         self.sync_conversation_block_ui();
                         self.chat.auto_scroll = auto_scroll;
                         self.chat.background_unread = 0;
-                        self.tab = Tab::Chat;
+                        self.set_tab(Tab::Chat);
                         self.status_message = "Session resumed".to_string();
 
                         if opened.truncated {
@@ -8448,7 +8498,7 @@ impl App {
                             content.push_str(&arguments);
                         }
                         self.install_command_draft(content);
-                        self.tab = Tab::Chat;
+                        self.set_tab(Tab::Chat);
                         self.close_command_palette();
                         self.status_message =
                             format!("Command loaded into composer — review; {send}");
@@ -9433,8 +9483,9 @@ impl App {
                 }
             }
             Tab::Sessions => {
-                self.sessions.selected =
+                let selected =
                     scroll_selection(self.sessions.selected, self.sessions.sessions.len(), delta);
+                self.sessions.select(selected);
             }
             Tab::Mcp => {
                 self.mcp.selected =
@@ -10232,31 +10283,26 @@ impl App {
             ActionId::OpenSessionsTab => self.open_tab(Tab::Sessions),
             ActionId::OpenMcpTab => self.open_tab(Tab::Mcp),
             ActionId::OpenSkillsTab => self.open_tab(Tab::Skills),
-            ActionId::OpenConfigTab => {
-                self.tab = Tab::Config;
-                self.load_tab_data();
-            }
+            ActionId::OpenConfigTab => self.open_tab(Tab::Config),
             ActionId::OpenPermissionPolicy => self.open_permission_policy(),
             ActionId::TogglePermissionBypass => self.begin_permission_mode_toggle(),
-            ActionId::OpenSchedulesTab => {
-                self.tab = Tab::Schedules;
-                self.load_tab_data();
-            }
-            ActionId::NextTab => {
-                self.tab = self.tab.next();
-                self.load_tab_data();
-            }
-            ActionId::PreviousTab => {
-                self.tab = self.tab.prev();
-                self.load_tab_data();
-            }
+            ActionId::OpenSchedulesTab => self.open_tab(Tab::Schedules),
+            ActionId::NextTab => self.open_tab(self.tab.next()),
+            ActionId::PreviousTab => self.open_tab(self.tab.prev()),
             _ => {}
         }
     }
 
     fn open_tab(&mut self, tab: Tab) {
-        self.tab = tab;
+        self.set_tab(tab);
         self.load_tab_data();
+    }
+
+    fn set_tab(&mut self, tab: Tab) {
+        if self.tab == Tab::Sessions && tab != Tab::Sessions {
+            self.sessions.loop_lookup = None;
+        }
+        self.tab = tab;
     }
 
     pub(crate) fn workspace_controls_enabled(&self) -> bool {
@@ -10362,8 +10408,7 @@ impl App {
             _ => None,
         };
         if let Some(index) = index {
-            self.tab = Tab::from_index(index).unwrap_or(self.tab);
-            self.load_tab_data();
+            self.open_tab(Tab::from_index(index).unwrap_or(self.tab));
         }
     }
 
@@ -12051,6 +12096,9 @@ impl App {
     /// tab loading and spawn the fetch, which posts its result back as an
     /// `AppEvent` handled in `handle_event`.
     fn load_tab_data(&mut self) {
+        if self.tab == Tab::Sessions {
+            self.sessions.loop_lookup = None;
+        }
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
@@ -12943,7 +12991,7 @@ impl App {
         self.chat.project_id = project_id;
         self.chat.expand_tools = expand_tools;
         self.opening_session_id = None;
-        self.tab = Tab::Chat;
+        self.set_tab(Tab::Chat);
         self.status_message = "New session".to_string();
     }
 
@@ -15135,15 +15183,63 @@ impl App {
         });
     }
 
+    fn selected_session_loop_lookup(&self) -> Option<&SessionLoopLookup> {
+        self.sessions.loop_lookup.as_ref().filter(|lookup| {
+            self.tab == Tab::Sessions
+                && self.sessions.selected_id() == Some(lookup.session_id.as_str())
+        })
+    }
+
+    pub(crate) fn selected_session_loop_status(&self) -> Option<&SessionListLoopStatus> {
+        self.selected_session_loop_lookup()
+            .map(|lookup| &lookup.status)
+    }
+
+    fn inspect_selected_session_loop(&mut self) {
+        if self.sessions.loading
+            || self.sessions.error.is_some()
+            || matches!(
+                self.selected_session_loop_status(),
+                Some(SessionListLoopStatus::Loading)
+            )
+        {
+            return;
+        }
+        let (Some(session_id), Some(tx)) = (self.sessions.selected_id(), self.event_tx.clone())
+        else {
+            return;
+        };
+        let session_id = session_id.to_owned();
+        let generation = self.sessions.loop_status_generation.wrapping_add(1);
+        self.sessions.loop_status_generation = generation;
+        self.sessions.loop_lookup = Some(SessionLoopLookup {
+            session_id: session_id.clone(),
+            status: SessionListLoopStatus::Loading,
+        });
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .selected_session_loop_status(&session_id)
+                .await
+                .map_err(|_| ());
+            let _ = tx.send(AppEvent::SelectedSessionLoopStatusLoaded {
+                generation,
+                session_id,
+                result,
+            });
+        });
+    }
+
     async fn handle_sessions_key(&mut self, key: KeyEvent) -> Result<()> {
         let action = self.resolve_context_action(ActionContext::Sessions, key);
         match action {
             Some(ActionId::NavigateDown) if !self.sessions.sessions.is_empty() => {
-                self.sessions.selected =
-                    (self.sessions.selected + 1).min(self.sessions.sessions.len() - 1);
+                let selected = (self.sessions.selected + 1).min(self.sessions.sessions.len() - 1);
+                self.sessions.select(selected);
             }
             Some(ActionId::NavigateUp) => {
-                self.sessions.selected = self.sessions.selected.saturating_sub(1);
+                self.sessions
+                    .select(self.sessions.selected.saturating_sub(1));
             }
             Some(ActionId::Activate) => {
                 // Full resume, off the event loop: history replay + live
@@ -15161,20 +15257,21 @@ impl App {
                     self.pending_delete = Some((session.id.clone(), session.title.clone()));
                 }
             }
+            Some(ActionId::InspectSelectedSessionLoop) => self.inspect_selected_session_loop(),
             Some(ActionId::Refresh) => {
                 self.load_tab_data();
             }
             Some(ActionId::NextPage) => {
                 if let Some(next) = self.sessions.next_offset {
                     self.sessions.offset = next;
-                    self.sessions.selected = 0;
+                    self.sessions.select(0);
                     self.load_tab_data();
                 }
             }
             Some(ActionId::PreviousPage) if self.sessions.offset > 0 => {
                 let step = self.sessions.page_limit.max(1);
                 self.sessions.offset = self.sessions.offset.saturating_sub(step);
-                self.sessions.selected = 0;
+                self.sessions.select(0);
                 self.load_tab_data();
             }
             _ => {}
@@ -16503,7 +16600,7 @@ impl App {
     }
 
     fn open_permission_policy(&mut self) {
-        self.tab = Tab::Config;
+        self.set_tab(Tab::Config);
         self.config.view = ConfigView::Permissions;
         self.load_permission_policy();
     }
@@ -18263,7 +18360,7 @@ impl App {
             draft.push_str(arguments);
         }
         self.install_command_draft(draft);
-        self.tab = Tab::Chat;
+        self.set_tab(Tab::Chat);
         self.close_command_palette();
         let kind = match command.command_type.to_ascii_lowercase().as_str() {
             "skill" => "Skill",
@@ -23774,9 +23871,9 @@ mod question_tests {
             actual,
             vec![
                 if cfg!(target_os = "macos") {
-                    13_760_179_138_186_495_100
+                    8_720_670_158_330_795_275
                 } else {
-                    6_778_824_493_373_319_245
+                    847_289_420_698_626_001
                 },
                 17_834_027_550_822_363_739,
                 17_756_585_848_801_451_862,
@@ -24598,6 +24695,268 @@ mod question_tests {
             bypass_permissions: false,
             plan_mode: None,
         }
+    }
+
+    async fn expect_selected_loop_get(
+        listener: &tokio::net::TcpListener,
+        encoded_id: &str,
+    ) -> tokio::net::TcpStream {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut stream).await;
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next().unwrap(),
+                format!("GET /api/v1/sessions/{encoded_id}/loop HTTP/1.1")
+            );
+            assert!(headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("cache-control: no-store")));
+            assert!(body.is_empty());
+            stream
+        })
+        .await
+        .expect("selected Session Loop GET")
+    }
+
+    async fn finish_selected_loop_get(app: &mut App, rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("selected Session Loop response")
+            .unwrap();
+        assert!(matches!(
+            event,
+            AppEvent::SelectedSessionLoopStatusLoaded { .. }
+        ));
+        app.handle_event(event).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_key_queries_only_selected_row_and_renders() {
+        use crossterm::event::KeyEventKind;
+        use ratatui::backend::TestBackend;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = App::new(BambooClient::new(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Sessions;
+        app.connected = true;
+        app.chat.session_id = Some("unchanged-chat".into());
+        app.sessions.sessions = vec![bare_session("project/review"), bare_session("build")];
+        app.sessions.sessions[0].title = "Deployment review".into();
+        app.sessions.sessions[1].title = "Build check".into();
+        app.sessions.total = 2;
+        app.sessions.page_limit = 200;
+        let chat_status = app.status_message.clone();
+
+        let render = |app: &App, width: u16| {
+            let height = if width == crate::ui::MIN_TERMINAL_WIDTH {
+                crate::ui::MIN_TERMINAL_HEIGHT
+            } else {
+                40
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, app))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(usize::from(width))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let initially = render(&app, 60);
+        assert!(initially.contains("l loop status"), "{initially}");
+        assert!(!initially.contains("Checking loop status"));
+        app.handle_key(key(KeyCode::Char('l'))).await.unwrap();
+        let mut first = expect_selected_loop_get(&listener, "project%2Freview").await;
+        for width in [60, 120] {
+            assert!(render(&app, width).contains("Checking loop status…"));
+        }
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ] {
+            app.handle_key(KeyEvent::new_with_kind(
+                KeyCode::Char('l'),
+                KeyModifiers::empty(),
+                kind,
+            ))
+            .await
+            .unwrap();
+        }
+        respond_test_http(
+            &mut first,
+            "application/json",
+            r#"{"session_id":"project/review","loop":{"state":"scheduled","next_fire_at":"2030-01-02T12:34:56Z","prompt":"fixture prompt stays hidden"}}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        for width in [60, 120] {
+            let frame = render(&app, width);
+            for text in [
+                "Selected · Loop scheduled · next 2030-01-02 12:34:56 UTC",
+                "Deployment review",
+                "Build check",
+                "Enter open · d delete · r refresh · l loop status",
+            ] {
+                assert!(
+                    frame.contains(text),
+                    "{width} columns missing {text:?}\n{frame}"
+                );
+            }
+            assert!(!frame.contains("fixture prompt stays hidden"));
+            if width == 60 && std::env::var_os("BAMBOO_TUI_CAPTURE_SELECTED_SESSION_LOOP").is_some()
+            {
+                eprintln!(
+                    "SELECTED SESSION LOOP PREVIEW\n{frame}\nEND SELECTED SESSION LOOP PREVIEW"
+                );
+            }
+        }
+
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        assert!(app.selected_session_loop_status().is_none());
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[{"context":"sessions","action":"inspect-selected-session-loop","keys":["F8"]}]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        assert!(render(&app, 60).contains("F8 loop status"));
+        app.handle_key(key(KeyCode::Char('l'))).await.unwrap();
+        assert!(app.selected_session_loop_status().is_none());
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        let mut second = expect_selected_loop_get(&listener, "build").await;
+        respond_test_http(
+            &mut second,
+            "application/json",
+            r#"{"session_id":"build","loop":null}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        assert!(render(&app, 60).contains("No session loop"));
+
+        app.handle_key(key(KeyCode::F(8))).await.unwrap();
+        let mut third = expect_selected_loop_get(&listener, "build").await;
+        let body = "fixture error must remain hidden";
+        third
+            .write_all(
+                format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        third.shutdown().await.unwrap();
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        let frame = render(&app, 60);
+        assert!(frame.contains("Loop status unavailable"));
+        assert!(!frame.contains(body));
+        assert!(!frame.contains("No session loop"));
+
+        assert_eq!(app.tab, Tab::Sessions);
+        assert_eq!(app.sessions.selected_id(), Some("build"));
+        assert_eq!(app.chat.session_id.as_deref(), Some("unchanged-chat"));
+        assert_eq!(app.status_message, chat_status);
+        assert!(app.chat.loop_watch.is_none());
+        assert!(app.sse_task.is_none());
+        assert!(app.opening_session_id.is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "unexpected extra Host request"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_session_loop_status_discards_out_of_order_same_row_after_navigation() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = App::new(BambooClient::new(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Sessions;
+        app.sessions.sessions = vec![bare_session("first"), bare_session("second")];
+        app.sessions.page_limit = 2;
+        app.sessions.next_offset = Some(2);
+
+        app.handle_key(key(KeyCode::Char('l'))).await.unwrap();
+        let mut stale = expect_selected_loop_get(&listener, "first").await;
+        app.handle_key(key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.sessions.selected_id(), Some("second"));
+        assert!(app.selected_session_loop_status().is_none());
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.sessions.selected_id(), Some("first"));
+        assert!(app.selected_session_loop_status().is_none());
+
+        app.handle_key(key(KeyCode::Char('l'))).await.unwrap();
+        let mut fresh = expect_selected_loop_get(&listener, "first").await;
+        respond_test_http(
+            &mut stale,
+            "application/json",
+            r#"{"session_id":"first","loop":null}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        assert!(matches!(
+            app.selected_session_loop_status(),
+            Some(SessionListLoopStatus::Loading)
+        ));
+        respond_test_http(
+            &mut fresh,
+            "application/json",
+            r#"{"session_id":"first","loop":{"state":"paused","next_fire_at":null}}"#,
+        )
+        .await;
+        finish_selected_loop_get(&mut app, &mut rx).await;
+        app.handle_key(key(KeyCode::Up)).await.unwrap();
+        let confirmed = app.sessions.loop_lookup.take().unwrap();
+        assert!(matches!(
+            confirmed.status,
+            SessionListLoopStatus::Available(Some(SessionLoopPreview {
+                state: crate::api::SessionLoopPreviewState::Paused,
+                next_fire_at: None,
+            }))
+        ));
+
+        // Exercise the real commands without initiating unrelated catalog requests.
+        app.event_tx = None;
+        for code in [KeyCode::Char('r'), KeyCode::Char(']'), KeyCode::Char('1')] {
+            app.sessions.loop_lookup = Some(SessionLoopLookup {
+                session_id: confirmed.session_id.clone(),
+                status: SessionListLoopStatus::Available(None),
+            });
+            assert!(app.selected_session_loop_status().is_some());
+            app.handle_key(key(code)).await.unwrap();
+            assert!(
+                app.sessions.loop_lookup.is_none(),
+                "lookup survived {code:?}"
+            );
+        }
+        assert_eq!(app.sessions.offset, 2);
+        assert_eq!(app.tab, Tab::Chat);
     }
 
     #[tokio::test]
