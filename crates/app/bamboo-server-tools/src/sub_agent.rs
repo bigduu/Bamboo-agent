@@ -1217,6 +1217,26 @@ impl SubAgentTool {
             .await
             .map_err(tool_error_from_child_session)?;
 
+        use bamboo_domain::session::tool_authority::{
+            PROJECT_MANAGER_SESSION_HINT, TICKET_CREATOR_ROLE,
+        };
+        if let SubAgentArgs::Create { subagent_type, .. } = &parsed {
+            let ticket_creator = subagent_type.as_deref() == Some(TICKET_CREATOR_ROLE);
+            if parent.metadata.get(PROJECT_MANAGER_SESSION_HINT) == Some(&parent.id)
+                && !ticket_creator
+            {
+                return Err(ToolError::InvalidArguments(
+                    "Use project_manager_work to dispatch Work, or ticket-creator to draft it"
+                        .into(),
+                ));
+            }
+            if ticket_creator && (ctx.plan_read_only || parent.project_id_meta().is_none()) {
+                return Err(ToolError::InvalidArguments(
+                    "Ticket Creator requires a writable Project Session".into(),
+                ));
+            }
+        }
+
         // The production Root tool is a shared instance. Keep its synchronous
         // launch transactions sequential, including explicit `wait`, so a
         // failed same-child launch cannot roll back another call's wait.
