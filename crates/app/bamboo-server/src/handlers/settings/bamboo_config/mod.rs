@@ -15,7 +15,7 @@ mod tests;
 pub use codex::detect_codex_cli;
 pub use config_endpoints::{
     confirm_config_recovery, get_bamboo_config, get_config_recovery_status,
-    get_model_limit_defaults, reset_bamboo_config, set_bamboo_config,
+    get_model_limit_defaults, reset_bamboo_config, resolve_model_limit_windows, set_bamboo_config,
 };
 pub use connect::{get_connect_config, put_connect_config};
 pub use credentials::{
