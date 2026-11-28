@@ -2200,6 +2200,29 @@ mod tests {
     }
 
     #[test]
+    fn mermaid_decision_preview_keeps_exact_fence_source_in_both_glyph_modes() {
+        let body = concat!(
+            "flowchart TD\r\n",
+            "A[准备] -->|ready| B{\"审查 {UTC} (QA) | 🚀?\"}\r\n",
+            "B --> C(Done)\r\n",
+        );
+        let source = format!("~~~mermaid\r\n{body}~~~\r\n");
+        for (glyphs, corner) in [(MermaidGlyphs::Unicode, '╱'), (MermaidGlyphs::Ascii, '/')] {
+            let rows = render_markdown_with_mermaid_glyphs(&source, 60, glyphs);
+            assert_eq!(rows.len(), 11);
+            assert!(text_of(&rows[4]).starts_with(corner));
+            assert!(text_of(&rows[5]).contains("审查 {UTC} (QA) | 🚀?"));
+            assert_eq!(
+                copyable_fences(&source).1,
+                [CopyableFence {
+                    language: Some("mermaid"),
+                    source: body,
+                }]
+            );
+        }
+    }
+
+    #[test]
     fn settled_mermaid_chains_match_separate_edges_and_keep_raw_copy_source() {
         let chain = "\tA(Plan)-->|复核 🧭|B[Run]-->C(Done);\r\n";
         let separate = "\tA(Plan)-->|复核 🧭|B[Run];\r\n\tB-->C(Done);\r\n";

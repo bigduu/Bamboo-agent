@@ -1853,6 +1853,90 @@ mod tests {
     }
 
     #[test]
+    fn testbackend_previews_mermaid_decisions_in_both_glyph_modes() {
+        use markdown::MermaidGlyphs::{Ascii, Unicode};
+
+        const EDGES: &str = concat!(
+            "A(Plan) --> B{开始 🧭}\r\n",
+            "B -->|批准| C{\"复核 (QA) 🚀\"}\r\n",
+            "C --> D[Done]\r\n",
+        );
+        for (glyphs, slopes) in [(Unicode, ['╱', '╲']), (Ascii, ['/', '\\'])] {
+            for direction in ["TD", "LR"] {
+                let source = format!(
+                    "~~~mermaid\r\nflowchart {direction}\r\n{EDGES}~~~\r\n\r\nAfter the diagram."
+                );
+                let mut saved = assistant_transcript(&source);
+                saved.mermaid_glyphs = glyphs;
+                let mut live = App::new(BambooClient::new("http://127.0.0.1:0"));
+                live.mermaid_glyphs = glyphs;
+                live.chat.streaming = true;
+                live.chat.current_turn_id = Some("run:mermaid-decision".into());
+                live.chat.current_response = source;
+
+                for width in [60, 80, 120] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                    let streaming = transcript_rows(&mut terminal, &live, true);
+                    let fence = fence_rows(&streaming, "mermaid");
+                    assert!(fence[1].contains(&format!("flowchart {direction}")));
+                    assert!(fence[2].replace(' ', "").contains("B{开始🧭}"));
+                    assert!(fence[3].replace(' ', "").contains("C{\"复核(QA)🚀\"}"));
+                    assert!(!streaming.iter().any(|row| row.contains(slopes)));
+
+                    let rows = transcript_rows(&mut terminal, &saved, false);
+                    let rendered = (0..rows.len())
+                        .map(|row| visible_transcript_row(&terminal, row))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    for label in [
+                        "Plan",
+                        "开始 🧭",
+                        "复核 (QA) 🚀",
+                        "批准",
+                        "Done",
+                        "After the diagram.",
+                    ] {
+                        assert!(rendered.contains(label), "missing {label:?}:\n{rendered}");
+                    }
+                    assert!(
+                        !rendered.contains("flowchart") && !rendered.contains("Mermaid source")
+                    );
+                    for slope in slopes {
+                        assert_eq!(rendered.matches(slope).count(), 4, "{rendered}");
+                    }
+                    if width == 60
+                        && std::env::var_os("BAMBOO_TUI_CAPTURE_MERMAID_DECISION").is_some()
+                    {
+                        eprintln!(
+                            "MERMAID DECISION {direction} {glyphs:?} PREVIEW\n{rendered}\nEND MERMAID DECISION PREVIEW"
+                        );
+                    }
+                }
+            }
+
+            for (edges, literal) in [
+                (
+                    "A{Ready?} --> B[Continue]\r\nA --> C[Stop]\r\n",
+                    "A --> C[Stop]",
+                ),
+                ("A{{Review}} --> B[Done]\r\n", "A{{Review}}"),
+            ] {
+                let mut saved =
+                    assistant_transcript(&format!("```mermaid\r\nflowchart TD\r\n{edges}```"));
+                saved.mermaid_glyphs = glyphs;
+                let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+                let rows = transcript_rows(&mut terminal, &saved, false);
+                assert!(rows
+                    .iter()
+                    .any(|row| row.trim() == "Mermaid source · unsupported diagram"));
+                assert!(fence_rows(&rows, "mermaid")
+                    .iter()
+                    .any(|row| row.contains(literal)));
+            }
+        }
+    }
+
+    #[test]
     fn testbackend_renders_assistant_checklist_and_neighboring_markdown_at_each_width() {
         let source = concat!(
             "# Launch checklist\n\n",
