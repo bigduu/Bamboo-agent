@@ -4522,8 +4522,9 @@ async fn run_pipeline_inner(
                             break;
                         }
                     }
-                    if let Some(recovery) = next.filter(|_| {
-                        !reasoning_repeated && reasoning_only
+                    if let Some(recovery) = next.filter(|candidate| {
+                        !reasoning_repeated
+                            && (reasoning_only || candidate.is_truncated_client_tool_retry())
                             && attempt + usize::from(overflow_recovery_attempted) < MAX_LLM_TURN_ATTEMPTS
                     }) {
                         let next_cost = previous_prompt_tokens.saturating_add(recovery.output_limit());
@@ -4531,7 +4532,11 @@ async fn run_pipeline_inner(
                             && check_run_budget_exceeded(&spent, &config.run_budget).is_none()
                         {
                             output_limit_recovery = Some(recovery);
-                            tracing::info!(convergence = recovery.is_convergence(), "Retrying an output-limited reasoning-only response");
+                            tracing::info!(
+                                convergence = recovery.is_convergence(),
+                                truncated_client_tool = recovery.is_truncated_client_tool_retry(),
+                                "Retrying an output-limited response"
+                            );
                             continue;
                         }
                     }

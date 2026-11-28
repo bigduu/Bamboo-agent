@@ -266,6 +266,7 @@ pub struct OutputLimitRecovery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputLimitStep {
     LowerEffort,
+    RetryTruncatedClientTool,
     Converge,
     Split { lower_effort: bool },
 }
@@ -282,6 +283,10 @@ pub(crate) struct OutputLimitRecoveryControls {
 impl OutputLimitRecovery {
     pub fn is_convergence(self) -> bool {
         self.step == OutputLimitStep::Converge
+    }
+
+    pub fn is_truncated_client_tool_retry(self) -> bool {
+        self.step == OutputLimitStep::RetryTruncatedClientTool
     }
 
     pub fn output_limit(self) -> u64 {
@@ -333,6 +338,7 @@ struct CompletionDiagnosticState {
     first_answer_index: Option<u64>,
     first_answer_identity: Option<String>,
     first_answer_part: Option<u64>,
+    responses_incomplete_with_client_items_only: bool,
     response_progress_seen: bool,
     pending_usage: Option<ProviderUsageReplacement>,
     compatible_messages: bool,
@@ -576,6 +582,27 @@ impl CompletionDiagnostics {
             .recovery
     }
 
+    /// Authorize one lower-effort retry of an incomplete Responses client tool
+    /// call. The caller confirms that the tool arguments were truncated.
+    pub fn truncated_responses_client_tool_retry(&self) -> Option<OutputLimitRecovery> {
+        use crate::providers::common::request_overrides::ENDPOINT_RESPONSES;
+
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .recovery
+            .filter(|retry| {
+                retry.step == OutputLimitStep::LowerEffort
+                    && state.endpoint == Some(ENDPOINT_RESPONSES)
+                    && state.finish_reason == Some("max_output_tokens")
+                    && state.responses_incomplete_with_client_items_only
+                    && !state.provider_tool_seen
+            })
+            .map(|retry| OutputLimitRecovery {
+                step: OutputLimitStep::RetryTruncatedClientTool,
+                ..retry
+            })
+    }
+
     pub(crate) fn observe_agent_round_request(
         &self,
         endpoint: &'static str,
@@ -711,10 +738,30 @@ impl CompletionDiagnostics {
                 "completed" => "completed",
                 _ => "other",
             };
-            self.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .finish_reason = Some(safe);
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.finish_reason = Some(safe);
+            if safe == "max_output_tokens" {
+                let response = value.get("response").unwrap_or(value);
+                let status = response.get("status").and_then(serde_json::Value::as_str);
+                // Terminal snapshots can include outputs with no preceding item event.
+                state.responses_incomplete_with_client_items_only = matches!(
+                    (event, status),
+                    ("response.incomplete", None | Some("incomplete"))
+                        | ("response.completed", Some("incomplete"))
+                ) && response
+                    .get("output")
+                    .or_else(|| value.get("output"))
+                    .is_none_or(|output| {
+                        output.as_array().is_some_and(|items| {
+                            items.iter().all(|item| {
+                                matches!(
+                                    item.get("type").and_then(serde_json::Value::as_str),
+                                    Some("message" | "reasoning" | "function_call")
+                                )
+                            })
+                        })
+                    });
+            }
         }
     }
 

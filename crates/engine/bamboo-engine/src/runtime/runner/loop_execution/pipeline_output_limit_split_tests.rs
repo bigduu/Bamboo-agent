@@ -860,6 +860,79 @@ async fn pipeline_keeps_a_provider_tool_stream_open_until_it_settles() {
 }
 
 #[tokio::test]
+async fn pipeline_recovers_truncated_responses_client_tool_arguments() {
+    let partial = r#"{"file_path":"fixture.txt"#;
+    let client_call = json!({
+        "type":"function_call","id":"item_cut","call_id":"call_cut","name":"Read",
+        "arguments":partial
+    });
+    for provider_work in [false, true] {
+        let mut output = vec![client_call.clone()];
+        if provider_work {
+            output.push(json!({"type":"web_search_call","id":"search","status":"completed"}));
+        }
+        let truncated = mock_completion_sse(&[
+            json!({"type":"response.output_item.added","output_index":0,"item":{
+                "type":"function_call","id":"item_cut","call_id":"call_cut","name":"Read",
+                "arguments":""
+            }}),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,
+                "item_id":"item_cut","delta":partial}),
+            json!({"type":"response.incomplete","response":{
+                "id":"resp_cut","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+                "usage":{"input_tokens":31,"output_tokens":CAP},"output":output
+            }}),
+        ]);
+        let mut replies = vec![truncated];
+        if !provider_work {
+            replies.push(mock_completion_sse(&[
+                json!({"type":"response.completed","response":{
+                    "id":"resp_retry","status":"completed","usage":{"input_tokens":31,"output_tokens":7},
+                    "output":[{"type":"message","id":"msg_retry","content":[
+                        {"type":"output_text","text":"Ready to proceed."}
+                    ]}]
+                }}),
+            ]));
+        }
+        let run = run(
+            Protocol::Responses,
+            Some(ReasoningEffort::High),
+            replies,
+            Default::default(),
+        )
+        .await;
+        assert_eq!(run.tools.call_count(), 0);
+        assert!(run.session.messages.iter().all(|message| {
+            message
+                .tool_calls
+                .iter()
+                .flatten()
+                .all(|call| call.id != "call_cut")
+        }));
+        if provider_work {
+            assert!(matches!(
+                run.result,
+                Err(AgentError::OutputTokenLimit { .. })
+            ));
+            assert_eq!(run.requests.len(), 1);
+        } else {
+            assert!(run.result.unwrap());
+            assert_eq!(run.requests.len(), 2);
+            assert_eq!(run.requests[0]["reasoning"]["effort"], "high");
+            assert_eq!(run.requests[1]["reasoning"]["effort"], "low");
+            assert_eq!(
+                run.requests[0]["max_output_tokens"],
+                run.requests[1]["max_output_tokens"]
+            );
+            assert_eq!(
+                run.session.messages.last().unwrap().content,
+                "Ready to proceed."
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn pipeline_accepts_long_distinct_reasoning_before_a_normal_answer() {
     use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
 
