@@ -704,7 +704,8 @@ impl AppState {
         // Build one creation service before shared tools. Both the generic
         // caller port and Supervisor controls retain this same durable writer.
         let project_context_source = Arc::new(
-            crate::project_context::ProjectStoreContextSource::new(project_store.clone()),
+            crate::project_context::ProjectStoreContextSource::new(project_store.clone())
+                .with_session_storage(storage.clone()),
         );
         let project_context_resolver = Arc::new(
             bamboo_engine::project_context::ProjectContextResolver::new_with_workspace_resolver(

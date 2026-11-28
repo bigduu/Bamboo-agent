@@ -150,6 +150,8 @@ pub struct WorkspaceBinding {
 pub struct ProjectSidebarSection {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Project-owned presentation state, independent from session execution metadata.
@@ -222,6 +224,41 @@ pub struct ProjectManifest {
 }
 
 impl ProjectManifest {
+    /// Find the current named Section of this exact Root lifetime.
+    pub async fn resolve_root_section(
+        &self,
+        root: &crate::Session,
+        storage: &dyn crate::storage::Storage,
+    ) -> Option<&ProjectSidebarSection> {
+        if self.status != ProjectStatus::Active
+            || root.kind != crate::SessionKind::Root
+            || root.parent_session_id.is_some()
+            || root.spawn_depth != 0
+            || (!root.root_session_id.is_empty() && root.root_session_id != root.id)
+            || root.project_id_meta().as_deref().map(str::trim) != Some(self.id.as_str())
+        {
+            return None;
+        }
+
+        let sidebar = self.sidebar.as_ref()?;
+        let section_id = sidebar.session_sections.get(&root.id)?.as_deref()?;
+        let section = sidebar
+            .sections
+            .iter()
+            .find(|section| section.id == section_id)?;
+        let birth_token = root.root_mode_birth_token();
+        let authorized = match self.sidebar_section_bindings.get(&root.id) {
+            Some(binding) => {
+                binding.section_id == section.id && binding.root_birth_token == birth_token
+            }
+            None => storage
+                .first_root_lifetime_matches(&root.id, &birth_token)
+                .await
+                .ok()?,
+        };
+        authorized.then_some(section)
+    }
+
     pub fn new(
         id: ProjectId,
         name: impl Into<String>,
@@ -467,6 +504,7 @@ mod tests {
             sections: vec![ProjectSidebarSection {
                 id: "section:2d567c47-a081-4a8d-9c9e-246bce470c9f".into(),
                 name: "Support".into(),
+                description: None,
             }],
             session_sections: BTreeMap::from([("root".into(), None)]),
             hidden_legacy: true,

@@ -14,7 +14,7 @@ use std::path::Path;
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{
-    LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectSidebar,
+    LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectSidebar, ProjectSidebarSection,
     ProjectSidebarSectionBinding, ProjectStatus, SessionKind, WorkspaceBinding,
 };
 use bamboo_projects::{
@@ -49,11 +49,64 @@ where
 
 fn deserialize_sidebar_snapshot<'de, D>(
     deserializer: D,
-) -> std::result::Result<Option<ProjectSidebar>, D::Error>
+) -> std::result::Result<Option<ProjectSidebarSnapshotRequest>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    ProjectSidebar::deserialize(deserializer).map(Some)
+    ProjectSidebarSnapshotRequest::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ProjectSidebarSnapshotRequest {
+    sections: Vec<ProjectSidebarSectionRequest>,
+    session_sections: BTreeMap<String, Option<String>>,
+    hidden_legacy: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ProjectSidebarSectionRequest {
+    id: String,
+    name: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    description: Option<Option<String>>,
+}
+
+impl ProjectSidebarSnapshotRequest {
+    fn to_sidebar(&self, previous: Option<&ProjectSidebar>) -> ProjectSidebar {
+        let sections = self
+            .sections
+            .iter()
+            .map(|section| {
+                // Older clients send complete snapshots without descriptions.
+                let description = match &section.description {
+                    Some(value) => value
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned),
+                    None => previous
+                        .and_then(|sidebar| {
+                            sidebar.sections.iter().find(|old| old.id == section.id)
+                        })
+                        .and_then(|old| old.description.clone()),
+                };
+                ProjectSidebarSection {
+                    id: section.id.clone(),
+                    name: section.name.trim().to_string(),
+                    description,
+                }
+            })
+            .collect();
+        ProjectSidebar {
+            sections,
+            session_sections: self.session_sections.clone(),
+            hidden_legacy: self.hidden_legacy,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,10 +129,10 @@ pub struct PatchProjectRequest {
     /// Complete Project-owned sidebar snapshot. Explicit null is invalid;
     /// clearing the sidebar uses an empty snapshot, which remains durable.
     #[serde(default, deserialize_with = "deserialize_sidebar_snapshot")]
-    pub sidebar: Option<ProjectSidebar>,
+    pub sidebar: Option<ProjectSidebarSnapshotRequest>,
     /// One-time browser migration. It cannot overwrite an existing snapshot.
     #[serde(default, deserialize_with = "deserialize_sidebar_snapshot")]
-    pub import_sidebar: Option<ProjectSidebar>,
+    pub import_sidebar: Option<ProjectSidebarSnapshotRequest>,
 }
 
 // Bound incoming organization snapshots without imposing new read-time rules
@@ -106,7 +159,7 @@ impl Write for SidebarByteBudget {
     }
 }
 
-fn sidebar_request_within_limits(sidebar: &ProjectSidebar) -> bool {
+fn sidebar_request_within_limits(sidebar: &ProjectSidebarSnapshotRequest) -> bool {
     if sidebar.sections.len() > MAX_SIDEBAR_SECTIONS
         || sidebar.session_sections.len() > MAX_SIDEBAR_ASSIGNMENTS
     {
@@ -139,7 +192,7 @@ fn clear_removed_sidebar_assignments(
 
 fn apply_sidebar_snapshot(
     project: &mut ProjectManifest,
-    requested: Option<&ProjectSidebar>,
+    requested: Option<&ProjectSidebarSnapshotRequest>,
     importing: bool,
     valid_roots: &BTreeMap<String, Option<String>>,
 ) -> bamboo_projects::ProjectStoreResult<()> {
@@ -149,12 +202,12 @@ fn apply_sidebar_snapshot(
         ));
     }
     let previous = project.sidebar.as_ref();
-    let Some(mut sidebar) = requested.cloned().or_else(|| previous.cloned()) else {
+    let Some(mut sidebar) = requested
+        .map(|snapshot| snapshot.to_sidebar(previous))
+        .or_else(|| previous.cloned())
+    else {
         return Ok(());
     };
-    for section in &mut sidebar.sections {
-        section.name = section.name.trim().to_string();
-    }
     let mut available = sidebar
         .sections
         .iter()

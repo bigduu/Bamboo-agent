@@ -4,9 +4,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bamboo_domain::ProjectId;
+use bamboo_agent_core::storage::Storage;
+use bamboo_domain::{ProjectId, Session, SessionKind};
 use bamboo_engine::project_context::{
-    ProjectContextError, ProjectContextSource, ProjectDescriptor,
+    ProjectContextError, ProjectContextSource, ProjectDescriptor, ProjectPromptDescriptions,
 };
 use bamboo_projects::{ProjectStore, ProjectStoreError};
 
@@ -526,11 +527,58 @@ fn validate_workspace_assignment_with(
 
 pub struct ProjectStoreContextSource {
     store: Arc<ProjectStore>,
+    storage: Option<Arc<dyn Storage>>,
 }
 
 impl ProjectStoreContextSource {
     pub fn new(store: Arc<ProjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            storage: None,
+        }
+    }
+
+    pub fn with_session_storage(mut self, storage: Arc<dyn Storage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    async fn lookup_project(
+        &self,
+        project_id: &ProjectId,
+        session: Option<&Session>,
+    ) -> Result<Option<(ProjectDescriptor, ProjectPromptDescriptions)>, ProjectContextError> {
+        let manifest = match self.store.get(project_id) {
+            Ok(project) => project,
+            Err(ProjectStoreError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(ProjectContextError::Source(error.to_string())),
+        };
+        let resources = self
+            .store
+            .resource_summary(project_id)
+            .map_err(|error| ProjectContextError::Source(error.to_string()))?;
+        let descriptions = if let Some(root) = session.filter(|root| root.kind == SessionKind::Root)
+        {
+            let section = match self.storage.as_deref() {
+                Some(storage) => manifest.resolve_root_section(root, storage).await.cloned(),
+                None => None,
+            };
+            ProjectPromptDescriptions {
+                project: manifest.description.clone(),
+                section,
+            }
+        } else {
+            ProjectPromptDescriptions::default()
+        };
+        let descriptor = ProjectDescriptor {
+            id: manifest.id,
+            name: manifest.name,
+            project_path: manifest.project_path.map(std::path::PathBuf::from),
+            home: self.store.paths().project_home(project_id),
+            workspace_bindings: manifest.workspace_bindings,
+            resources,
+        };
+        Ok(Some((descriptor, descriptions)))
     }
 
     fn workspace_facts_with_owner(
@@ -591,23 +639,18 @@ impl ProjectContextSource for ProjectStoreContextSource {
         &self,
         project_id: &ProjectId,
     ) -> Result<Option<ProjectDescriptor>, ProjectContextError> {
-        let manifest = match self.store.get(project_id) {
-            Ok(project) => project,
-            Err(ProjectStoreError::NotFound(_)) => return Ok(None),
-            Err(error) => return Err(ProjectContextError::Source(error.to_string())),
-        };
-        let resources = self
-            .store
-            .resource_summary(project_id)
-            .map_err(|error| ProjectContextError::Source(error.to_string()))?;
-        Ok(Some(ProjectDescriptor {
-            id: manifest.id.clone(),
-            name: manifest.name,
-            project_path: manifest.project_path.map(std::path::PathBuf::from),
-            home: self.store.paths().project_home(project_id),
-            workspace_bindings: manifest.workspace_bindings,
-            resources,
-        }))
+        Ok(self
+            .lookup_project(project_id, None)
+            .await?
+            .map(|(project, _)| project))
+    }
+
+    async fn find_session_project(
+        &self,
+        project_id: &ProjectId,
+        session: &Session,
+    ) -> Result<Option<(ProjectDescriptor, ProjectPromptDescriptions)>, ProjectContextError> {
+        self.lookup_project(project_id, Some(session)).await
     }
 
     async fn list_projects(&self) -> Result<Vec<ProjectDescriptor>, ProjectContextError> {

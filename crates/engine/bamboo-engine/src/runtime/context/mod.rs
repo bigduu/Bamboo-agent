@@ -212,12 +212,31 @@ pub fn build_project_prompt_context(context: &ResolvedProjectContext) -> String 
 /// not duplicate that path or leak into provider-visible diagnostics.
 pub fn build_project_model_context(context: &ResolvedProjectContext) -> String {
     let project = &context.project;
-    let body = format!(
+    let mut body = format!(
         "{PROJECT_CONTEXT_PREFIX}{}\nProject name: {}\nThis session belongs to this Project.\nWorkspace is mutable execution context; changing it does not change Project membership, sidebar grouping, Project memory, or Project-shared resources.\nProject-shared resource inventory is supplied separately as per-round dynamic context.\nThe host owns workspace selection and reports the active execution context separately.",
         prompt_safe_scalar(project.id.as_str()),
         prompt_safe_scalar(&project.name),
     );
+    if let Some(description) = prompt_description(context.descriptions.project.as_deref()) {
+        body.push_str("\nProject description: ");
+        body.push_str(&description);
+    }
+    if let Some(section) = context.descriptions.section.as_ref() {
+        if let Some(description) = prompt_description(section.description.as_deref()) {
+            body.push_str("\nCurrent Section: ");
+            body.push_str(&prompt_safe_scalar(&section.name));
+            body.push_str("\nSection description: ");
+            body.push_str(&description);
+        }
+    }
     format!("{PROJECT_CONTEXT_START_MARKER}\n{body}\n{PROJECT_CONTEXT_END_MARKER}")
+}
+
+fn prompt_description(value: Option<&str>) -> Option<String> {
+    const MAX_DESCRIPTION_CHARS: usize = 1024;
+    let bounded: String = value?.trim().chars().take(MAX_DESCRIPTION_CHARS).collect();
+    let description = prompt_safe_scalar(&bounded);
+    (!description.is_empty()).then_some(description)
 }
 
 /// Replace every existing Project block with exactly one current block.
@@ -392,6 +411,7 @@ mod project_context_tests {
                     ],
                 },
             },
+            descriptions: Default::default(),
             workspace: Some(PathBuf::from(workspace)),
             workspace_source: WorkspaceSource::Session,
             binding_status: WorkspaceBindingStatus::Registered,
@@ -423,6 +443,29 @@ mod project_context_tests {
         assert!(prompt.contains("Project ID:"));
         assert!(!prompt.contains("/workspace/main"));
         assert!(!prompt.contains("/data/projects"));
+    }
+
+    #[test]
+    fn project_model_context_omits_blank_descriptions_and_bounds_configured_text() {
+        let mut context = project_context("/workspace/main");
+        context.descriptions.project = Some(" \n\t".into());
+        context.descriptions.section = Some(bamboo_domain::ProjectSidebarSection {
+            id: "section:fixture".into(),
+            name: "Documentation".into(),
+            description: None,
+        });
+        let prompt = build_project_model_context(&context);
+        assert!(!prompt.contains("description:"));
+        assert!(!prompt.contains("Documentation"));
+
+        context.descriptions.project = Some(format!("{} EXTRA", "界".repeat(1024)));
+        context.descriptions.section.as_mut().unwrap().description =
+            Some("  Write release notes.\nUse approved terms.  ".into());
+        let prompt = build_project_model_context(&context);
+        assert!(prompt.contains(&"界".repeat(1024)));
+        assert!(!prompt.contains("EXTRA"));
+        assert!(prompt.contains("Current Section: Documentation"));
+        assert!(prompt.contains("Section description: Write release notes. Use approved terms."));
     }
 
     #[test]
