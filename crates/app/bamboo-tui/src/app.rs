@@ -7667,9 +7667,7 @@ impl App {
                 }
                 match result {
                     Ok(()) => self.notify(NoticeLevel::Info, "Schedule deleted"),
-                    Err(error) => {
-                        self.notify(NoticeLevel::Error, format!("Delete failed: {error}"))
-                    }
+                    Err(error) => self.notify(NoticeLevel::Error, error),
                 }
                 self.load_tab_data();
             }
@@ -15446,7 +15444,7 @@ impl App {
                     tokio::spawn(async move {
                         let outcome = match client.run_schedule_now(&id).await {
                             Ok(()) => Ok("Schedule triggered".to_string()),
-                            Err(e) => Err(format!("Run failed: {e}")),
+                            Err(error) => Err(error.to_string()),
                         };
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
@@ -16450,7 +16448,7 @@ impl App {
                     tokio::spawn(async move {
                         let outcome = match client.create_schedule(req).await {
                             Ok(()) => Ok("Schedule created".to_string()),
-                            Err(e) => Err(format!("Create failed: {e}")),
+                            Err(error) => Err(error.to_string()),
                         };
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
@@ -25583,6 +25581,57 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn schedule_run_now_shows_an_unconfirmed_outcome_without_resubmitting() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut socket).await;
+            assert_eq!(
+                request.lines().next(),
+                Some("POST /api/v1/schedules/review/run HTTP/1.1")
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let mut app = App::new(client);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        app.schedules.schedules.push(Schedule::from_view(
+            serde_json::from_value(serde_json::json!({"id":"review","name":"Review"})).unwrap(),
+        ));
+        app.handle_key(key(KeyCode::Char('r'))).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_event(outcome).await.unwrap();
+        assert_eq!(
+            app.status_message,
+            "Could not confirm Run Now. Check Recent runs before trying again."
+        );
+        let notice = app.notifications.last().unwrap();
+        assert_eq!(notice.text, app.status_message);
+        assert!(matches!(notice.level, NoticeLevel::Error));
+        assert_eq!(app.schedules.schedules[app.schedules.selected].id, "review");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn schedule_form_posts_weekly_schedule_from_keyboard_input() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
@@ -27387,6 +27436,7 @@ mod question_tests {
         use tokio::io::AsyncWriteExt;
         use tokio::sync::oneshot;
 
+        const LIST_ERROR: &str = "Could not load schedules. Reopen Schedules to try again.";
         const ORIGINAL: &str = r#"{"schedules":[
             {"id":"first","name":"First review","enabled":true,"trigger":{"type":"interval","every_seconds":90}},
             {"id":"second","name":"Second review","enabled":true}
@@ -27442,6 +27492,13 @@ mod question_tests {
             }
             text
         };
+        let shows_catalog_error = |frame: &str| {
+            frame
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(LIST_ERROR)
+        };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = BambooClient::new(&format!("http://{}", listener.local_addr().unwrap()));
@@ -27450,6 +27507,13 @@ mod question_tests {
         let (allow_patch, wait_patch) = oneshot::channel();
         let (allow_refresh, wait_refresh) = oneshot::channel();
         let server = tokio::spawn(async move {
+            let (mut cold, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut cold).await.lines().next(),
+                Some("GET /api/v1/schedules HTTP/1.1")
+            );
+            reply_error(&mut cold, "503 Service Unavailable", "RAW_COLD_CATALOG").await;
+
             let (mut first, _) = listener.accept().await.unwrap();
             assert_eq!(read_test_http_path(&mut first).await, "/api/v1/schedules");
             respond_test_http(&mut first, "application/json", ORIGINAL).await;
@@ -27491,6 +27555,27 @@ mod question_tests {
                 r#"{"error":{"message":"RAW_REFRESH_DIAGNOSTIC"}}"#,
             )
             .await;
+
+            let (mut runs, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut runs).await.lines().next(),
+                Some("GET /api/v1/schedules/first/runs HTTP/1.1")
+            );
+            respond_test_http(
+                &mut runs,
+                "application/json",
+                r#"{"schedule_id":"first","runs":[]}"#,
+            )
+            .await;
+
+            let (mut recovered, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_request(&mut recovered).await.lines().next(),
+                Some("GET /api/v1/schedules HTTP/1.1")
+            );
+            let mut catalog: serde_json::Value = serde_json::from_str(REORDERED).unwrap();
+            catalog["schedules"].as_array_mut().unwrap().reverse();
+            respond_test_http(&mut recovered, "application/json", &catalog.to_string()).await;
         });
 
         let mut app = App::new(client);
@@ -27517,6 +27602,14 @@ mod question_tests {
         app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
         app.handle_event(next_event(&mut rx).await).await.unwrap();
         assert_eq!(app.tab, Tab::Schedules);
+        assert!(app.schedules.schedules.is_empty());
+        assert_eq!(app.schedules.error.as_deref(), Some(LIST_ERROR));
+        let cold = preview(&app, "COLD CATALOG FAILURE");
+        assert!(shows_catalog_error(&cold), "{cold}");
+        assert!(!cold.contains("RAW_COLD_CATALOG"), "{cold}");
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(app.schedules.error.is_none());
         app.handle_key(key(KeyCode::Char('t'))).await.unwrap();
         assert!(!app.schedules.has_pending_toggle());
         app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
@@ -27599,6 +27692,7 @@ mod question_tests {
         assert!(app.schedules.loading);
         app.handle_event(next_event(&mut rx).await).await.unwrap();
         assert!(!app.schedules.loading);
+        assert_eq!(app.schedules.error.as_deref(), Some(LIST_ERROR));
         let selected = &app.schedules.schedules[app.schedules.selected];
         assert_eq!(selected.id, "first");
         assert_eq!(selected.enabled, Some(false));
@@ -27608,16 +27702,29 @@ mod question_tests {
             .find(|row| row.contains("› First review"))
             .unwrap();
         assert!(row.contains("disabled"), "{cached}");
-        for expected in [
-            "Refresh failed",
-            "Every 90 seconds",
-            "/ Enable",
-            "Enter runs",
-            "r run now",
-        ] {
+        assert!(shows_catalog_error(&cached), "{cached}");
+        for expected in ["Every 90 seconds", "/ Enable", "Enter runs", "r run now"] {
             assert!(cached.contains(expected), "missing {expected:?}\n{cached}");
         }
         assert!(!cached.contains("RAW_REFRESH_DIAGNOSTIC"), "{cached}");
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        let runs = app.schedule_runs.as_ref().unwrap();
+        assert_eq!(runs.schedule_id, "first");
+        assert!(matches!(&runs.content, ScheduleRunsContent::Loaded(rows) if rows.is_empty()));
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.schedule_runs.is_none());
+
+        app.handle_key(key(KeyCode::Char('4'))).await.unwrap();
+        app.handle_event(next_event(&mut rx).await).await.unwrap();
+        assert!(app.schedules.error.is_none());
+        assert_eq!(
+            app.schedules.selected, 0,
+            "selection follows the retained ID"
+        );
+        assert_eq!(app.schedules.schedules[0].id, "first");
+        assert_eq!(app.schedules.schedules[0].enabled, Some(false));
         tokio::time::timeout(budget, server).await.unwrap().unwrap();
     }
 
