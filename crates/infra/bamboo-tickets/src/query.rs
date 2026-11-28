@@ -201,6 +201,8 @@ pub struct WorkContextPacket {
     pub binding: ScopeBinding,
     pub contract: Contract,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_brief: Option<DraftBrief>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<ExecutionWorkspace>,
     pub inputs: Vec<DependencyInput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -848,7 +850,7 @@ pub(crate) fn build_context_packet(
         }
     }
     let packet=WorkContextPacket { project_context: snapshot.project.assignment_contexts.get(assignment_id).and_then(|hash| snapshot.project.contexts.get(hash)).cloned(), contract_ref:work.id.clone(),contract_revision:work.contract_revision,generation:assignment.generation,
-        assignment_id:assignment_id.into(),binding:snapshot.binding.clone(),contract:work.contract.clone(),inputs:assignment.dependency_inputs.clone(),
+        assignment_id:assignment_id.into(),binding:snapshot.binding.clone(),contract:work.contract.clone(),draft_brief:work.draft_brief.clone(),inputs:assignment.dependency_inputs.clone(),
         input_artifacts, workspace:assignment.workspace.clone(),
         answers:snapshot.requests.values().filter(|r| r.work_id == work.id && r.contract_revision == assignment.contract_revision
             && r.generation < assignment.generation && r.kind == RequestKind::Question && r.status == RequestStatus::Answered)
