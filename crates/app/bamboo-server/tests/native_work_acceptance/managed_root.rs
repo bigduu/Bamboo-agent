@@ -1086,6 +1086,28 @@ async fn existing_project_work_survives_restart_and_dispatches_into_section() {
             StatusCode::OK
         );
         let manager_id = manager["session_id"].as_str().unwrap().to_owned();
+        let other = state.project_store.create("Other Project", None).unwrap();
+        let manager_session = state
+            .storage
+            .load_root_authority(&manager_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for project_id in [Value::Null, json!(other.id)] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{manager_id}"))
+                    .insert_header(("If-Match", manager_session.metadata_version.to_string()))
+                    .set_json(json!({ "project_id": project_id }))
+                    .peer_addr("127.0.0.1:5700".parse().unwrap())
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["error"]["code"], "project_manager_membership_fixed");
+        }
         drop(app);
         state.shutdown().await;
         (project.id, manager_id, work_id)

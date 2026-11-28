@@ -128,7 +128,7 @@ fn active_project(
     Ok(project)
 }
 
-fn manager_matches(project: &ProjectManifest, session: &Session) -> bool {
+pub(crate) fn manager_matches(project: &ProjectManifest, session: &Session) -> bool {
     project.project_manager.as_ref().is_some_and(|binding| {
         session.kind == SessionKind::Root
             && session.authority_identity.is_ordinary()
