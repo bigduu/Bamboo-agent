@@ -15,7 +15,7 @@ use crate::app::{
     ScheduleCadenceEdit, ScheduleCadenceKind, SessionActivityStatus, SessionPickerMode, Tab,
 };
 use crate::keymap::{ActionContext, ActionId};
-use crate::schedule_form::ScheduleField;
+use crate::schedule_form::{parse_schedule_once_at, ScheduleField, ScheduleTriggerKind};
 use crate::theme::{self, colors};
 use crate::ui::schedules::cron_expression_line;
 use crate::ui::sessions::session_row_line_with_activity;
@@ -2327,10 +2327,18 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
             Span::styled(value, style),
         ]));
     }
-    lines.push(Line::from(Span::styled(
-        format!("  {}", form.hint()),
-        Style::default().fg(colors::subtle()),
-    )));
+    let guidance = Style::default().fg(colors::subtle());
+    lines.push(Line::styled(format!("  {}", form.hint()), guidance));
+    if form.trigger == ScheduleTriggerKind::Once {
+        if let Ok(at) = parse_schedule_once_at(&form.timing, chrono::Utc::now()) {
+            let at = at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+            lines.push(Line::styled(format!("  UTC trigger  {at}"), guidance));
+        }
+        lines.push(Line::styled(
+            "  If picked up late, the Host can run it once.",
+            guidance,
+        ));
+    }
     if let Some(error) = &form.error {
         lines.push(Line::from(Span::styled(
             format!(
@@ -4068,9 +4076,35 @@ mod tests {
             if trigger == Once {
                 assert!(words.contains("offset"), "{text}");
             }
+            assert_eq!(
+                words.contains("If picked up late, the Host can run it once."),
+                trigger == Once,
+                "{text}"
+            );
+            assert!(!words.contains("UTC trigger"), "{text}");
             for label in ["Weekdays", "Days of month"] {
                 assert_eq!(text.contains(label), days == Some(label), "{text}");
             }
+        }
+
+        app.schedule_form = Some(ScheduleForm {
+            trigger: Once,
+            field: 2,
+            timing: "9999-12-31T23:59:59.123456789-23:59".into(),
+            error: Some("Enter a task prompt".into()),
+            ..ScheduleForm::default()
+        });
+        terminal
+            .draw(|frame| super::render_schedule_form(frame, &app))
+            .unwrap();
+        let text = terminal_text(&terminal);
+        for expected in [
+            "+10000-01-01T23:58:59.123456789Z",
+            "Enter a task prompt",
+            "Enter create",
+            "Esc cancel",
+        ] {
+            assert!(text.contains(expected), "{expected:?}\n{text}");
         }
     }
 
