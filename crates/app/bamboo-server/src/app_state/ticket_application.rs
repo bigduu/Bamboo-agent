@@ -45,6 +45,7 @@ pub struct TicketApplication {
     unavailable: Option<String>,
     adapter: OnceLock<Arc<ChildSessionAdapter>>,
     managed_work_host: OnceLock<managed_work::ManagedWorkHost>,
+    project_scan_lock: tokio::sync::Mutex<()>,
     messenger: OnceLock<Arc<bamboo_engine::SessionMessenger>>,
     workspace: String,
     ready_scheduler: Arc<bamboo_orchestration::ReadyWorkScheduler>,
@@ -77,6 +78,7 @@ mod initialization;
 mod managed_work;
 mod memory_sources;
 pub(crate) mod project_manager;
+pub(crate) mod project_scan;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod patrol_adapter;
 pub use patrol_adapter::{
@@ -121,6 +123,7 @@ impl TicketApplication {
             unavailable,
             adapter: OnceLock::new(),
             managed_work_host: OnceLock::new(),
+            project_scan_lock: Default::default(),
             messenger: OnceLock::new(),
             workspace: root
                 .join("workspaces")

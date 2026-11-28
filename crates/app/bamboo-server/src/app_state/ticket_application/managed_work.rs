@@ -19,7 +19,7 @@ use crate::app_state::supervised_root_run::SupervisedRootRunController;
 pub(super) struct ManagedWorkHost {
     pub(super) creator: Arc<SupervisedRootCreator>,
     pub(super) persistence: Arc<bamboo_storage::LockedSessionStore>,
-    providers: Arc<bamboo_llm::ProviderRegistry>,
+    pub(super) providers: Arc<bamboo_llm::ProviderRegistry>,
     runs: OnceLock<Arc<SupervisedRootRunController>>,
 }
 

@@ -85,6 +85,7 @@ impl bamboo_engine::session_app::child_session::ticket_creator::TicketDraftPubli
             facts,
             decisions,
             open_questions: open_questions.clone(),
+            required_files: BTreeSet::new(),
             sources: context
                 .payload
                 .sources
