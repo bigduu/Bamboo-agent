@@ -56,10 +56,7 @@ pub(super) fn take_fence<'a>(
     opening: SourceLine<'a>,
     input: &mut impl Iterator<Item = SourceLine<'a>>,
 ) -> Option<FencedBlock<'a>> {
-    let (marker, length, info) = fence_prefix(opening.text)?;
-    if marker == b'`' && info.contains('`') {
-        return None;
-    }
+    let (marker, length, info) = opening_prefix(opening.text)?;
     let mut info_words = info.split_whitespace();
     let kind = match info_words.next() {
         Some(language) if language.eq_ignore_ascii_case("mermaid") => FenceKind::Mermaid {
@@ -86,6 +83,10 @@ pub(super) fn take_fence<'a>(
         source: &source[opening.end..end],
         closing_line,
     })
+}
+
+pub(super) fn opening_prefix(line: &str) -> Option<(u8, usize, &str)> {
+    fence_prefix(line).filter(|(marker, _, info)| *marker != b'`' || !info.contains('`'))
 }
 
 fn fence_prefix(line: &str) -> Option<(u8, usize, &str)> {
