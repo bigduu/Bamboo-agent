@@ -21,6 +21,7 @@ use ratatui::Frame;
 use tokio::sync::{mpsc, watch, Notify};
 
 use crate::app::{ActiveQuestionKind, App, ConfigView, MessageRole, Tab};
+use crate::components::markdown::MermaidGlyphs;
 use crate::event::AppEvent;
 use crate::file_reference::file_name;
 use crate::keymap::{ActionContext, ActionId};
@@ -615,14 +616,16 @@ pub(crate) enum TerminalSetting {
     Appearance,
     ToolDetails,
     KeyHints,
+    MermaidGlyphs,
     ServerConfig,
     Permissions,
 }
 
-const SETTINGS: [TerminalSetting; 5] = [
+const SETTINGS: [TerminalSetting; 6] = [
     TerminalSetting::Appearance,
     TerminalSetting::ToolDetails,
     TerminalSetting::KeyHints,
+    TerminalSetting::MermaidGlyphs,
     TerminalSetting::ServerConfig,
     TerminalSetting::Permissions,
 ];
@@ -675,7 +678,7 @@ pub(super) fn render_settings(frame: &mut Frame, app: &App, anchor: Rect) {
     let Some(settings) = &app.terminal_settings else {
         return;
     };
-    let outer = popover_area(anchor, 57, 9, true);
+    let outer = popover_area(anchor, 57, 10, true);
     let inner = panel(frame, outer, " Settings ", app.theme);
     settings.rows.set(inner);
     let appearance = match app.theme {
@@ -700,6 +703,13 @@ pub(super) fn render_settings(frame: &mut Frame, app: &App, anchor: Rect) {
                 "shown"
             } else {
                 "hidden"
+            },
+        ),
+        (
+            "Mermaid diagrams",
+            match app.mermaid_glyphs {
+                MermaidGlyphs::Unicode => "Unicode",
+                MermaidGlyphs::Ascii => "ASCII",
             },
         ),
         ("Server configuration", "open ›"),
@@ -765,6 +775,34 @@ mod tests {
             text.find(label)
                 .map(|column| (text[..column].chars().count() as u16, row))
         })
+    }
+
+    #[test]
+    fn terminal_settings_mermaid_row_and_footer_fit_at_minimum_size() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.terminal_settings = Some(SettingsMenu::default());
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        for (glyphs, value) in [
+            (MermaidGlyphs::Unicode, "Unicode"),
+            (MermaidGlyphs::Ascii, "ASCII"),
+        ] {
+            app.mermaid_glyphs = glyphs;
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_settings(frame, &app, area);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let (_, toolbar_row) = position(buffer, "Toolbar hints").unwrap();
+            let (_, mermaid_row) = position(buffer, "Mermaid diagrams").unwrap();
+            let (_, value_row) = position(buffer, value).unwrap();
+            let (_, permission_row) = position(buffer, "Permission policy").unwrap();
+            let (_, footer_row) = position(buffer, "Esc close").unwrap();
+            assert_eq!(mermaid_row, toolbar_row + 1);
+            assert_eq!(mermaid_row, value_row);
+            assert!(footer_row > permission_row);
+        }
     }
 
     async fn draw_until(

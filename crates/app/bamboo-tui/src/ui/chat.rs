@@ -522,7 +522,11 @@ fn build_conversation_lines(app: &App, width: u16, workspace: bool) -> RenderedC
                 let rendered = if streaming {
                     markdown::render_streaming_markdown(content, width)
                 } else {
-                    markdown::render_markdown(content, width)
+                    markdown::render_markdown_with_mermaid_glyphs(
+                        content,
+                        width,
+                        app.mermaid_glyphs,
+                    )
                 };
                 lines.extend(rendered);
             }

@@ -4,6 +4,8 @@ use ratatui::text::{Line, Span};
 use crate::text::grapheme_cell_width;
 use crate::theme::colors;
 
+use super::MermaidGlyphs;
+
 const MAX_SOURCE_BYTES: usize = 4 * 1024;
 const MAX_NODES: usize = 8;
 
@@ -24,12 +26,68 @@ impl Unavailable {
 
 /// Preview one path in its declared direction, including chains on a single
 /// line. The source picker can still access the original fence.
-pub(super) fn render(source: &str, width: usize) -> Result<Vec<Line<'static>>, Unavailable> {
+pub(super) fn render(
+    source: &str,
+    width: usize,
+    glyphs: MermaidGlyphs,
+) -> Result<Vec<Line<'static>>, Unavailable> {
     let (direction, nodes) = parse_path(source).ok_or(Unavailable::Unsupported)?;
     let border = Style::default().fg(colors::code_border());
+    let glyphs = DiagramGlyphs::for_mode(glyphs);
     match direction {
-        Direction::TopDown => render_vertical(nodes, width, border),
-        Direction::LeftToRight => render_horizontal(nodes, width, border),
+        Direction::TopDown => render_vertical(nodes, width, border, &glyphs),
+        Direction::LeftToRight => render_horizontal(nodes, width, border, &glyphs),
+    }
+}
+
+struct DiagramGlyphs {
+    rule: &'static str,
+    side: char,
+    top_junction: &'static str,
+    bottom_junction: &'static str,
+    left_junction: char,
+    right_junction: char,
+    down_arrow: char,
+    right_arrow: char,
+    rectangle: [char; 4],
+    rounded: [char; 4],
+}
+
+impl DiagramGlyphs {
+    fn for_mode(mode: MermaidGlyphs) -> Self {
+        match mode {
+            MermaidGlyphs::Unicode => Self {
+                rule: "─",
+                side: '│',
+                top_junction: "┴",
+                bottom_junction: "┬",
+                left_junction: '┤',
+                right_junction: '├',
+                down_arrow: '↓',
+                right_arrow: '→',
+                rectangle: ['┌', '┐', '└', '┘'],
+                rounded: ['╭', '╮', '╰', '╯'],
+            },
+            MermaidGlyphs::Ascii => Self {
+                rule: "-",
+                side: '|',
+                top_junction: "+",
+                bottom_junction: "+",
+                left_junction: '+',
+                right_junction: '+',
+                down_arrow: 'v',
+                right_arrow: '>',
+                rectangle: ['+'; 4],
+                rounded: ['.', '.', '\'', '\''],
+            },
+        }
+    }
+
+    fn corners(&self, shape: NodeShape) -> [char; 4] {
+        match shape {
+            NodeShape::Rectangle => self.rectangle,
+            NodeShape::Rounded => self.rounded,
+        }
     }
 }
 
@@ -37,6 +95,7 @@ fn render_vertical(
     nodes: Vec<PathStep<'_>>,
     width: usize,
     border: Style,
+    glyphs: &DiagramGlyphs,
 ) -> Result<Vec<Line<'static>>, Unavailable> {
     let label_width = nodes.iter().map(|step| step.cells).max().unwrap_or(0);
     let center = (label_width + 3) / 2;
@@ -50,25 +109,34 @@ fn render_vertical(
         return Err(Unavailable::TooWide);
     }
 
-    let rule_left = "─".repeat(center - 1);
-    let rule_right = "─".repeat(label_width + 2 - center);
-    let arrow = format!("{}↓", " ".repeat(center));
+    let rule_left = glyphs.rule.repeat(center - 1);
+    let rule_right = glyphs.rule.repeat(label_width + 2 - center);
+    let side = glyphs.side;
+    let arrow = format!("{}{}", " ".repeat(center), glyphs.down_arrow);
     let mut rows = Vec::with_capacity(nodes.len() * 4 - 1);
     let last_index = nodes.len() - 1;
     for (index, step) in nodes.into_iter().enumerate() {
         let node = step.display;
-        let [top_left, top_right, bottom_left, bottom_right] = node.shape.corners();
-        let top_center = if index == 0 { '─' } else { '┴' };
-        let bottom_center = if index == last_index { '─' } else { '┬' };
+        let [top_left, top_right, bottom_left, bottom_right] = glyphs.corners(node.shape);
+        let top_center = if index == 0 {
+            glyphs.rule
+        } else {
+            glyphs.top_junction
+        };
+        let bottom_center = if index == last_index {
+            glyphs.rule
+        } else {
+            glyphs.bottom_junction
+        };
         rows.push(Line::styled(
             format!("{top_left}{rule_left}{top_center}{rule_right}{top_right}"),
             border,
         ));
         rows.push(Line::from(vec![
-            Span::styled("│ ", border),
+            Span::styled(format!("{side} "), border),
             Span::raw(node.label.to_owned()),
             Span::styled(
-                format!("{} │", " ".repeat(label_width - step.cells)),
+                format!("{} {side}", " ".repeat(label_width - step.cells)),
                 border,
             ),
         ]));
@@ -94,6 +162,7 @@ fn render_horizontal(
     nodes: Vec<PathStep<'_>>,
     width: usize,
     border: Style,
+    glyphs: &DiagramGlyphs,
 ) -> Result<Vec<Line<'static>>, Unavailable> {
     let last_index = nodes.len() - 1;
     let box_widths: usize = nodes.iter().map(|step| step.cells + 4).sum();
@@ -110,18 +179,26 @@ fn render_horizontal(
     let mut bottom = String::new();
     for (index, step) in nodes.into_iter().enumerate() {
         let node = step.display;
-        let [top_left, top_right, bottom_left, bottom_right] = node.shape.corners();
-        let rule = "─".repeat(step.cells + 2);
+        let [top_left, top_right, bottom_left, bottom_right] = glyphs.corners(node.shape);
+        let rule = glyphs.rule.repeat(step.cells + 2);
         top.push(Span::styled(format!("{top_left}{rule}{top_right}"), border));
         bottom.push(bottom_left);
         bottom.push_str(&rule);
         bottom.push(bottom_right);
 
-        let left_side = if index == 0 { "│ " } else { "┤ " };
-        let right_side = if index == last_index { " │" } else { " ├" };
-        middle.push(Span::styled(left_side, border));
+        let left_side = if index == 0 {
+            glyphs.side
+        } else {
+            glyphs.left_junction
+        };
+        let right_side = if index == last_index {
+            glyphs.side
+        } else {
+            glyphs.right_junction
+        };
+        middle.push(Span::styled(format!("{left_side} "), border));
         middle.push(Span::raw(node.label.to_owned()));
-        middle.push(Span::styled(right_side, border));
+        middle.push(Span::styled(format!(" {right_side}"), border));
         if index != last_index {
             let gap_width = step.horizontal_gap();
             if let Some(label) = step.outgoing_label {
@@ -130,7 +207,11 @@ fn render_horizontal(
                 top.push(Span::styled("   ", border));
             }
             middle.push(Span::styled(
-                format!("{}→", "─".repeat(gap_width - 1)),
+                format!(
+                    "{}{}",
+                    glyphs.rule.repeat(gap_width - 1),
+                    glyphs.right_arrow
+                ),
                 border,
             ));
             bottom.push_str(&" ".repeat(gap_width));
@@ -153,15 +234,6 @@ enum Direction {
 enum NodeShape {
     Rectangle,
     Rounded,
-}
-
-impl NodeShape {
-    fn corners(self) -> [char; 4] {
-        match self {
-            Self::Rectangle => ['┌', '┐', '└', '┘'],
-            Self::Rounded => ['╭', '╮', '╰', '╯'],
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -385,6 +457,7 @@ fn parse_node(input: &str) -> Option<(NodeRef<'_>, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use MermaidGlyphs::{Ascii, Unicode};
 
     #[test]
     fn orders_rectangles_by_edges_with_unicode_and_plain_quoted_labels() {
@@ -453,7 +526,7 @@ mod tests {
         ] {
             for direction in ["TD", "LR"] {
                 assert_eq!(
-                    render(&format!("flowchart {direction}\n{body}"), 120),
+                    render(&format!("flowchart {direction}\n{body}"), 120, Unicode),
                     Err(Unavailable::Unsupported),
                     "{body}",
                 );
@@ -492,7 +565,7 @@ mod tests {
             "A --> B -- Label --> C",
         ] {
             assert_eq!(
-                render(&format!("flowchart LR\n{body}"), 120),
+                render(&format!("flowchart LR\n{body}"), 120, Unicode),
                 Err(Unavailable::Unsupported),
                 "{body:?}",
             );
@@ -509,7 +582,8 @@ mod tests {
     fn same_line_chains_match_separate_edges_in_both_directions() {
         let compact = "B[Check];\r\nA(Plan)-->|Go|B[Check] -->\t| 审核 👩‍💻 |C(Review)-->D[Done];";
         for (direction, width) in [("TD", 13), ("LR", 51)] {
-            let preview = |body, width| render(&format!("flowchart {direction}\r\n{body}"), width);
+            let preview =
+                |body, width| render(&format!("flowchart {direction}\r\n{body}"), width, Unicode);
             assert_eq!(
                 preview("A[Plan] --> B --> C", width).unwrap(),
                 preview("A[Plan] --> B\r\nB --> C", width).unwrap()
@@ -525,7 +599,7 @@ mod tests {
     #[test]
     fn vertical_labels_follow_their_edges_and_fit_by_cells() {
         let source = format!("flowchart TD\r\n{MIXED_EDGES}");
-        let rows = render(&source, 13).unwrap();
+        let rows = render(&source, 13, Unicode).unwrap();
         assert_eq!(rows.len(), 15);
         assert_eq!(rows[0].to_string(), "╭────────╮");
         assert_eq!(rows[3].to_string(), "    ↓ Go");
@@ -533,13 +607,13 @@ mod tests {
         assert_eq!(rows[7].to_string(), "    ↓ 审核 👩‍💻");
         assert_eq!(rows[11].to_string(), "    ↓");
         assert_eq!(grapheme_cell_width(&rows[7].to_string()), 13);
-        assert_eq!(render(&source, 12), Err(Unavailable::TooWide));
+        assert_eq!(render(&source, 12, Unicode), Err(Unavailable::TooWide));
     }
 
     #[test]
     fn horizontal_labels_widen_only_their_own_gaps_and_fit_by_cells() {
         let source = format!("graph LR\r\n{MIXED_EDGES}");
-        let rows = render(&source, 51).unwrap();
+        let rows = render(&source, 51, Unicode).unwrap();
         let content: Vec<_> = rows.iter().map(ToString::to_string).collect();
         assert_eq!(
             content,
@@ -550,7 +624,7 @@ mod tests {
             ]
         );
         assert!(content.iter().all(|row| grapheme_cell_width(row) == 51));
-        assert_eq!(render(&source, 50), Err(Unavailable::TooWide));
+        assert_eq!(render(&source, 50, Unicode), Err(Unavailable::TooWide));
     }
 
     #[test]
@@ -562,15 +636,6 @@ mod tests {
             }
             source
         };
-        assert_eq!(
-            render(&chain(MAX_NODES), 120).unwrap().len(),
-            MAX_NODES * 4 - 1
-        );
-        assert_eq!(
-            render(&chain(MAX_NODES + 1), 120),
-            Err(Unavailable::Unsupported)
-        );
-
         let compact = |nodes| {
             let path = (0..nodes)
                 .map(|node| format!("N{node}"))
@@ -578,26 +643,36 @@ mod tests {
                 .join("-->");
             format!("flowchart TD\n{path}")
         };
-        assert_eq!(
-            render(&compact(MAX_NODES), 120).unwrap().len(),
-            MAX_NODES * 4 - 1
-        );
-        assert_eq!(
-            render(&compact(MAX_NODES + 1), 120),
-            Err(Unavailable::Unsupported)
-        );
+        for glyphs in [Unicode, Ascii] {
+            assert_eq!(
+                render(&chain(MAX_NODES), 120, glyphs).unwrap().len(),
+                MAX_NODES * 4 - 1
+            );
+            assert_eq!(
+                render(&chain(MAX_NODES + 1), 120, glyphs),
+                Err(Unavailable::Unsupported)
+            );
+            assert_eq!(
+                render(&compact(MAX_NODES), 120, glyphs).unwrap().len(),
+                MAX_NODES * 4 - 1
+            );
+            assert_eq!(
+                render(&compact(MAX_NODES + 1), 120, glyphs),
+                Err(Unavailable::Unsupported)
+            );
 
-        let mut source = compact(3);
-        source.push_str(&" ".repeat(MAX_SOURCE_BYTES - source.len()));
-        assert_eq!(render(&source, 120).unwrap().len(), 11);
-        source.push(' ');
-        assert_eq!(render(&source, 120), Err(Unavailable::Unsupported));
+            let mut source = compact(3);
+            source.push_str(&" ".repeat(MAX_SOURCE_BYTES - source.len()));
+            assert_eq!(render(&source, 120, glyphs).unwrap().len(), 11);
+            source.push(' ');
+            assert_eq!(render(&source, 120, glyphs), Err(Unavailable::Unsupported));
+        }
     }
 
     #[test]
     fn unicode_connectors_align_at_the_exact_cell_width() {
         let source = "flowchart TD\nA[检查 👩‍💻] --> B[结果]";
-        let rows = render(source, 11).unwrap();
+        let rows = render(source, 11, Unicode).unwrap();
         let content: Vec<_> = rows.iter().map(ToString::to_string).collect();
         assert_eq!(
             content,
@@ -612,7 +687,7 @@ mod tests {
             ]
         );
         assert!(rows.iter().all(|row| row.width() <= 11));
-        assert_eq!(render(source, 10), Err(Unavailable::TooWide));
+        assert_eq!(render(source, 10, Unicode), Err(Unavailable::TooWide));
     }
 
     #[test]
@@ -623,7 +698,7 @@ mod tests {
             "  A --> B\r\n",
             "  A[检查 👩‍💻]\r\n",
         );
-        let rows = render(source, 22).unwrap();
+        let rows = render(source, 22, Unicode).unwrap();
         assert_eq!(
             rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
             [
@@ -633,7 +708,7 @@ mod tests {
             ]
         );
         assert!(rows.iter().all(|row| row.width() == 22));
-        assert_eq!(render(source, 21), Err(Unavailable::TooWide));
+        assert_eq!(render(source, 21, Unicode), Err(Unavailable::TooWide));
     }
 
     #[test]
@@ -645,7 +720,7 @@ mod tests {
             "B --> C\n",
             "A(\"检查 👩‍💻\")\n",
         );
-        let rows = render(source, 11).unwrap();
+        let rows = render(source, 11, Unicode).unwrap();
         assert_eq!(
             rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
             [
@@ -662,13 +737,13 @@ mod tests {
                 "└─────────┘",
             ]
         );
-        assert_eq!(render(source, 10), Err(Unavailable::TooWide));
+        assert_eq!(render(source, 10, Unicode), Err(Unavailable::TooWide));
     }
 
     #[test]
     fn horizontal_round_node_accepts_quoted_parentheses_and_fits_by_cells() {
         let source = "flowchart LR\nB[Done]\nA --> B\nA(\"Plan (ok)\")";
-        let rows = render(source, 24).unwrap();
+        let rows = render(source, 24, Unicode).unwrap();
         assert_eq!(
             rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
             [
@@ -678,8 +753,56 @@ mod tests {
             ]
         );
         assert!(rows.iter().all(|row| row.width() == 24));
-        assert_eq!(render(source, 23), Err(Unavailable::TooWide));
-        assert!(render("graph LR\nA(\"- note -\") --> B(Task-)", 60).is_ok());
-        assert!(render("graph LR\nA(\"One | Two\") --> B(/review)", 60).is_ok());
+        assert_eq!(render(source, 23, Unicode), Err(Unavailable::TooWide));
+        assert!(render("graph LR\nA(\"- note -\") --> B(Task-)", 60, Unicode).is_ok());
+        assert!(render("graph LR\nA(\"One | Two\") --> B(/review)", 60, Unicode).is_ok());
+    }
+
+    #[test]
+    fn ascii_glyphs_preserve_shapes_and_label_cells_at_the_same_boundaries() {
+        let fixtures: [(&str, usize, &[&str]); 2] = [
+            (
+                "flowchart TD",
+                11,
+                &[
+                    ".---------.",
+                    "| 检查 👩‍💻 |",
+                    "'----+----'",
+                    "     v 审核",
+                    "+----+----+",
+                    "| 结果    |",
+                    "+---------+",
+                ],
+            ),
+            (
+                "graph LR",
+                25,
+                &[
+                    ".---------. 审核 +------+",
+                    "| 检查 👩‍💻 +----->+ 结果 |",
+                    "'---------'      +------+",
+                ],
+            ),
+        ];
+        for (header, width, expected) in fixtures {
+            let source = format!("{header}\nA(检查 👩‍💻) -->|审核| B[结果]");
+            let ascii = render(&source, width, Ascii).unwrap();
+            let unicode = render(&source, width, Unicode).unwrap();
+            let content: Vec<_> = ascii.iter().map(ToString::to_string).collect();
+            assert_eq!(content, expected);
+            assert_eq!(ascii.len(), unicode.len());
+            for (ascii_row, unicode_row) in content.iter().zip(&unicode) {
+                assert_eq!(
+                    grapheme_cell_width(ascii_row),
+                    grapheme_cell_width(&unicode_row.to_string())
+                );
+            }
+            for glyphs in [Ascii, Unicode] {
+                assert_eq!(
+                    render(&source, width - 1, glyphs),
+                    Err(Unavailable::TooWide)
+                );
+            }
+        }
     }
 }
