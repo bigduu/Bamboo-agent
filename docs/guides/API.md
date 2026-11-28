@@ -838,6 +838,24 @@ continue to filter `skills` and its top-level `total`. Skill enablement comes
 from the existing configuration. Omitting `include_management` or setting it to
 `false` returns the original list shape.
 
+#### Advisory Skill quality
+
+Each management row includes `quality` with `score_version`, `state`, `score`,
+and `suggestions`. Version 1 returns a `rated` integer from 0 to 100 when the
+current instructions can be assessed. An `unavailable` assessment carries a
+`null` score and an empty suggestion list. Retained and view-only rows use this
+state, as do instructions longer than 65,536 Unicode characters.
+
+The static rubric starts at 100 and suggests a use case when the display text
+offers no context beyond the title. It also looks for visible steps or prose,
+order and verification in multi-part instructions, and direct Markdown links
+to published files in the `references/`, `assets/`, and `scripts/` directories. Each suggestion
+has a stable `code`, a neutral `message`, and a `location` for the field or
+instructions it describes.
+
+The score is informational. Enablement, availability, and activation use their
+existing rules.
+
 ---
 
 ### Health Check

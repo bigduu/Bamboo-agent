@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use actix_web::{web, HttpResponse};
 use bamboo_skills::catalog::{WorkflowCatalogSnapshot, WorkflowStatus};
+use bamboo_skills::store::SkillQuality;
 use bamboo_skills::types::{SkillDefinition, SkillFilter};
 
 use crate::app_state::AppState;
@@ -30,8 +31,10 @@ pub async fn list_skills(
     };
     let store = state.skill_manager.as_ref().store();
     let (skills, management) = if query.include_management.unwrap_or(false) {
-        let (mut skills, catalog) = store.skills_and_catalog_snapshot(None, refresh).await;
-        let management = project_management(catalog, &skills);
+        let (mut skills, catalog, quality) = store
+            .skills_catalog_and_quality_snapshot(None, refresh)
+            .await;
+        let management = project_management(catalog, &skills, &quality);
         skills.retain(|skill| filter.matches(skill));
         (skills, Some(management))
     } else {
@@ -55,6 +58,7 @@ pub async fn list_skills(
 fn project_management(
     catalog: WorkflowCatalogSnapshot,
     skills: &[SkillDefinition],
+    quality: &HashMap<String, SkillQuality>,
 ) -> SkillManagementSnapshot {
     let readable_ids: HashSet<_> = skills.iter().map(|skill| skill.id.as_str()).collect();
     let entries: Vec<_> = catalog
@@ -67,6 +71,10 @@ fn project_management(
                 (WorkflowStatus::Invalid, true) => SkillAvailability::Retained,
                 (_, false) => SkillAvailability::ViewOnly,
             };
+            let quality = quality
+                .get(&entry.id)
+                .cloned()
+                .unwrap_or_else(SkillQuality::unavailable);
             SkillManagementEntry {
                 id: entry.id,
                 name: entry.name,
@@ -74,6 +82,7 @@ fn project_management(
                 source: entry.source,
                 revision: entry.revision,
                 availability,
+                quality,
             }
         })
         .collect();

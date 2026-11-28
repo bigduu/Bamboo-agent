@@ -1,4 +1,5 @@
 use bamboo_skills::catalog::WorkflowSource;
+use bamboo_skills::store::SkillQuality;
 use bamboo_skills::types::SkillDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,6 +27,7 @@ pub(super) struct SkillManagementEntry {
     pub(super) source: WorkflowSource,
     pub(super) revision: u64,
     pub(super) availability: SkillAvailability,
+    pub(super) quality: SkillQuality,
 }
 
 #[derive(Serialize)]

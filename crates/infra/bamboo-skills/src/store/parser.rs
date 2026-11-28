@@ -277,18 +277,10 @@ fn markdown_display_fields(body: &str) -> (Option<&str>, String) {
     let mut title = None;
     while let Some((start, line)) = lines.next() {
         let text = line.trim();
-        if let Some((marker, length)) = markdown_fence(line) {
-            let _ = lines.by_ref().find(|(_, line)| {
-                let text = line.trim();
-                !indented_code(line)
-                    && text.len() >= length
-                    && text.chars().all(|character| character == marker)
-            });
-        } else if text.starts_with("<!--") {
-            if !text.contains("-->") {
-                let _ = lines.by_ref().find(|(_, line)| line.contains("-->"));
-            }
-        } else if let Some(heading) = markdown_heading(line) {
+        if skip_literal_markdown_block(line, &mut lines.by_ref().map(|(_, line)| line)) {
+            continue;
+        }
+        if let Some(heading) = markdown_heading(line) {
             if !heading.is_empty() {
                 title.get_or_insert(heading);
             }
@@ -324,6 +316,28 @@ fn markdown_display_fields(body: &str) -> (Option<&str>, String) {
     (title, String::new())
 }
 
+pub(super) fn skip_literal_markdown_block<'a>(
+    line: &str,
+    lines: &mut impl Iterator<Item = &'a str>,
+) -> bool {
+    if let Some((marker, length)) = markdown_fence(line) {
+        let _ = lines.find(|line| {
+            let text = line.trim();
+            !indented_code(line)
+                && text.len() >= length
+                && text.chars().all(|character| character == marker)
+        });
+        return true;
+    }
+    if line.trim().starts_with("<!--") {
+        if !line.contains("-->") {
+            let _ = lines.find(|line| line.contains("-->"));
+        }
+        return true;
+    }
+    false
+}
+
 fn markdown_fence(line: &str) -> Option<(char, usize)> {
     if indented_code(line) {
         return None;
@@ -340,7 +354,7 @@ fn markdown_fence(line: &str) -> Option<(char, usize)> {
     (length >= 3).then_some((marker, length))
 }
 
-fn setext_underline(line: &str) -> bool {
+pub(super) fn setext_underline(line: &str) -> bool {
     if indented_code(line) {
         return false;
     }
@@ -350,7 +364,7 @@ fn setext_underline(line: &str) -> bool {
     })
 }
 
-fn markdown_heading(line: &str) -> Option<&str> {
+pub(super) fn markdown_heading(line: &str) -> Option<&str> {
     if indented_code(line) {
         return None;
     }
@@ -367,7 +381,7 @@ fn markdown_heading(line: &str) -> Option<&str> {
     Some(title.trim())
 }
 
-fn prose_line(line: &str) -> bool {
+pub(super) fn prose_line(line: &str) -> bool {
     let text = line.trim();
     let block_prefixes = ["```", "~~~", "<!--", "![", "[!["];
     !text.is_empty()
@@ -378,7 +392,7 @@ fn prose_line(line: &str) -> bool {
         && !block_prefixes.iter().any(|prefix| text.starts_with(prefix))
 }
 
-fn list_or_quote(text: &str) -> bool {
+pub(super) fn list_or_quote(text: &str) -> bool {
     text.starts_with('>')
         || text.split_whitespace().next().is_some_and(|prefix| {
             matches!(prefix, "-" | "+" | "*")
@@ -388,7 +402,7 @@ fn list_or_quote(text: &str) -> bool {
         })
 }
 
-fn thematic_break(text: &str) -> bool {
+pub(super) fn thematic_break(text: &str) -> bool {
     let mut markers = text.bytes().filter(|byte| !byte.is_ascii_whitespace());
     let Some(marker @ (b'-' | b'*' | b'_')) = markers.next() else {
         return false;
@@ -396,7 +410,7 @@ fn thematic_break(text: &str) -> bool {
     markers.clone().take(2).count() == 2 && markers.all(|byte| byte == marker)
 }
 
-fn indented_code(line: &str) -> bool {
+pub(super) fn indented_code(line: &str) -> bool {
     line.starts_with("    ") || line.trim_start_matches(' ').starts_with('\t')
 }
 
