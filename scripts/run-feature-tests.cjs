@@ -304,7 +304,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // server-tests-1. Cargo features and additive case selections stay the same.
 // #3268 updates the Ticket command source. Draft context uses the default
 // project_board integration target in packages-0. Additive selections stay intact.
-const FEATURE_SOURCE_SHA256 = "ca0cf1b352cc4b388c442598b6099a15407af35f55c9ebf7311c40b54b39893f";
+// The Ticket Creator changes the existing Server Tools and Engine sources.
+// Its native Project admission case uses native_work_acceptance in
+// server-tests-1. Additive selections stay intact.
+const FEATURE_SOURCE_SHA256 = "a9a80c4ac31f9985f4d3e02487d79004eda9693019949b4b055fc363a11c61ed";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

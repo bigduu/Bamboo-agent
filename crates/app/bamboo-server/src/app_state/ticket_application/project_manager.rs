@@ -11,7 +11,7 @@ use bamboo_engine::session_app::session_create::{
 use serde::Deserialize;
 use std::path::Path;
 
-const MANAGER_PROMPT: &str = "You are this Project's Project Manager. Use project_manager_work to list Work and its Sections or inspect the exact Work ID. If the tool is deferred, discover it by name. When instructed to start Work, select the requested Section or an existing Section that fits its content. Report the committed dispatch and let the Work Session execute. A submission awaits user acceptance.";
+const MANAGER_PROMPT: &str = "You are this Project's Project Manager. Use project_manager_work to list Work and its Sections or inspect the exact Work ID. If the tool is deferred, discover it by name. For a separately tracked follow-up, use SubAgent with role=ticket-creator and wait for the Work receipt. When instructed to start Work, select the requested Section or an existing Section that fits its content. Report the committed dispatch and let the Work Session execute. A submission awaits user acceptance.";
 
 pub async fn open(
     state: web::Data<super::super::AppState>,
@@ -193,7 +193,7 @@ fn project_board_request(
     }
 }
 
-fn operation_key(
+pub(super) fn operation_key(
     kind: &str,
     caller: &SessionCallerReference,
     project_id: &ProjectId,
@@ -211,7 +211,7 @@ fn operation_key(
     .to_string())
 }
 
-fn coordinator() -> Principal {
+pub(super) fn coordinator() -> Principal {
     Principal::Supervisor {
         session_id: DEFAULT_SUPERVISOR_SESSION_ID.into(),
     }
@@ -324,10 +324,10 @@ impl TicketApplication {
         }
     }
 
-    async fn verify_project_manager(
+    pub(super) async fn resolve_project_caller(
         &self,
         caller: &SessionCallerReference,
-    ) -> Result<ProjectManifest> {
+    ) -> Result<(ProjectManifest, Session)> {
         let host = self.managed_work_host.get().ok_or_else(|| {
             Error::AuthorityUnavailable("Project Work Host is unavailable".into())
         })?;
@@ -342,6 +342,14 @@ impl TicketApplication {
         let project_id =
             ProjectId::parse(&project_id).map_err(|error| Error::ScopeDenied(error.to_string()))?;
         let project = active_project(&host.creator.projects, &project_id)?;
+        Ok((project, current))
+    }
+
+    async fn verify_project_manager(
+        &self,
+        caller: &SessionCallerReference,
+    ) -> Result<ProjectManifest> {
+        let (project, current) = self.resolve_project_caller(caller).await?;
         if !manager_matches(&project, &current) {
             return Err(Error::ScopeDenied(
                 "This Project's verified Project Manager is required".into(),

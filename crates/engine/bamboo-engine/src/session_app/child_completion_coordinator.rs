@@ -796,6 +796,12 @@ fn typed_child_resume_message(
             completion.child_session_id
         ),
         (Some("planner_artifact"), _) => "The saved planner result is unavailable.".into(),
+        (Some("ticket_draft"), Some(true)) => {
+            "Use the Host-confirmed Work ID and surface any open questions.".into()
+        }
+        (Some("ticket_draft"), _) => {
+            "Report the specific draft blocker or ask the returned question.".into()
+        }
         _ => format!(
             "For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors."
         ),
@@ -941,6 +947,8 @@ pub struct ChildCompletionCoordinator {
     root_account_sink: Option<Arc<crate::events::AccountEventSink>>,
     root_title_context: Arc<OnceLock<Weak<dyn AgentSessionContext>>>,
     root_tools: Arc<RwLock<Option<Arc<dyn ToolExecutor>>>>,
+    ticket_draft_publisher:
+        Option<Weak<dyn super::child_session::ticket_creator::TicketDraftPublisher>>,
     reserved_root_adapter: Arc<StdRwLock<Option<ReservedRootExecutionAdapter>>>,
     /// Late-bound guardian reviewer spawner, set post-construction by the server
     /// (mirrors `root_tools`). Re-injected into resumed runs so a guardian's
@@ -954,6 +962,14 @@ pub struct ChildCompletionCoordinator {
 }
 
 impl ChildCompletionCoordinator {
+    pub fn with_ticket_draft_publisher(
+        mut self,
+        publisher: Arc<dyn super::child_session::ticket_creator::TicketDraftPublisher>,
+    ) -> Self {
+        self.ticket_draft_publisher = Some(Arc::downgrade(&publisher));
+        self
+    }
+
     pub fn with_root_account_sink(mut self, sink: Arc<crate::events::AccountEventSink>) -> Self {
         self.root_account_sink = Some(sink);
         self
@@ -988,6 +1004,7 @@ impl ChildCompletionCoordinator {
             root_account_sink: None,
             root_title_context: Arc::default(),
             root_tools: Arc::new(RwLock::new(None)),
+            ticket_draft_publisher: None,
             reserved_root_adapter: Arc::new(StdRwLock::new(None)),
             guardian_spawner: Arc::new(RwLock::new(None)),
             spawn_scheduler: Arc::new(RwLock::new(Weak::new())),
@@ -1047,6 +1064,37 @@ impl ChildCompletionCoordinator {
 
     pub async fn set_root_tools(&self, tools: Arc<dyn ToolExecutor>) {
         *self.root_tools.write().await = Some(tools);
+    }
+
+    async fn project_child_completion(
+        &self,
+        completion: &ChildCompletion,
+        child: &Session,
+        parent: &Session,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let publisher = self.ticket_draft_publisher.as_ref().and_then(Weak::upgrade);
+        if let Some(draft) = super::child_session::ticket_creator::publish_completion(
+            publisher.as_deref(),
+            completion,
+            child,
+            parent,
+        )
+        .await?
+        {
+            return Ok(Some(draft));
+        }
+        match super::child_session::planner_artifact::publish_completion(
+            &self.app_data_dir,
+            completion,
+            child,
+            parent,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        {
+            Some(projection) => Ok(Some(projection)),
+            None => Ok(sealed_child_report(completion, child, parent)),
+        }
     }
 
     pub async fn set_spawn_scheduler(&self, scheduler: &Arc<SpawnScheduler>) {
@@ -1973,19 +2021,14 @@ impl ChildCompletionCoordinator {
                 SessionActivationPolicy::InterruptSpecificWait
             };
             let mut typed_result = if let Some(child) = loaded_child.as_ref() {
-                match super::child_session::planner_artifact::publish_completion(
-                    &self.app_data_dir,
-                    &completion,
-                    child,
-                    &parent,
-                )
-                .await
+                match self
+                    .project_child_completion(&completion, child, &parent)
+                    .await
                 {
-                    Ok(Some(projection)) => Some(projection),
-                    Ok(None) => sealed_child_report(&completion, child, &parent),
+                    Ok(projection) => projection,
                     Err(error) => {
                         tracing::warn!(%error, child_session_id = %child.id,
-                            "planner artifact publication failed; leaving wait armed");
+                            "Child result publication failed; leaving wait armed");
                         return;
                     }
                 }
@@ -2221,25 +2264,17 @@ impl ChildCompletionCoordinator {
                             .source
                             .as_ref()
                             .and_then(|source| source.result(&sibling, &parent));
-                        let mut typed_result =
-                            match super::child_session::planner_artifact::publish_completion(
-                                &self.app_data_dir,
-                                &sibling_completion,
-                                &sibling,
-                                &parent,
-                            )
+                        let mut typed_result = match self
+                            .project_child_completion(&sibling_completion, &sibling, &parent)
                             .await
-                            {
-                                Ok(Some(projection)) => Some(projection),
-                                Ok(None) => {
-                                    sealed_child_report(&sibling_completion, &sibling, &parent)
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%error, %child_id,
-                                    "sibling planner artifact publication failed; leaving wait armed");
-                                    return;
-                                }
-                            };
+                        {
+                            Ok(projection) => projection,
+                            Err(error) => {
+                                tracing::warn!(%error, %child_id,
+                                    "Sibling result publication failed; leaving wait armed");
+                                return;
+                            }
+                        };
                         let mut presentation = if let Some(projection) = typed_result.as_ref() {
                             typed_child_resume_message(
                                 &sibling_completion,

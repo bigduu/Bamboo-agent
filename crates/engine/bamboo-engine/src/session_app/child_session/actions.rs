@@ -154,6 +154,16 @@ async fn create_child_action_inner(
                 .await?
         }
     };
+    let ticket_creator = profile
+        .as_ref()
+        .is_some_and(super::named_profile::ResolvedChildProfile::ticket_creator);
+    if input.subagent_type == bamboo_domain::session::tool_authority::TICKET_CREATOR_ROLE
+        && !ticket_creator
+    {
+        return Err(ChildSessionError::Execution(
+            "The built-in Ticket Creator is unavailable".into(),
+        ));
+    }
     if shared_workspace
         && input
             .runtime_metadata
@@ -206,7 +216,16 @@ async fn create_child_action_inner(
         // The strict route protects the complete assignment in task_brief.
         // Do not duplicate it as the default objective: both fields are rendered
         // and counted against the required-context budget.
-        if !input
+        if ticket_creator {
+            let parent = port.load_parent_session(&input.parent_session.id).await?;
+            let packet = super::ticket_creator::draft_context(&parent)?;
+            input.runtime_metadata.insert(
+                bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
+                serde_json::to_string(&packet).map_err(|_| {
+                    ChildSessionError::InvalidArguments("invalid_ticket_creator_context".into())
+                })?,
+            );
+        } else if !input
             .runtime_metadata
             .contains_key(bamboo_domain::CHILD_PACKET_INPUT_KEY)
         {
@@ -663,8 +682,10 @@ async fn create_child_action_inner(
             serde_json::to_string(ticket_context)
                 .map_err(|e| ChildSessionError::Execution(e.to_string()))?,
         );
-    } else if let Some(parent_task_list) = input.parent_session.task_list.clone() {
-        child.set_task_list(parent_task_list);
+    } else if !ticket_creator {
+        if let Some(parent_task_list) = input.parent_session.task_list.clone() {
+            child.set_task_list(parent_task_list);
+        }
     }
 
     // Persist any per-child tool denylist so the spawn path (enqueue_child_run

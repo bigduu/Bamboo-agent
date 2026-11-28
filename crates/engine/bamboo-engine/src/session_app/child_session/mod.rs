@@ -19,6 +19,7 @@ pub mod owned_tree;
 pub mod planner_artifact;
 pub(crate) mod result_projection;
 mod shared_workspace;
+pub mod ticket_creator;
 
 #[cfg(test)]
 mod tests;

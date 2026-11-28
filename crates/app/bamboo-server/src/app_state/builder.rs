@@ -915,7 +915,8 @@ impl AppState {
                 data_dir.clone(),
                 Some(account_sink.inbox()),
             )
-            .with_root_account_sink(account_sink.clone()),
+            .with_root_account_sink(account_sink.clone())
+            .with_ticket_draft_publisher(tickets.clone()),
         );
         session_activation_router
             .set_spawner(child_completion_coordinator.clone())

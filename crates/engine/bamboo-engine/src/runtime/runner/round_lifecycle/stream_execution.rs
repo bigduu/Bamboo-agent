@@ -36,7 +36,8 @@ use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, CapabilityLoadingMode, CompressionEventKind,
     CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
-    ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    ProviderProtocol, ReasoningEffort, DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+    MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::cache::AnthropicHistoryCache;
 use bamboo_llm::provider::{
@@ -1404,6 +1405,44 @@ fn build_request_envelope_reconciled_for_loading_mode<'a>(
             loading_mode,
             permission_mode,
         ));
+        if config.ticket_worker_plan.is_none()
+            && session.kind == bamboo_domain::SessionKind::Root
+            && session.project_id_meta().is_some()
+            && session.supervisor_incarnation_id().is_none()
+            && !session.allows_model_tool_execution("project_manager_work")
+            && tool_schemas
+                .iter()
+                .any(|tool| tool.function.name == "SubAgent")
+            && !ToolExecutionSessionFlags::from_session_and_configured_mode(
+                session,
+                permission_mode,
+            )
+            .plan_read_only
+        {
+            let wire_has = |name| {
+                wire_tool_schemas
+                    .iter()
+                    .any(|tool| tool.function.name == name)
+            };
+            let hint = if wire_has("SubAgent") {
+                Some("For work needing separate tracking, later follow-up, or handoff, call SubAgent with role=ticket-creator and wait for its Work receipt.")
+            } else if wire_has(DISCOVERY_CONTROL_FALLBACK_TOOL_NAME) {
+                Some("For work needing separate tracking, later follow-up, or handoff, call discover_capabilities with query=SubAgent to load it, then use SubAgent with role=ticket-creator and wait for its Work receipt.")
+            } else if loading_mode == CapabilityLoadingMode::Progressive {
+                Some("For work needing separate tracking, later follow-up, or handoff, use tool discovery to load SubAgent, then call it with role=ticket-creator and wait for its Work receipt.")
+            } else {
+                None
+            };
+            current_context.extend(hint.map(|hint| {
+                ContextBlock::new(
+                    ContextBlockType::ToolGuide,
+                    ContextBlockPriority::High,
+                    ContextBlockStability::RoundDynamic,
+                    "Project Work",
+                    hint,
+                )
+            }));
+        }
     }
     // The agenda and tool guidance are current context, outside the
     // generated ledger. Present them before the user who owns this turn.

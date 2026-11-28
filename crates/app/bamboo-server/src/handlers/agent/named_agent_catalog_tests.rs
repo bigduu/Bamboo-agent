@@ -287,7 +287,7 @@ async fn existing_project_backup_recovery_is_usable_and_catalog_creates_no_agent
     let body: serde_json::Value = test::read_body_json(response).await;
     assert_eq!(body["status"], "available");
     let entries = body["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 3);
+    assert_eq!(entries.len(), 4);
     let names: std::collections::BTreeSet<_> = entries
         .iter()
         .map(|entry| {
@@ -300,7 +300,7 @@ async fn existing_project_backup_recovery_is_usable_and_catalog_creates_no_agent
         .collect();
     assert_eq!(
         names,
-        std::collections::BTreeSet::from(["explorer", "implementer", "reviewer"])
+        std::collections::BTreeSet::from(["explorer", "implementer", "reviewer", "ticket-creator"])
     );
     assert!(!body.to_string().contains("Builtin role package v1:"));
     assert_eq!(state.project_store.get(&id).unwrap().id, id); // Existing get recovered the authority; the catalog added no recovery protocol.

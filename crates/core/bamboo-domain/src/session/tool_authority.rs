@@ -105,6 +105,7 @@ pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 17] = [
 /// This marker only controls schema exposure. The server separately checks the
 /// manager's canonical Project binding and exact Session lifetime.
 pub const PROJECT_MANAGER_SESSION_HINT: &str = "runtime.project_manager_session";
+pub const TICKET_CREATOR_ROLE: &str = "ticket-creator";
 
 /// Server Work operations are exposed only to the trusted Supervisor.
 pub fn supervisor_work_tool(execution_name: &str) -> bool {
@@ -213,7 +214,7 @@ impl Session {
         if project_manager {
             return matches!(
                 execution_name,
-                "project_manager_work" | "session_history_current"
+                "project_manager_work" | "SubAgent" | "session_history_current"
             );
         }
         if execution_name == "project_manager_work" {

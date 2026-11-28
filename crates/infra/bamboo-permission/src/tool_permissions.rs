@@ -1287,6 +1287,17 @@ pub fn check_permissions(
                 return Ok(None);
             };
             match action.as_str() {
+                "create"
+                    if args.get("action").is_none()
+                        && args.get("role").and_then(Value::as_str)
+                            == Some(
+                                bamboo_domain::session::tool_authority::TICKET_CREATOR_ROLE,
+                            ) =>
+                {
+                    // The server binds this reserved role to a one-shot, tool-free
+                    // draft publisher with its own write-scope and feature checks.
+                    Ok(None)
+                }
                 // Spawn / run / drive a child agent = independent compute + full toolset.
                 "create" | "run" | "send_message" => Ok(Some(vec![PermissionContext::new(
                     PermissionType::ExecuteCommand,
