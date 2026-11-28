@@ -1,30 +1,36 @@
 //! The bounded input and sealed result seam for the built-in Ticket Creator.
 use super::{named_profile, result_projection, ChildSessionError};
 use crate::runtime::execution::{ChildCompletion, ChildCompletionSource};
-use bamboo_domain::{ChildContextBinding, ChildContextPacket, Role, Session};
+use bamboo_domain::session::history::is_hidden_from_ui;
+use bamboo_domain::{ChildContextBinding, ChildContextPacket, Message, Role, Session};
 use serde_json::Value;
+
+fn has_plain_text(message: &Message) -> bool {
+    !message.compressed
+        && !message.content.trim().is_empty()
+        && message.content_parts.as_ref().is_none_or(Vec::is_empty)
+        && message.tool_calls.as_ref().is_none_or(Vec::is_empty)
+}
 
 pub(super) fn draft_context(parent: &Session) -> Result<ChildContextPacket, ChildSessionError> {
     let mut recent = parent.messages.iter().rev().filter(|message| {
         matches!(message.role, Role::User | Role::Assistant)
-            && !message.compressed
-            && !message.content.trim().is_empty()
-            && message.content_parts.as_ref().is_none_or(Vec::is_empty)
-            && message.tool_calls.as_ref().is_none_or(Vec::is_empty)
-            && message.metadata.as_ref().is_none_or(|metadata| {
-                metadata.get("hidden_from_ui").is_none()
-                    && metadata.get("child_session_id").is_none()
-            })
+            && !is_hidden_from_ui(message)
+            && message
+                .metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.get("child_session_id").is_none())
     });
     let anchor = recent
         .find(|message| message.role == Role::User)
+        .filter(|message| has_plain_text(message))
         .ok_or_else(|| {
             ChildSessionError::InvalidArguments(
-                "Ticket Creator requires a source user message".into(),
+                "Ticket Creator requires the current source message in plain text".into(),
             )
         })?;
     let mut background_message_ids: Vec<_> = recent
-        .filter(|message| message.content.len() <= 1_024)
+        .filter(|message| has_plain_text(message) && message.content.len() <= 1_024)
         .take(3)
         .map(|message| message.id.clone())
         .collect();
@@ -96,4 +102,25 @@ pub(crate) async fn publish_completion(
         .publish_draft(parent, child, &context, report)
         .await
         .map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_domain::session::MessagePart;
+
+    #[test]
+    fn an_unsupported_current_source_does_not_fall_back_to_an_older_turn() {
+        let mut parent = Session::new("project-session", "model");
+        parent.add_message(Message::user("Older project request."));
+        let mut message = Message::user("Use the attached material.");
+        message.content_parts = Some(vec![MessagePart::Text {
+            text: message.content.clone(),
+        }]);
+        parent.add_message(message);
+        assert!(matches!(
+            draft_context(&parent),
+            Err(ChildSessionError::InvalidArguments(_))
+        ));
+    }
 }
