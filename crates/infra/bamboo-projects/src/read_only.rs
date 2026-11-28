@@ -76,7 +76,12 @@ fn read(
     let root = root_at(store.paths.data_dir())?;
     check_root(&root, store.paths.data_dir())?;
     let projects = open_at(&root, "projects", true)?;
-    let home = open_at(&projects, id.as_str(), true)?;
+    let home = open_at(&projects, id.as_str(), true).map_err(|error| match error {
+        ProjectStoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ProjectStoreError::NotFound(id.clone())
+        }
+        error => error,
+    })?;
     let lock = open_at(&home, ".project.lock", false)?;
     check_at(&home, ".project.lock", &lock, false)?;
     FileExt::try_lock_shared(&lock)?;

@@ -3066,6 +3066,13 @@ pub fn parse_anthropic_sse_event(
             }
 
             let v: Value = serde_json::from_str(data)?;
+            if let Some(diagnostics) = state
+                .completion_diagnostics
+                .as_ref()
+                .filter(|diagnostics| diagnostics.observes_single_answer())
+            {
+                diagnostics.observe_event(event_type, &v);
+            }
             let Some(delta) = v.get("delta") else {
                 return Ok(None);
             };

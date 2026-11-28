@@ -206,7 +206,9 @@ impl GeminiProviderUsage {
 }
 
 impl GeminiStreamState {
-    pub(super) fn with_diagnostics(diagnostics: Option<CompletionDiagnostics>) -> Self {
+    pub(in crate::providers) fn with_diagnostics(
+        diagnostics: Option<CompletionDiagnostics>,
+    ) -> Self {
         Self {
             decode_observation: DecodeObservation {
                 diagnostics,
@@ -388,7 +390,12 @@ pub fn parse_gemini_sse_event(
         return Ok(vec![LLMChunk::Done]);
     }
 
-    if matches!(event_type, "" | "message") && !state.captures_native_replay() {
+    let single_answer = state
+        .decode_observation
+        .diagnostics
+        .as_ref()
+        .is_some_and(|diagnostics| diagnostics.observes_single_answer());
+    if matches!(event_type, "" | "message") && !state.captures_native_replay() && !single_answer {
         // The strict subset has no usage/finish markers, tool calls, or
         // replay effects. Plain text borrows from the frame until it is sent.
         if let Some(text) = text_frame::decode(data) {
@@ -411,19 +418,25 @@ pub fn parse_gemini_sse_event(
             diagnostics.observe_event(event_type, &value);
         }
     }
-    let chunks = parse_gemini_frame(state, &value, data)?;
+    let mut chunks = parse_gemini_frame(state, &value, data)?;
     #[cfg(feature = "litellm-wire-types")]
-    let chunks = {
-        let mut chunks = chunks;
-        if let Some(item) = state
-            .native_replay
-            .as_mut()
-            .and_then(|capture| capture.observe(&value, &chunks, data.len()))
-        {
-            chunks.push(item);
-        }
-        chunks
-    };
+    if let Some(item) = state
+        .native_replay
+        .as_mut()
+        .and_then(|capture| capture.observe(&value, &chunks, data.len()))
+    {
+        chunks.push(item);
+    }
+    // Gemini's native API reports its terminal state in the candidate frame.
+    // The bounded text request consumes that boundary before any usage trailer.
+    if single_answer
+        && value
+            .pointer("/candidates/0/finishReason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.is_empty())
+    {
+        chunks.push(LLMChunk::Done);
+    }
     Ok(chunks)
 }
 

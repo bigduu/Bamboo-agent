@@ -580,7 +580,12 @@ impl BodhiProvider {
             )));
         }
 
-        let mut state = GeminiStreamState::default();
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
+        let mut state = GeminiStreamState::with_diagnostics(
+            completion_diagnostics
+                .clone()
+                .filter(|diagnostics| diagnostics.observes_single_answer()),
+        );
         #[cfg(feature = "litellm-wire-types")]
         if self.litellm_wire_types {
             state.enable_litellm_tool_ids();
@@ -588,11 +593,13 @@ impl BodhiProvider {
         // Multi-chunk adapter: a final Gemini `usageMetadata` carries both a
         // cache hit and output/thinking usage in one event, and the stream sends
         // no [DONE], so both must be emitted from that single event (issue #27).
-        let completion_diagnostics = crate::provider::current_completion_diagnostics();
         let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
             response,
             move |event, data| {
-                if let Some(diagnostics) = &completion_diagnostics {
+                if let Some(diagnostics) = completion_diagnostics
+                    .as_ref()
+                    .filter(|diagnostics| !diagnostics.observes_single_answer())
+                {
                     diagnostics.observe_sse(event, data);
                 }
                 let chunks = parse_gemini_sse_event(&mut state, event, data)?;

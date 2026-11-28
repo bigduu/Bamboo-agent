@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
 
+pub(crate) mod category_suggestion;
+
 #[derive(Debug, Deserialize)]
 pub struct CreateProjectRequest {
     pub name: String,

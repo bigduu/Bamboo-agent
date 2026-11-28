@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use bamboo_domain::{Message, ReasoningEffort, TokenUsage};
+use bamboo_domain::{Message, ProviderTranscriptItemKind, ReasoningEffort, TokenUsage};
 use futures::{future::BoxFuture, StreamExt};
 use reqwest::{Client, RequestBuilder, Response};
 use tokio::time::{timeout, timeout_at, Instant};
@@ -24,6 +24,7 @@ const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_STREAM_FRAMES: usize = 65_536;
 pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_TIME: Duration = Duration::from_secs(60);
+const SESSION_CATEGORY_SUGGESTION: &str = "session_category_suggestion";
 
 tokio::task_local! {
     static WORK_TEXT: Dispatch;
@@ -119,6 +120,7 @@ pub struct WorkTextObservations {
     /// UTF-8 bytes of ordinary text before Done, including rejected text.
     pub text_bytes: usize,
     pub unexpected_tools: bool,
+    pub invalid_single_answer: bool,
     pub text_overflow: bool,
     /// CompletionDiagnostics retains only recognized codes or other/unavailable.
     pub finish_reason: &'static str,
@@ -130,6 +132,7 @@ impl Default for WorkTextObservations {
             reasoning_seen: false,
             text_bytes: 0,
             unexpected_tools: false,
+            invalid_single_answer: false,
             text_overflow: false,
             finish_reason: "unavailable",
         }
@@ -227,6 +230,29 @@ pub async fn review_diagnosed(
     (reply, observations)
 }
 
+/// Complete one stateless Project category suggestion through the single-send transport.
+pub async fn session_category_suggestion(
+    client: &WorkTextClient,
+    provider: &dyn LLMProvider,
+    request: Request<'_>,
+) -> (WorkTextReply, WorkTextObservations) {
+    let mut observations = WorkTextObservations::default();
+    let reply = complete_with_options(
+        client,
+        provider,
+        request,
+        Arc::new(|| Box::pin(async { Ok(()) })),
+        LLMRequestOptions {
+            request_purpose: Some(SESSION_CATEGORY_SUGGESTION.into()),
+            reasoning_effort: Some(ReasoningEffort::Disabled),
+            ..Default::default()
+        },
+        &mut observations,
+    )
+    .await;
+    (reply, observations)
+}
+
 async fn complete_with_options(
     client: &WorkTextClient,
     provider: &dyn LLMProvider,
@@ -248,7 +274,12 @@ async fn complete_with_options(
     let transport = WorkPhysicalRequest::default();
     let admission_refused = Arc::new(AtomicBool::new(false));
     let physical_send_started = Arc::new(AtomicBool::new(false));
-    let completion = CompletionDiagnostics::default();
+    let single_answer = options.request_purpose.as_deref() == Some(SESSION_CATEGORY_SUGGESTION);
+    let completion = if single_answer {
+        CompletionDiagnostics::for_single_answer()
+    } else {
+        CompletionDiagnostics::default()
+    };
     let reply = scope_completion_diagnostics(
         completion.clone(),
         timeout(
@@ -324,12 +355,26 @@ async fn complete_with_options(
                                     }
                                 }
                             }
+                            LLMChunk::Token(token) if single_answer && !token.is_empty() => {
+                                observations.invalid_single_answer = true;
+                            }
                             LLMChunk::ReasoningToken(token) if !after_done && !token.is_empty() => {
                                 observations.reasoning_seen = true;
                             }
                             LLMChunk::ToolCalls(_) | LLMChunk::ToolCallsIndexed(_) => {
                                 observations.unexpected_tools = true;
                                 text = None;
+                            }
+                            LLMChunk::ProviderTranscriptItem(item)
+                                if single_answer
+                                    && (item.kind().is_discovery()
+                                        || matches!(
+                                            item.kind(),
+                                            ProviderTranscriptItemKind::OpenAiFunctionCall
+                                                | ProviderTranscriptItemKind::AnthropicToolUse
+                                        )) =>
+                            {
+                                observations.unexpected_tools = true;
                             }
                             _ => {}
                         }
@@ -341,6 +386,10 @@ async fn complete_with_options(
     )
     .await
     .unwrap_or(WorkTextReply::Unknown);
+    if single_answer {
+        observations.invalid_single_answer |= completion.invalid_single_answer();
+        observations.unexpected_tools |= completion.saw_provider_tool();
+    }
     observations.finish_reason = completion.finish_reason();
     if reply == WorkTextReply::Unknown
         && admission_refused.load(Ordering::Acquire)
