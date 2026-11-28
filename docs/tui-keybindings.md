@@ -37,6 +37,12 @@ new tool blocks, and toolbar hints for the current terminal process.
 **Mermaid diagrams** switches preview borders and connectors between Unicode and
 ASCII. The server configuration and permission policy entries open the
 corresponding Bamboo views.
+
+Settled Mermaid flowcharts can preview one connected path in `TD` or `LR`.
+For example, `A[Start] -->|ready| B{Check} --> C(Done)` shows a rectangle, a
+decision node, and a rounded node. A bare ID uses its label when one was
+defined. The transcript shows the source while the reply streams, when the
+syntax is unsupported, or when the diagram is wider than the terminal.
 Press `Esc` to park an approval in chat and `Ctrl+Q` to reopen it. The current
 draft remains in the composer.
 

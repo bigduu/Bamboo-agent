@@ -51,6 +51,7 @@ struct DiagramGlyphs {
     right_arrow: char,
     rectangle: [char; 4],
     rounded: [char; 4],
+    decision: [char; 4],
 }
 
 impl DiagramGlyphs {
@@ -67,6 +68,7 @@ impl DiagramGlyphs {
                 right_arrow: '→',
                 rectangle: ['┌', '┐', '└', '┘'],
                 rounded: ['╭', '╮', '╰', '╯'],
+                decision: ['╱', '╲', '╲', '╱'],
             },
             MermaidGlyphs::Ascii => Self {
                 rule: "-",
@@ -79,6 +81,7 @@ impl DiagramGlyphs {
                 right_arrow: '>',
                 rectangle: ['+'; 4],
                 rounded: ['.', '.', '\'', '\''],
+                decision: ['/', '\\', '\\', '/'],
             },
         }
     }
@@ -87,6 +90,7 @@ impl DiagramGlyphs {
         match shape {
             NodeShape::Rectangle => self.rectangle,
             NodeShape::Rounded => self.rounded,
+            NodeShape::Decision => self.decision,
         }
     }
 }
@@ -234,6 +238,7 @@ enum Direction {
 enum NodeShape {
     Rectangle,
     Rounded,
+    Decision,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,6 +425,8 @@ fn parse_node(input: &str) -> Option<(NodeRef<'_>, &str)> {
         Some(b'[') => (NodeShape::Rectangle, ']', &rest[1..]),
         // Mermaid reserves "(-" for ellipses.
         Some(b'(') if !rest.starts_with("(-") => (NodeShape::Rounded, ')', &rest[1..]),
+        // Double braces denote a different shape.
+        Some(b'{') if !rest.starts_with("{{") => (NodeShape::Decision, '}', &rest[1..]),
         _ => return Some((NodeRef { id, display: None }, rest.trim_ascii_start())),
     };
 
@@ -430,7 +437,7 @@ fn parse_node(input: &str) -> Option<(NodeRef<'_>, &str)> {
         let (label, rest) = body.split_once(closer)?;
         let unsupported_shape_text = match shape {
             NodeShape::Rectangle => label.trim_start().starts_with(['/', '|']),
-            NodeShape::Rounded => label.contains('|'),
+            NodeShape::Rounded | NodeShape::Decision => label.contains('|'),
         };
         if unsupported_shape_text || label.contains(['(', ')', '{', '}']) {
             return None;
@@ -802,6 +809,105 @@ mod tests {
                     render(&source, width - 1, glyphs),
                     Err(Unavailable::TooWide)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn decision_nodes_keep_mixed_shapes_at_exact_td_and_lr_widths() {
+        let fixtures: [(&str, MermaidGlyphs, usize, &[&str]); 4] = [
+            (
+                "flowchart TD",
+                Unicode,
+                11,
+                &[
+                    "┌─────────┐",
+                    "│ Start   │",
+                    "└────┬────┘",
+                    "     ↓",
+                    "╱────┴────╲",
+                    "│ 检查 👩‍💻 │",
+                    "╲────┬────╱",
+                    "     ↓ 审",
+                    "╭────┴────╮",
+                    "│ Done    │",
+                    "╰─────────╯",
+                ],
+            ),
+            (
+                "flowchart TD",
+                Ascii,
+                11,
+                &[
+                    "+---------+",
+                    "| Start   |",
+                    "+----+----+",
+                    "     v",
+                    "/----+----\\",
+                    "| 检查 👩‍💻 |",
+                    "\\----+----/",
+                    "     v 审",
+                    ".----+----.",
+                    "| Done    |",
+                    "'---------'",
+                ],
+            ),
+            (
+                "graph LR",
+                Unicode,
+                35,
+                &[
+                    "┌───────┐   ╱─────────╲ 审 ╭──────╮",
+                    "│ Start ├──→┤ 检查 👩‍💻 ├───→┤ Done │",
+                    "└───────┘   ╲─────────╱    ╰──────╯",
+                ],
+            ),
+            (
+                "graph LR",
+                Ascii,
+                35,
+                &[
+                    "+-------+   /---------\\ 审 .------.",
+                    "| Start +-->+ 检查 👩‍💻 +--->+ Done |",
+                    "+-------+   \\---------/    '------'",
+                ],
+            ),
+        ];
+        for (header, glyphs, width, expected) in fixtures {
+            let source = format!(
+                "{header}\r\nB -->|审| C(Done)\r\nB{{\"检查 👩‍💻\"}}\r\nA[Start] --> B\r\nB{{检查 👩‍💻}}"
+            );
+            let rows = render(&source, width, glyphs).unwrap();
+            let content: Vec<_> = rows.iter().map(ToString::to_string).collect();
+            assert_eq!(content, expected);
+            assert_eq!(
+                content.iter().map(|row| grapheme_cell_width(row)).max(),
+                Some(width)
+            );
+            assert_eq!(
+                render(&source, width - 1, glyphs),
+                Err(Unavailable::TooWide)
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_malformed_and_branched_decisions_in_both_modes() {
+        for body in [
+            "A{{Hexagon}} --> B",
+            "A{{\"Quoted hexagon\"}} --> B",
+            "A{Extra close}} --> B",
+            "A{\"Extra close\"}} --> B",
+            "A{Unclosed --> B",
+            "A{\"Unclosed quote} --> B",
+            "A{ } --> B",
+            "A{First | Second} --> B",
+            "A{Check} --> B\nA --> C",
+            "A{Check} --> B\nA[Check]",
+        ] {
+            let source = format!("flowchart TD\n{body}");
+            for glyphs in [Unicode, Ascii] {
+                assert_eq!(render(&source, 60, glyphs), Err(Unavailable::Unsupported));
             }
         }
     }
