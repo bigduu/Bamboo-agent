@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 
 use crate::text::grapheme_cell_width;
 
-use super::{DiagramGlyphs, Unavailable};
+use super::{first_word, DiagramGlyphs, Unavailable};
 
 const MAX_PARTICIPANTS: usize = 6;
 const MAX_MESSAGES: usize = 12;
@@ -254,13 +254,6 @@ fn is_plain_id(id: &str) -> bool {
         && !RESERVED_IDS.iter().any(|word| first.eq_ignore_ascii_case(word))
         // Mermaid can read -x as a cross arrow.
         && segments.all(|segment| !segment.is_empty() && !segment.starts_with(['x', 'X']))
-}
-
-fn first_word(text: &str) -> (&str, &str) {
-    let end = text
-        .find(|character: char| character.is_ascii_whitespace())
-        .unwrap_or(text.len());
-    (&text[..end], text[end..].trim_ascii_start())
 }
 
 struct Lane<'a> {

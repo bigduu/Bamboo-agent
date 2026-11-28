@@ -7,6 +7,7 @@ use crate::theme::colors;
 use super::MermaidGlyphs;
 
 mod sequence;
+mod state;
 
 const MAX_SOURCE_BYTES: usize = 4 * 1024;
 const MAX_NODES: usize = 8;
@@ -26,8 +27,8 @@ impl Unavailable {
     }
 }
 
-/// Render a bounded flowchart or sequence preview. The source picker retains
-/// the original fence.
+/// Render a bounded Mermaid preview. The source picker retains the original
+/// fence.
 pub(super) fn render(
     source: &str,
     width: usize,
@@ -42,8 +43,13 @@ pub(super) fn render(
         .lines()
         .map(str::trim_ascii)
         .filter(|line| !line.is_empty());
-    if statements.next() == Some("sequenceDiagram") {
-        return sequence::render(statements, width, border, &glyphs);
+    match statements.next() {
+        Some("sequenceDiagram") => return sequence::render(statements, width, border, &glyphs),
+        Some("stateDiagram-v2") => {
+            let path = state::parse(statements).ok_or(Unavailable::Unsupported)?;
+            return render_vertical(path, width, border, &glyphs);
+        }
+        _ => {}
     }
 
     let (direction, nodes) = parse_path(source).ok_or(Unavailable::Unsupported)?;
@@ -65,6 +71,8 @@ struct DiagramGlyphs {
     left_arrow: char,
     solid_connector: char,
     dotted_connector: char,
+    initial_state: char,
+    final_state: char,
     rectangle: [char; 4],
     rounded: [char; 4],
     decision: [char; 4],
@@ -85,6 +93,8 @@ impl DiagramGlyphs {
                 left_arrow: '←',
                 solid_connector: '─',
                 dotted_connector: '┄',
+                initial_state: '●',
+                final_state: '◎',
                 rectangle: ['┌', '┐', '└', '┘'],
                 rounded: ['╭', '╮', '╰', '╯'],
                 decision: ['╱', '╲', '╲', '╱'],
@@ -101,6 +111,8 @@ impl DiagramGlyphs {
                 left_arrow: '<',
                 solid_connector: '-',
                 dotted_connector: '.',
+                initial_state: '*',
+                final_state: '@',
                 rectangle: ['+'; 4],
                 rounded: ['.', '.', '\'', '\''],
                 decision: ['/', '\\', '\\', '/'],
@@ -142,34 +154,46 @@ fn render_vertical(
     let mut rows = Vec::with_capacity(nodes.len() * 4 - 1);
     let last_index = nodes.len() - 1;
     for (index, step) in nodes.into_iter().enumerate() {
-        let node = step.display;
-        let [top_left, top_right, bottom_left, bottom_right] = glyphs.corners(node.shape);
-        let top_center = if index == 0 {
-            glyphs.rule
-        } else {
-            glyphs.top_junction
+        let marker = match step.key {
+            NodeKey::Initial => Some(glyphs.initial_state),
+            NodeKey::Final => Some(glyphs.final_state),
+            NodeKey::Named(_) => None,
         };
-        let bottom_center = if index == last_index {
-            glyphs.rule
-        } else {
-            glyphs.bottom_junction
-        };
-        rows.push(Line::styled(
-            format!("{top_left}{rule_left}{top_center}{rule_right}{top_right}"),
-            border,
-        ));
-        rows.push(Line::from(vec![
-            Span::styled(format!("{side} "), border),
-            Span::raw(node.label.to_owned()),
-            Span::styled(
-                format!("{} {side}", " ".repeat(label_width - step.cells)),
+        if let Some(marker) = marker {
+            rows.push(Line::styled(
+                format!("{}{marker}", " ".repeat(center)),
                 border,
-            ),
-        ]));
-        rows.push(Line::styled(
-            format!("{bottom_left}{rule_left}{bottom_center}{rule_right}{bottom_right}"),
-            border,
-        ));
+            ));
+        } else {
+            let node = step.display;
+            let [top_left, top_right, bottom_left, bottom_right] = glyphs.corners(node.shape);
+            let top_center = if index == 0 {
+                glyphs.rule
+            } else {
+                glyphs.top_junction
+            };
+            let bottom_center = if index == last_index {
+                glyphs.rule
+            } else {
+                glyphs.bottom_junction
+            };
+            rows.push(Line::styled(
+                format!("{top_left}{rule_left}{top_center}{rule_right}{top_right}"),
+                border,
+            ));
+            rows.push(Line::from(vec![
+                Span::styled(format!("{side} "), border),
+                Span::raw(node.label.to_owned()),
+                Span::styled(
+                    format!("{} {side}", " ".repeat(label_width - step.cells)),
+                    border,
+                ),
+            ]));
+            rows.push(Line::styled(
+                format!("{bottom_left}{rule_left}{bottom_center}{rule_right}{bottom_right}"),
+                border,
+            ));
+        }
         if index != last_index {
             let row = match step.outgoing_label {
                 Some(label) => Line::from(vec![
@@ -269,9 +293,16 @@ struct NodeDisplay<'a> {
     shape: NodeShape,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeKey<'a> {
+    Named(&'a str),
+    Initial,
+    Final,
+}
+
 #[derive(Clone, Copy)]
 struct NodeRef<'a> {
-    id: &'a str,
+    key: NodeKey<'a>,
     display: Option<NodeDisplay<'a>>,
 }
 
@@ -294,6 +325,7 @@ struct Node<'a> {
 }
 
 struct PathStep<'a> {
+    key: NodeKey<'a>,
     display: NodeDisplay<'a>,
     cells: usize,
     outgoing_label: Option<EdgeLabel<'a>>,
@@ -332,16 +364,16 @@ fn parse_path(source: &str) -> Option<(Direction, Vec<PathStep<'_>>)> {
             let (label, after_link) = parse_link(rest)?;
             let (target, after_node) = parse_node(after_link)?;
             let to = register(&mut nodes, target)?;
-            if from == to || nodes[from].next.is_some() || nodes[to].incoming {
-                return None;
-            }
-            nodes[from].next = Some(Edge { target: to, label });
-            nodes[to].incoming = true;
+            link(&mut nodes, from, to, label)?;
             from = to;
             rest = after_node;
         }
     }
 
+    linked_path(&nodes, NodeShape::Rectangle).map(|path| (direction, path))
+}
+
+fn linked_path<'a>(nodes: &[Node<'a>], default_shape: NodeShape) -> Option<Vec<PathStep<'a>>> {
     if nodes.len() < 2 {
         return None;
     }
@@ -353,18 +385,23 @@ fn parse_path(source: &str) -> Option<(Direction, Vec<PathStep<'_>>)> {
     let mut path = Vec::with_capacity(nodes.len());
     for _ in 0..nodes.len() {
         let node = &nodes[index];
+        let key = node.reference.key;
         let display = node.reference.display.unwrap_or(NodeDisplay {
-            label: node.reference.id,
-            shape: NodeShape::Rectangle,
+            label: match key {
+                NodeKey::Named(id) => id,
+                NodeKey::Initial | NodeKey::Final => "",
+            },
+            shape: default_shape,
         });
         path.push(PathStep {
+            key,
             display,
             cells: grapheme_cell_width(display.label),
             outgoing_label: node.next.and_then(|edge| edge.label),
         });
         match node.next {
             Some(edge) => index = edge.target,
-            None => return (path.len() == nodes.len()).then_some((direction, path)),
+            None => return (path.len() == nodes.len()).then_some(path),
         }
     }
     None
@@ -390,7 +427,7 @@ fn parse_link(input: &str) -> Option<(Option<EdgeLabel<'_>>, &str)> {
 fn register<'a>(nodes: &mut Vec<Node<'a>>, reference: NodeRef<'a>) -> Option<usize> {
     if let Some(index) = nodes
         .iter()
-        .position(|node| node.reference.id == reference.id)
+        .position(|node| node.reference.key == reference.key)
     {
         if let Some(display) = reference.display {
             let saved = &mut nodes[index].reference.display;
@@ -410,6 +447,27 @@ fn register<'a>(nodes: &mut Vec<Node<'a>>, reference: NodeRef<'a>) -> Option<usi
         next: None,
     });
     Some(nodes.len() - 1)
+}
+
+fn link<'a>(
+    nodes: &mut [Node<'a>],
+    from: usize,
+    to: usize,
+    label: Option<EdgeLabel<'a>>,
+) -> Option<()> {
+    if from == to || nodes[from].next.is_some() || nodes[to].incoming {
+        return None;
+    }
+    nodes[from].next = Some(Edge { target: to, label });
+    nodes[to].incoming = true;
+    Some(())
+}
+
+fn first_word(text: &str) -> (&str, &str) {
+    let end = text
+        .find(|character: char| character.is_ascii_whitespace())
+        .unwrap_or(text.len());
+    (&text[..end], text[end..].trim_ascii_start())
 }
 
 fn parse_node(input: &str) -> Option<(NodeRef<'_>, &str)> {
@@ -446,7 +504,15 @@ fn parse_node(input: &str) -> Option<(NodeRef<'_>, &str)> {
         Some(b'(') if !rest.starts_with("(-") => (NodeShape::Rounded, ')', &rest[1..]),
         // Double braces denote a different shape.
         Some(b'{') if !rest.starts_with("{{") => (NodeShape::Decision, '}', &rest[1..]),
-        _ => return Some((NodeRef { id, display: None }, rest.trim_ascii_start())),
+        _ => {
+            return Some((
+                NodeRef {
+                    key: NodeKey::Named(id),
+                    display: None,
+                },
+                rest.trim_ascii_start(),
+            ));
+        }
     };
 
     let (label, rest) = if let Some(quoted) = body.strip_prefix('"') {
@@ -473,7 +539,7 @@ fn parse_node(input: &str) -> Option<(NodeRef<'_>, &str)> {
     }
     Some((
         NodeRef {
-            id,
+            key: NodeKey::Named(id),
             display: Some(NodeDisplay { label, shape }),
         },
         rest.trim_ascii_start(),
