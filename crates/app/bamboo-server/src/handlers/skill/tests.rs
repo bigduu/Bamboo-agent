@@ -163,7 +163,8 @@ async fn skill_management_lists_one_complete_publication_without_changing_legacy
     const PLAIN_SKILL: &str = concat!(
         "\u{feff}\n\n# Review ready\n\n",
         "![Status](badge.svg)\n\n",
-        "selection-needle winning instructions\n\nSecond paragraph.\n",
+        "selection-needle winning instructions\n\n",
+        "Second paragraph. [Guide](references/guide.md).\n",
     );
     let temp_dir = tempfile::tempdir().expect("temp data directory");
     let data = temp_dir.path();
@@ -192,6 +193,17 @@ async fn skill_management_lists_one_complete_publication_without_changing_legacy
             .await
             .unwrap();
     }
+    let oversized = data.join("skills/management-unrated");
+    tokio::fs::create_dir_all(&oversized).await.unwrap();
+    tokio::fs::write(
+        oversized.join("SKILL.md"),
+        format!(
+            "---\nname: Longer guide\ndescription: A complete longer guide\n---\n{}",
+            "Supplementary instruction.\n".repeat(3_000)
+        ),
+    )
+    .await
+    .unwrap();
     let agents = data.join("skills/management-ready/agents");
     tokio::fs::create_dir_all(&agents).await.unwrap();
     tokio::fs::write(
@@ -267,6 +279,7 @@ async fn skill_management_lists_one_complete_publication_without_changing_legacy
                 "source": entry.source,
                 "revision": entry.revision,
                 "availability": row["availability"],
+                "quality": row["quality"],
             })
         );
         assert!(matches!(
@@ -279,11 +292,34 @@ async fn skill_management_lists_one_complete_publication_without_changing_legacy
         ("management-ready", "ready"),
         ("management-disabled", "ready"),
         ("management-migrated", "ready"),
+        ("management-unrated", "ready"),
         ("management-retained", "retained"),
         ("management-view-only", "view_only"),
     ] {
         assert_eq!(row(id)["availability"], availability, "{id}");
     }
+    let unavailable = json!({
+        "score_version": 1, "state": "unavailable", "score": null, "suggestions": []
+    });
+    for id in [
+        "management-unrated",
+        "management-retained",
+        "management-view-only",
+    ] {
+        assert_eq!(row(id)["quality"], unavailable, "{id}");
+    }
+    assert_eq!(
+        row("management-disabled")["quality"],
+        json!({"score_version": 1, "state": "rated", "score": 100, "suggestions": []})
+    );
+    let ready_quality = &row("management-ready")["quality"];
+    assert_eq!(ready_quality["score"], 50);
+    assert_eq!(ready_quality["state"], "rated");
+    assert!(ready_quality["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["code"] == "review_references"));
     assert_eq!(row("management-ready")["source"], "user");
     assert_eq!(row("management-ready")["name"], "Review ready");
     assert_eq!(
@@ -325,6 +361,36 @@ async fn skill_management_lists_one_complete_publication_without_changing_legacy
     assert_eq!(including_disabled["skills"][0]["id"], "management-disabled");
     assert_eq!(including_disabled["skills"][1]["id"], "management-ready");
     assert_eq!(&including_disabled["management"], management);
+
+    let reference = data.join("skills/management-ready/references/guide.md");
+    tokio::fs::create_dir_all(reference.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(reference, "Supporting material.")
+        .await
+        .unwrap();
+    let refreshed =
+        get("/skills?search=selection-needle&refresh=true&include_management=true").await;
+    let refreshed_management = &refreshed["management"];
+    assert!(refreshed_management["revision"].as_u64().unwrap() > current.revision);
+    let refreshed_ready = refreshed_management["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "management-ready")
+        .unwrap();
+    assert_eq!(refreshed_ready["availability"], "ready");
+    assert_eq!(refreshed_ready["quality"]["score"], 65);
+    assert!(refreshed_ready["quality"]["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["code"] != "review_references"));
+    assert_eq!(refreshed["skills"], opted_in["skills"]);
+    assert_eq!(
+        get("/skills?search=selection-needle&refresh=true&include_management=true").await,
+        refreshed
+    );
 }
 
 #[actix_web::test]

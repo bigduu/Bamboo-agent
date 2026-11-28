@@ -49,7 +49,10 @@
 
 pub mod builtin;
 pub mod parser;
+mod quality;
 pub mod storage;
+
+pub use quality::SkillQuality;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 mod codex_frontmatter;
@@ -718,6 +721,7 @@ fn stable_workspace_hash(path: &Path) -> u64 {
 #[derive(Debug, Clone, Default)]
 struct SkillCatalogPublication {
     snapshot: WorkflowCatalogSnapshot,
+    quality: Arc<HashMap<SkillId, SkillQuality>>,
     legacy_resource_fallbacks: HashSet<SkillId>,
     /// Other scoped publications reuse a revision only while its exact
     /// captured source and content have a live publication owner.
@@ -2076,6 +2080,16 @@ impl SkillStore {
         {
             return Ok(count);
         }
+        let skill_quality = next_skill_catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.winner && entry.status == WorkflowStatus::Valid)
+            .filter_map(|entry| {
+                let skill = resolved_skills.get(&entry.id)?;
+                let resources = resolved_resources.get(&entry.id)?;
+                Some((entry.id.clone(), quality::assess(skill, resources)))
+            })
+            .collect();
         // The catalog and the exact YAML bytes are published together. Derive
         // eligibility once per publication for both UI and model discovery.
         let executable_ids = next_catalog
@@ -2157,6 +2171,7 @@ impl SkillStore {
         *resources_guard = resolved_resources;
         *skill_catalog_guard = SkillCatalogPublication {
             snapshot: next_skill_catalog.clone(),
+            quality: Arc::new(skill_quality),
             legacy_resource_fallbacks,
             _instruction_revisions: instruction_revisions,
         };
@@ -4398,6 +4413,22 @@ impl SkillStore {
         filter: Option<SkillFilter>,
         refresh: bool,
     ) -> (Vec<SkillDefinition>, WorkflowCatalogSnapshot) {
+        let (skills, catalog, _) = self
+            .skills_catalog_and_quality_snapshot(filter, refresh)
+            .await;
+        (skills, catalog)
+    }
+
+    /// Read management quality from the same publication as the definitions and catalog.
+    pub async fn skills_catalog_and_quality_snapshot(
+        &self,
+        filter: Option<SkillFilter>,
+        refresh: bool,
+    ) -> (
+        Vec<SkillDefinition>,
+        WorkflowCatalogSnapshot,
+        Arc<HashMap<SkillId, SkillQuality>>,
+    ) {
         // Optionally reload from disk to pick up new/updated skills
         if refresh {
             if let Err(e) = self.reload().await {
@@ -4407,7 +4438,7 @@ impl SkillStore {
 
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         let skills = self.skills.read().await;
-        let catalog = self.skill_catalog.read().await.snapshot.clone();
+        let publication = self.skill_catalog.read().await;
 
         let mut result: Vec<SkillDefinition> = skills
             .values()
@@ -4419,7 +4450,11 @@ impl SkillStore {
             .collect();
 
         result.sort_by_key(|s| s.name.clone());
-        (result, catalog)
+        (
+            result,
+            publication.snapshot.clone(),
+            publication.quality.clone(),
+        )
     }
 
     /// List skills with an optional mode override (without mutating in-memory cache).
