@@ -25646,6 +25646,135 @@ mod question_tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn schedule_form_previews_and_posts_the_same_once_utc_instant() {
+        use chrono::Datelike;
+
+        const LATE_PICKUP: &str = "If picked up late, the Host can run it once.";
+        const NAME: &str = "Deployment review";
+        const PROMPT: &str = "Review the deployment report";
+        const PROJECT_ID: &str = "project-release";
+
+        async fn type_field(app: &mut App, text: &str) {
+            for character in text.chars() {
+                app.handle_key(key(KeyCode::Char(character))).await.unwrap();
+            }
+        }
+
+        let year = Utc::now().year();
+        let past = format!("{}-12-31T23:30:00Z", year - 1);
+        let local = format!("{}-12-31T23:30:00.123456789-02:00", year + 1);
+        let utc_at = format!("{}-01-01T01:30:00.123456789Z", year + 2);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = App::new(BambooClient::new(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.tab = Tab::Schedules;
+        let mut selected = bare_session("selected-session");
+        selected.project_id = Some(PROJECT_ID.into());
+        app.sessions.sessions.push(selected);
+
+        app.handle_key(key(KeyCode::Char('n'))).await.unwrap();
+        let cron = schedule_editor_preview_at_width(&app, "ONCE_CREATE", "CRON", 60);
+        assert!(!cron.contains("UTC trigger"));
+        assert!(!cron.contains(LATE_PICKUP));
+        type_field(&mut app, NAME).await;
+        app.handle_key(key(KeyCode::Tab)).await.unwrap();
+        app.handle_key(key(KeyCode::Right)).await.unwrap();
+        app.handle_key(key(KeyCode::Tab)).await.unwrap();
+        type_field(&mut app, &past).await;
+        app.handle_key(key(KeyCode::Tab)).await.unwrap();
+        type_field(&mut app, PROMPT).await;
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert_eq!(
+            app.schedule_form.as_ref().unwrap().error.as_deref(),
+            Some("Once must be scheduled for a future time")
+        );
+        let expired = schedule_editor_preview_at_width(&app, "ONCE_CREATE", "PAST", 60);
+        assert!(!expired.contains("UTC trigger"));
+        assert!(expired.contains(LATE_PICKUP));
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+        for _ in past.chars() {
+            app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        }
+        type_field(&mut app, &local).await;
+        for width in [60, 120] {
+            let preview = schedule_editor_preview_at_width(&app, "ONCE_CREATE", "READY", width);
+            for expected in [
+                "Run at",
+                local.as_str(),
+                &format!("UTC trigger  {utc_at}"),
+                LATE_PICKUP,
+                "Enter create",
+                "Esc cancel",
+            ] {
+                assert!(
+                    preview.contains(expected),
+                    "{width} columns missing {expected:?}\n{preview}"
+                );
+            }
+        }
+
+        // Invalid typed input hides a previously visible preview immediately.
+        app.handle_key(key(KeyCode::Char('x'))).await.unwrap();
+        let invalid = schedule_editor_preview_at_width(&app, "ONCE_CREATE", "INVALID", 60);
+        assert!(!invalid.contains("UTC trigger"));
+        assert!(invalid.contains(LATE_PICKUP));
+        app.handle_key(key(KeyCode::Backspace)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "preview and invalid/past input should send no request"
+        );
+
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let request =
+            tokio::time::timeout(Duration::from_secs(5), read_test_http_request(&mut socket))
+                .await
+                .unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            headers.lines().next(),
+            Some("POST /api/v1/schedules HTTP/1.1")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({
+                "name": NAME,
+                "trigger": {"type": "once", "at": utc_at},
+                "enabled": true,
+                "run_config": {"project_id": PROJECT_ID, "task_message": PROMPT, "auto_execute": true},
+            })
+        );
+        respond_test_http(&mut socket, "application/json", "{}").await;
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            AppEvent::ActionDone { outcome: Ok(ref note), reload_tab: true, .. }
+                if note == "Schedule created"
+        ));
+        assert!(app.schedule_form.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "save should issue a single create request before catalog refresh"
+        );
+    }
+
     fn schedule_rename_preview(app: &App, phase: &str) -> String {
         schedule_editor_preview(app, "RENAME", phase)
     }
